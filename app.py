@@ -23,6 +23,7 @@ SCAN_SECONDS = 4
 FAST_SCAN = 1.5
 LIVE_STALE = 30
 ENTRY_WAIT = 75
+MAX_CYCLE_SWEEPS = 6
 BG, PANEL, NAV = "#f3f6fa", "#ffffff", "#111e32"
 TEXT, MUTED, LINE = "#172b45", "#718198", "#e5ebf2"
 ACCENT, PALE = "#087f78", "#e8f5f2"
@@ -39,6 +40,24 @@ def fresh_method():
 
 def signed(value):
     return ("+" if value > 0 else "") + M.fmt_money(value)
+
+
+def group_money_input(raw, caret):
+    """Nhóm lại ô nhập tiền theo dấu phẩy hàng nghìn và giữ vị trí con trỏ tương ứng."""
+    digits = re.sub(r"\D", "", raw)
+    grouped = M.fmt_input_money(int(digits)) if digits else ""
+    if grouped == raw:
+        return raw, caret
+    kept = len(re.sub(r"\D", "", raw[:caret]))
+    if kept >= len(digits):
+        return grouped, len(grouped)
+    seen = 0
+    for index, char in enumerate(grouped):
+        if char.isdigit():
+            seen += 1
+            if seen == kept + 1:
+                return grouped, index
+    return grouped, len(grouped)
 
 
 def road_is_current(row):
@@ -79,8 +98,10 @@ def row_problem(row, now=None, check_fresh=True):
 
 
 class LiveSimulation:
-    def __init__(self, book=None):
+    def __init__(self, book=None, profile=ME.DEFAULT_PROFILE, ladder=None):
         self.money = book or M.MoneyBook()
+        self.profile = profile
+        self.ladder = ME.ladder_stakes(profile, ladder)
         self.results = []
         self.log = []
         self.method_state = fresh_method()
@@ -90,11 +111,22 @@ class LiveSimulation:
         self.running = False
         self.pending = None
         self.note = "Chọn bàn để theo dõi."
+        self.block_hands = 0
+        self.cycle_done = False
+
+    @property
+    def cycle_hands(self):
+        """Số tay của một khối theo phương pháp đang chọn: 6 tay cho 3-3, 5 tay cho 3-2."""
+        return ME.block_hands(self.profile)
+
+    def set_method(self, profile, ladder):
+        self.profile = profile
+        self.ladder = ME.ladder_stakes(profile, ladder)
 
     def plan(self):
         s = self.method_state
-        return ME.plan(self.results, self.money.unit, s["ladder_step"], s["hands_in_block"],
-                       s["started"], s["strong"])
+        return ME.plan(self.results, self.ladder, s["ladder_step"], s["hands_in_block"],
+                       s["started"], s["strong"], self.profile)
 
     def bind(self, row):
         self.pause()
@@ -102,6 +134,7 @@ class LiveSimulation:
         self.letters = row["letters"]
         self.results = list(self.letters)
         self.method_state = fresh_method()
+        self.block_hands = 0
         self.note = "Đã chọn bàn."
 
     def start(self, row, verified=False, now=None):
@@ -193,7 +226,8 @@ class LiveSimulation:
             return False
         result = letters[-1]
         settled = self.money.settle(plan["side"], result, plan["stake"], E.PAYOUT)
-        self.method_state, _ = ME.advance(self.method_state, result, plan["side"], plan["stake"])
+        self.method_state, _ = ME.advance(self.method_state, result, plan["side"], plan["stake"],
+                                          self.profile)
         self.method_state["strong"] = plan["strong"]
         self.letters = letters
         self.results = list(letters)
@@ -202,8 +236,13 @@ class LiveSimulation:
                              delta=settled["delta"], outcome=settled["outcome"],
                              balance_after=self.money.balance, block_pos=plan["block_pos"],
                              ladder=plan["ladder_step"], source="live-driver"))
+        self.block_hands += 1
         if self.money.blocked:
             self.pause(self.money.blocked[1])
+        elif self.block_hands >= self.cycle_hands:
+            self.cycle_done = True
+            self.pause("Đã đi đủ %d tay của khối %s ở bàn này — rời bàn để tìm bàn mới." % (
+                self.cycle_hands, self.profile))
         else:
             self._arm()
         return True
@@ -213,6 +252,8 @@ class BCRApp:
     def __init__(self, root, state_file=STATE_FILE, auto_connect=True):
         self.root, self.state_file = root, Path(state_file)
         self.sim = LiveSimulation()
+        self.ladder_store = {}
+        self.ladder_shown_profile = None
         self.browser = BR.BrowserSession()
         self.tables = {}
         self.events = queue.Queue()
@@ -221,6 +262,9 @@ class BCRApp:
         self.auto_start_table_key = None
         self.auto_start_letters = ""
         self.auto_start_deadline = 0.0
+        self.cycle_waiting = False
+        self.cycle_attempts = 0
+        self.cycle_table_key = None
         self.stream = LS.LobbyStream(self.browser)
         self.sweep_note_text = "Quét sảnh để tìm bàn đạt 3 điều kiện."
         self.next_scan = 0
@@ -229,6 +273,7 @@ class BCRApp:
         self.ui_scale = DEFAULT_UI_SCALE
         self.chrome_startup_var = tk.BooleanVar(value=False)
         self.cdp_var = tk.BooleanVar(value=False)
+        self.auto_cycle_var = tk.BooleanVar(value=True)
         self.verified = tk.BooleanVar(value=False)
         self.only_eligible = tk.BooleanVar(value=False)
         self.search = tk.StringVar()
@@ -236,7 +281,7 @@ class BCRApp:
         self._load_state()
         self.base_tk_scaling = float(root.tk.call("tk", "scaling"))
         root.tk.call("tk", "scaling", self.base_tk_scaling * self.ui_scale / 100)
-        root.title("BCR · Live Method Lab — Giả lập 3-3")
+        root.title("BCR · Live Method Lab — Giả lập 3-3 / 3-2")
         root.configure(bg=BG)
         root.geometry("1200x900+20+20")
         root.minsize(960, 720)
@@ -276,7 +321,8 @@ class BCRApp:
         sidebar.pack_propagate(False)
         self._label(sidebar, "BCR", 29, "white", True).pack(anchor="w", padx=24, pady=(28, 0))
         self._label(sidebar, "LIVE METHOD LAB", 9, "#8b9bb2").pack(anchor="w", padx=24)
-        self._label(sidebar, "3 — 3", 24, "#63d6bc", True).pack(anchor="w", padx=24, pady=(18, 32))
+        self.brand_method = self._label(sidebar, "", 24, "#63d6bc", True)
+        self.brand_method.pack(anchor="w", padx=24, pady=(18, 32))
         self.nav_buttons = {}
         for key, title in (("overview", "Tổng quan"), ("history", "Lịch sử"), ("settings", "Cài đặt")):
             button = tk.Button(sidebar, text=title, anchor="w", relief="flat", bd=0,
@@ -311,16 +357,19 @@ class BCRApp:
         self.connection_note.pack(fill="x", padx=14, pady=(0, 8))
         sweep_row = tk.Frame(connect, bg=PANEL)
         sweep_row.pack(fill="x", padx=14, pady=(0, 10))
+        self.enter_lobby_button = self._button(sweep_row, "Vào sảnh EVO", self.enter_lobby)
+        self.enter_lobby_button.pack(side="left")
         self.sweep_button = self._button(sweep_row, "Quét toàn sảnh", self.sweep_lobby)
-        self.sweep_button.pack(side="left")
+        self.sweep_button.pack(side="left", padx=6)
         self.auto_open_button = self._button(sweep_row, "Tự mở bàn đạt chuẩn", lambda: self.auto_open_table(True))
         self.auto_open_button.pack(side="left", padx=6)
-        self.sweep_note = self._label(sweep_row, "Một lần bấm: quét sảnh lấy lịch sử mọi bàn, đối chiếu hai nguồn, "
-                                                 "mở bàn đạt 3 điều kiện rồi giả lập từ ván kế tiếp.",
+        self.sweep_note = self._label(sweep_row, "Bấm “Vào sảnh EVO” để mở sảnh từ trang vào; bấm “Quét toàn sảnh” "
+                                                 "để lấy lịch sử, đối chiếu hai nguồn, mở bàn đạt 3 điều kiện và giả "
+                                                 "lập từ ván kế tiếp. Đủ tay của khối là tự về sảnh tìm bàn mới.",
                                       9, MUTED, anchor="w", justify="left", wraplength=680)
         self.sweep_note.pack(side="left", fill="x", expand=True, padx=10)
-        self._label(main, "01  Mở Chrome     /     02  Chọn bàn     /     03  Đối chiếu kết quả", 9,
-                    MUTED, anchor="w").pack(fill="x", pady=(0, 12))
+        self.step_label = self._label(main, "", 9, MUTED, anchor="w")
+        self.step_label.pack(fill="x", pady=(0, 12))
         self._label(main, "Chỉ mô phỏng, không đặt tiền.", 9, MUTED, anchor="w").pack(
             side="bottom", fill="x", pady=(10, 0))
         self.stack = tk.Frame(main, bg=BG)
@@ -394,13 +443,10 @@ class BCRApp:
         self.plan_side.pack(anchor="w", padx=14)
         self.plan_stake = self._label(plan, "", 10, MUTED)
         self.plan_stake.pack(anchor="w", padx=14, pady=(0, 5))
-        cycle = tk.Frame(plan, bg=PANEL)
-        cycle.pack(fill="x", padx=14)
+        self.cycle_strip = tk.Frame(plan, bg=PANEL)
+        self.cycle_strip.pack(fill="x", padx=14)
         self.cycle_labels = []
-        for i in range(6):
-            label = self._label(cycle, str(i + 1), 10, MUTED, True, width=3, pady=3)
-            label.pack(side="left", padx=(0, 5))
-            self.cycle_labels.append(label)
+        self._sync_cycle_strip()
         self.checks_label = self._label(plan, "", 9, MUTED, anchor="w", justify="left")
         self.checks_label.pack(fill="x", padx=14, pady=6)
         self.verify_check = tk.Checkbutton(plan, text="Cầu khớp site · bàn chuẩn B 0,95 / P 1:1",
@@ -425,7 +471,7 @@ class BCRApp:
         entry.pack(side="right", ipady=5)
         self.search.trace_add("write", lambda *_: self._render_tables())
         self.live_tree = self._tree(table_card, (("table", "TÊN BÀN", 220), ("hands", "TAY", 55),
-                                    ("strong", "BÊN MẠNH", 100), ("rules", "ĐIỀU KIỆN 3-3", 240),
+                                    ("strong", "BÊN MẠNH", 100), ("rules", "ĐIỀU KIỆN VÀO CẦU", 240),
                                     ("data", "DỮ LIỆU", 165)), height=4)
         self.live_tree.tag_configure("ready", foreground=ACCENT)
         self.live_tree.tag_configure("wait", foreground=MUTED)
@@ -472,13 +518,14 @@ class BCRApp:
         card = self._card(parent)
         card.pack(fill="both", expand=True)
         self._label(card, "Vốn & giới hạn phiên", 15, bold=True).pack(anchor="w", padx=20, pady=(18, 5))
-        self._label(card, "Đổi vốn sẽ lưu phiên hiện tại.", 10, MUTED).pack(anchor="w", padx=20)
+        self._label(card, "Đổi vốn sẽ lưu phiên hiện tại · tiền tệ hiển thị dạng 2,000,000 (triệu rõ ngay khi nhìn).",
+                    10, MUTED).pack(anchor="w", padx=20)
         grid = tk.Frame(card, bg=PANEL)
         grid.pack(fill="x", padx=20, pady=18)
         self.entries = {}
-        fields = (("capital", "Vốn ban đầu (đ)"), ("unit", "Cược gốc (đ)"),
-                  ("stop_loss_pct", "Cắt lỗ (% vốn)"), ("take_profit_pct", "Chốt lời (% vốn)"),
-                  ("max_hands", "Giới hạn tay (0 = không giới hạn)"))
+        self.money_inputs = []
+        fields = (("capital", "Vốn ban đầu (đ)"),
+                  ("take_profit_pct", "Chốt lời (% vốn)"))
         for i, (key, title) in enumerate(fields):
             r, c = divmod(i, 2)
             grid.columnconfigure(c, weight=1)
@@ -486,14 +533,40 @@ class BCRApp:
             field.grid(row=r, column=c, sticky="ew", padx=(0, 24), pady=(0, 12))
             self._label(field, title, 10, MUTED).pack(anchor="w", pady=(0, 4))
             value = self.sim.money.start_capital if key == "capital" else getattr(self.sim.money, key)
-            display_value = M.fmt_money(value) if key in ("capital", "unit") else str(value)
+            is_money = key == "capital"
+            display_value = M.fmt_input_money(value) if is_money else str(value)
             var = tk.StringVar(value=display_value)
-            tk.Entry(field, textvariable=var, font=("Segoe UI", 12), relief="solid", bd=1).pack(fill="x", ipady=6)
+            entry = tk.Entry(field, textvariable=var, font=("Segoe UI", 12), relief="solid", bd=1)
+            entry.pack(fill="x", ipady=6)
+            if is_money:
+                self._bind_money_input(entry, var)
             self.entries[key] = var
-        self._label(card, "Bậc cược: 1 → 3 → 7 → 15 → 31 → 64. Thắng về bậc 1.\n"
-                    "Hòa giữ bậc. Chỉ theo dõi bàn Baccarat chuẩn.",
-                    10, MUTED, justify="left").pack(anchor="w", padx=20, pady=(0, 14))
-        self._button(card, "Lưu phiên cũ & áp dụng vốn mới", self.apply_settings, True).pack(anchor="w", padx=20)
+        method = tk.Frame(card, bg=PANEL)
+        method.pack(fill="x", padx=20, pady=(4, 0))
+        self._label(method, "Phương pháp vào cầu", 13, bold=True).pack(anchor="w")
+        self.profile_var = tk.StringVar(value=self.sim.profile)
+        for name in ME.PROFILES:
+            tk.Radiobutton(method, text=ME.PROFILE_LABEL[name], variable=self.profile_var, value=name,
+                           command=self._rebuild_ladder_inputs, bg=PANEL, fg=TEXT, selectcolor=PALE,
+                           activebackground=PANEL, font=("Segoe UI", 10)).pack(anchor="w")
+        self.ladder_frame = tk.Frame(method, bg=PANEL)
+        self.ladder_frame.pack(fill="x", pady=(10, 0))
+        self.ladder_vars = []
+        self._rebuild_ladder_inputs()
+        self._label(method, "Thắng ở bậc nào thì quay về bậc 1. Hòa giữ bậc và hoàn tiền.\n"
+                            "Mỗi ô là một tay trong khối — tự điền số tiền tùy ý, app không nhân cứng bậc sau với bậc trước.",
+                    9, MUTED, justify="left").pack(anchor="w", pady=(6, 0))
+        self._button(card, "Lưu phiên cũ & áp dụng phương pháp mới", self.apply_settings, True).pack(anchor="w", padx=20, pady=(14, 0))
+        cycle = tk.Frame(card, bg=PANEL)
+        cycle.pack(fill="x", padx=20, pady=(18, 0))
+        self._label(cycle, "Chu trình bàn", 13, bold=True).pack(anchor="w")
+        self.cycle_check = tk.Checkbutton(cycle, text="", variable=self.auto_cycle_var,
+                                          command=self._save_state, bg=PANEL, fg=TEXT, selectcolor=PALE,
+                                          activebackground=PANEL, font=("Segoe UI", 10))
+        self.cycle_check.pack(anchor="w")
+        self.cycle_rule = self._label(cycle, "", 9, MUTED, justify="left")
+        self.cycle_rule.pack(anchor="w", pady=(4, 0))
+        self._sync_method_texts()
         display = tk.Frame(card, bg=PANEL)
         display.pack(fill="x", padx=20, pady=(20, 0))
         self._label(display, "Hiển thị", 13, bold=True).pack(anchor="w", pady=(0, 8))
@@ -513,6 +586,99 @@ class BCRApp:
                            activebackground=PANEL, font=("Segoe UI", 10)).pack(anchor="w", padx=16)
         self._label(card, "Đăng nhập trong Chrome để bắt đầu đọc bàn.",
                     9, MUTED, justify="left").pack(anchor="w", padx=20, pady=10)
+
+    def _bind_money_input(self, entry, var):
+        """Ô nhập tiền chỉ nhận chữ số và tự chèn dấu phân cách hàng nghìn khi gõ."""
+        entry.config(validate="key", validatecommand=(
+            entry.register(lambda proposed: re.fullmatch(r"[\d,.]*", proposed) is not None), "%P"))
+
+        def regroup(_event=None):
+            try:
+                caret = entry.index("insert")
+            except tk.TclError:
+                caret = len(var.get())
+            grouped, target = group_money_input(var.get(), caret)
+            if grouped == var.get():
+                return
+            var.set(grouped)
+            entry.icursor(target)
+
+        self.money_inputs.append((entry, regroup))
+        for event in ("<KeyRelease>", "<FocusOut>"):
+            entry.bind(event, regroup)
+
+    def format_money_inputs(self):
+        """Định dạng lại mọi ô nhập tiền khi giá trị được set bằng code, không có phím thật."""
+        alive = []
+        for entry, regroup in self.money_inputs:
+            if not entry.winfo_exists():
+                continue
+            regroup()
+            alive.append((entry, regroup))
+        self.money_inputs = alive
+
+    def _sync_cycle_strip(self):
+        """Dải ô tay của khối: 6 ô cho 3-3, 5 ô cho 3-2, dựng lại khi đổi phương pháp."""
+        for label in self.cycle_labels:
+            label.destroy()
+        self.cycle_labels = []
+        for i in range(self.sim.cycle_hands):
+            label = self._label(self.cycle_strip, str(i + 1), 10, MUTED, True, width=3, pady=3)
+            label.pack(side="left", padx=(0, 5))
+            self.cycle_labels.append(label)
+
+    def _rebuild_ladder_inputs(self):
+        """Số ô nhập bậc cược đi theo khối của phương pháp; giữ mức đã gõ riêng cho từng phương pháp."""
+        if getattr(self, "ladder_vars", None):
+            self.ladder_store[self.ladder_shown_profile] = [var.get() for var in self.ladder_vars]
+        profile = self.profile_var.get()
+        raw = self.ladder_store.get(profile) or [M.fmt_input_money(s) for s in ME.DEFAULT_LADDER[profile]]
+        for child in self.ladder_frame.winfo_children():
+            child.destroy()
+        self.ladder_vars = []
+        for i, text in enumerate(raw):
+            field = tk.Frame(self.ladder_frame, bg=PANEL)
+            field.grid(row=i // 3, column=i % 3, padx=(0, 12), pady=(0, 8))
+            self._label(field, "Tay %d · bậc %d (đ)" % (i + 1, i + 1), 9, MUTED).pack(anchor="w")
+            var = tk.StringVar(value=text)
+            entry = tk.Entry(field, textvariable=var, width=13, font=("Segoe UI", 11),
+                             relief="solid", bd=1)
+            entry.pack(ipady=4)
+            self._bind_money_input(entry, var)
+            self.ladder_vars.append(var)
+        self.ladder_shown_profile = profile
+        self._sync_method_texts(profile)
+
+    def _ladder_from_inputs(self):
+        """Đọc các ô bậc cược thành số tiền; báo rõ ô nào nhập sai."""
+        stakes = []
+        for i, var in enumerate(self.ladder_vars):
+            try:
+                stakes.append(M.parse_money(var.get()))
+            except ValueError:
+                raise ValueError("Bậc %d (%r) chưa hợp lệ — nhập số tiền, ví dụ 160,000." % (
+                    i + 1, var.get()))
+        return stakes
+
+    def _sync_method_texts(self, profile=None):
+        """Câu chữ trong app luôn nói đúng số tay của khối đang chọn."""
+        profile = profile or self.sim.profile
+        hands = ME.block_hands(profile)
+        strong = ME.strong_hands(profile)
+        if hasattr(self, "brand_method"):
+            applied = ME.strong_hands(self.sim.profile)
+            self.brand_method.config(text="%d — %d" % (applied, self.sim.cycle_hands - applied))
+        if hasattr(self, "cycle_check"):
+            self.cycle_check.config(text="Đủ %d tay là tự rời bàn, quét sảnh tìm bàn mới" % hands)
+            self.cycle_rule.config(
+                text="Mỗi bàn chỉ đi một khối %s: %d tay bên mạnh + %d tay bên đổi. Hết %d tay, app đưa tab về "
+                     "danh sách bàn Baccarat, quét lại sảnh và mở một bàn đạt 3 điều kiện khác." % (
+                         profile, strong, hands - strong, hands))
+        if hasattr(self, "step_label"):
+            self.step_label.config(text=(
+                "01  Đăng nhập %s     /     02  Vào sảnh EVO     /     03  Quét sảnh     /     "
+                "04  Đối chiếu kết quả     /     05  Đủ %d tay (%s) · tự đổi bàn" % (
+                    BR.PORTAL_HOST, hands, profile)))
 
     def _scroll_page(self, event):
         canvas = self.page_scrolls.get(self.current_page)
@@ -539,7 +705,8 @@ class BCRApp:
                 if not self.browser.alive() and not self.browser.start(BR.START_URL, pos=pos, cdp=cdp):
                     self.events.put(("open_error", self.browser.last_error))
                     return
-                self.events.put(("opened", self.browser.driver_info + " · Đăng nhập thủ công rồi mở sảnh Baccarat."))
+                self.events.put(("opened", self.browser.driver_info
+                                 + " · Đăng nhập thủ công rồi bấm “Vào sảnh EVO”."))
             except Exception as exc:
                 self.events.put(("open_error", str(exc).splitlines()[0][:240]))
         threading.Thread(target=work, daemon=True).start()
@@ -569,6 +736,26 @@ class BCRApp:
         except Exception:
             return False
 
+    def enter_lobby(self):
+        if self.chrome_busy or self.sweep_busy or self.exit_requested:
+            return
+        if not self._cdp_available():
+            self.sweep_note_text = ("Chưa bật CDP: bấm “Chơi game” của Evolution trong cửa sổ Chrome, "
+                                    "app sẽ tự đọc khi có tab sảnh."
+                                    if self.browser.driver is not None else "Gắn Chrome đang mở trước.")
+            self.refresh()
+            return
+        self.sweep_busy = True
+        self.sweep_note_text = "Đang bấm “Chơi game” của Evolution trên trang vào…"
+        def work():
+            try:
+                ok, note = self.stream.open_lobby_from_portal()
+                self.events.put(("lobby_entered", (ok, note)))
+            except Exception as exc:
+                self.events.put(("lobby_entered", (False, "Không vào được sảnh (%s)." % type(exc).__name__)))
+        threading.Thread(target=work, daemon=True).start()
+        self.refresh()
+
     def sweep_lobby(self):
         if self.chrome_busy or self.sweep_busy or self.exit_requested:
             return
@@ -587,7 +774,7 @@ class BCRApp:
         threading.Thread(target=work, daemon=True).start()
         self.refresh()
 
-    def auto_open_table(self, allow_sweep=False):
+    def auto_open_table(self, allow_sweep=False, exclude_key=None):
         if self.chrome_busy or self.sweep_busy or self.open_table_busy or self.exit_requested:
             return
         if not self._cdp_available():
@@ -600,7 +787,7 @@ class BCRApp:
             return
         candidates = []
         for row in self.tables.values():
-            if not row.get("table_id") or row_problem(row):
+            if not row.get("table_id") or row["key"] == exclude_key or row_problem(row):
                 continue
             if not road_is_current(row):
                 continue
@@ -609,6 +796,15 @@ class BCRApp:
                 candidates.append((info["hands"], row, info))
         if not candidates:
             if allow_sweep:
+                if self.cycle_waiting and self.cycle_attempts >= MAX_CYCLE_SWEEPS:
+                    self.cycle_waiting = False
+                    self.cycle_attempts = 0
+                    self.sweep_note_text = ("Chưa tìm được bàn đạt 3 điều kiện sau %d lần quét lại sảnh. "
+                                            "Bấm “Tự mở bàn đạt chuẩn” khi cần." % MAX_CYCLE_SWEEPS)
+                    self.refresh()
+                    return
+                if self.cycle_waiting:
+                    self.cycle_attempts += 1
                 self.sweep_note_text = "Chưa có bàn vừa được đối chiếu hai nguồn. Đang quét lại sảnh…"
                 self.sweep_lobby()
             else:
@@ -628,6 +824,33 @@ class BCRApp:
                 self.events.put(("table_opened", (ok, note, row["key"])))
             except Exception as exc:
                 self.events.put(("table_opened", (False, "Không mở được bàn (%s)." % type(exc).__name__, "")))
+        threading.Thread(target=work, daemon=True).start()
+        self.refresh()
+
+    def leave_table_for_lobby(self):
+        """Hết khối 6 tay: đưa tab về danh sách bàn rồi lặp lại quy trình quét - chọn - mở bàn."""
+        if not self.auto_cycle_var.get() or self.exit_requested:
+            return
+        if self.chrome_busy or self.sweep_busy or self.open_table_busy:
+            self.cycle_waiting = False
+            self.sweep_note_text = "Chưa tự đổi bàn được vì app đang bận; bấm “Quét toàn sảnh” để chạy lại."
+            self.refresh()
+            return
+        if not self._cdp_available():
+            self.cycle_waiting = False
+            self.sweep_note_text = "Chu trình tự đổi bàn dừng: chưa gắn Chrome."
+            self.refresh()
+            return
+        self.cycle_waiting = True
+        self.cycle_attempts = 0
+        self.cycle_table_key = self.sim.table_key
+        self.sweep_busy = True
+        self.sweep_note_text = "Đã đi đủ %d tay · rời bàn, về danh sách bàn Baccarat…" % self.sim.cycle_hands
+        def work():
+            try:
+                self.events.put(("cycle_back", self.stream.back_to_lobby()))
+            except Exception as exc:
+                self.events.put(("cycle_back", (False, "Không về được sảnh (%s)." % type(exc).__name__)))
         threading.Thread(target=work, daemon=True).start()
         self.refresh()
 
@@ -687,7 +910,9 @@ class BCRApp:
                 if error:
                     self.sweep_note_text = "Quét toàn sảnh không thành công: " + error
                 elif not rows:
-                    self.sweep_note_text = "Chưa nhận được lịch sử. Mở sảnh Baccarat rồi quét lại."
+                    self.sweep_note_text = ("Chưa đọc được lịch sử bàn ở sảnh. Bấm “Vào sảnh EVO” rồi chờ quét lại."
+                                            if self.cycle_waiting else
+                                            "Chưa nhận được lịch sử. Mở sảnh Baccarat rồi quét lại.")
                 else:
                     self._ingest_reports([{"tables": rows, "page": {}, "diag": {}}], observed_at)
                     for row in rows:
@@ -699,7 +924,23 @@ class BCRApp:
                         len(rows), sum(1 for r in rows if r["road_match"]))
                     # Bàn được mở bằng đúng ô bàn của sảnh nên phiên đăng nhập không bị động vào.
                     if not self.sim.running:
-                        self.auto_open_table()
+                        self.auto_open_table(allow_sweep=self.cycle_waiting,
+                                             exclude_key=self.cycle_table_key if self.cycle_waiting else None)
+            elif kind == "lobby_entered":
+                self.sweep_busy = False
+                ok, note = data
+                self.sweep_note_text = note
+                if ok:
+                    self.next_scan = 0
+            elif kind == "cycle_back":
+                self.sweep_busy = False
+                ok, note = data
+                self.sweep_note_text = note
+                if ok:
+                    self.sweep_lobby()
+                else:
+                    self.cycle_waiting = False
+                    self.refresh()
             elif kind == "table_opened":
                 self.open_table_busy = False
                 ok, note, key = data
@@ -714,6 +955,9 @@ class BCRApp:
         self._auto_start_verified_table()
         if self.sim.process(self.tables.get(self.sim.table_key)):
             self._save_state()
+        if self.sim.cycle_done:
+            self.sim.cycle_done = False
+            self.leave_table_for_lobby()
         now = time.time()
         if (not self.exit_requested and now >= self.next_scan and not self.scan_busy
                 and not self.chrome_busy and not self.sweep_busy and self.browser.connected):
@@ -765,6 +1009,11 @@ class BCRApp:
         self.tables = {k: r for k, r in self.tables.items() if now - r["ts"] < 300 or k == self.sim.table_key}
         # Lobby có thể tạm không trả bàn đang mở khi chuyển màn hình: giữ cược đã chốt, chờ lượt đọc sau.
 
+    def _cycle_search(self, key):
+        """Chu trình đang chờ bàn mới: loại bàn vừa hỏng và tìm bàn khác trong sảnh."""
+        if self.cycle_waiting:
+            self.auto_open_table(allow_sweep=True, exclude_key=key)
+
     def _auto_start_verified_table(self):
         key = self.auto_start_table_key
         if not key:
@@ -773,8 +1022,9 @@ class BCRApp:
         if not row or row.get("source") != "evo-bead" or row.get("screen_stable", 0) < 2:
             if time.time() > self.auto_start_deadline:
                 self.sweep_note_text = ("Vào bàn rồi nhưng %d giây chưa đọc được cầu bàn đã mở hai lần giống nhau. "
-                                        "Hãy quét lại sảnh hoặc bấm “Chọn bàn”." % ENTRY_WAIT)
+                                        "Đang tìm bàn khác…" % ENTRY_WAIT)
                 self.auto_start_table_key = None
+                self._cycle_search(key)
             return
         problem = row_problem(row)
         if problem or not same_shoe(self.auto_start_letters, row["letters"]):
@@ -783,14 +1033,19 @@ class BCRApp:
                     len(row["letters"]), len(self.auto_start_letters)))
             self.auto_start_table_key = None
             self.verified.set(False)
+            self._cycle_search(key)
             return
         self.verified.set(True)
         if self.sim.arm_at_entry(row):
             self.sweep_note_text = "Đã vào bàn và bắt đầu giả lập · %s" % self.sim.note
             self.auto_start_table_key = None
+            self.cycle_waiting = False
+            self.cycle_attempts = 0
+            self.cycle_table_key = None
         else:
             self.sweep_note_text = "Chưa thể bắt đầu: " + self.sim.note
             self.auto_start_table_key = None
+            self._cycle_search(key)
 
     def _render_tables(self):
         if not hasattr(self, "live_tree"):
@@ -875,6 +1130,7 @@ class BCRApp:
         self.open_button.config(state="disabled" if self.chrome_busy else "normal")
         self.attach_button.config(state="disabled" if self.chrome_busy else "normal")
         self.disconnect_button.config(text="Ngắt kết nối" if self.browser.mode == "cdp" else "Đóng")
+        self.enter_lobby_button.config(state="disabled" if self.chrome_busy or self.sweep_busy else "normal")
         self.sweep_button.config(state="disabled" if self.chrome_busy or self.sweep_busy else "normal")
         self.auto_open_button.config(state="disabled" if self.chrome_busy or self.sweep_busy
                                      or self.open_table_busy else "normal")
@@ -887,11 +1143,13 @@ class BCRApp:
         plan = self.sim.pending or self.sim.plan()
         side = plan["side"]
         self.plan_side.config(text=E.SIDE_NAME.get(side, "CHỜ BÀN").upper(), fg=COLORS.get(side, MUTED))
-        self.plan_stake.config(text=("%s đ · bậc %d/6 · %s" % (M.fmt_money(plan["stake"]),
-                                   min(plan["ladder_step"] + 1, 6), "đã chốt" if self.sim.running else "dự kiến")) if side else "Chưa chốt cược giả lập")
+        self.plan_stake.config(text=("%s đ · bậc %d/%d · %s" % (
+            M.fmt_money(plan["stake"]), min(plan["ladder_step"] + 1, len(self.sim.ladder)),
+            len(self.sim.ladder), "đã chốt" if self.sim.running else "dự kiến")) if side else "Chưa chốt cược giả lập")
         strong = plan["strong"]
         for i, label in enumerate(self.cycle_labels):
-            cell_side = strong if i < 3 else ("P" if strong == "B" else "B") if strong else None
+            cell_side = strong if i < ME.strong_hands(self.sim.profile) else (
+                ("P" if strong == "B" else "B") if strong else None)
             active = i == plan["block_pos"] and side
             label.config(text=cell_side or str(i + 1), bg=COLORS.get(cell_side, BG) if active else BG,
                          fg="white" if active else COLORS.get(cell_side, MUTED))
@@ -993,21 +1251,26 @@ class BCRApp:
 
     def apply_settings(self):
         try:
-            values = {k: float(v.get().strip().replace(",", "").replace(".", "")
-                                if k in ("capital", "unit") else v.get().strip())
+            values = {k: (M.parse_money(v.get()) if k == "capital" else float(v.get().strip()))
                       for k, v in self.entries.items()}
             if not all(math.isfinite(v) for v in values.values()):
-                raise ValueError()
-            if not (0 < values["unit"] <= values["capital"] and 1 <= values["stop_loss_pct"] <= 100
-                    and values["take_profit_pct"] >= 1 and values["max_hands"] >= 0
-                    and values["max_hands"].is_integer()):
-                raise ValueError()
-            book = M.MoneyBook(**values)
-        except (ValueError, OverflowError):
-            messagebox.showerror("Thông số chưa hợp lệ", "Vốn và cược gốc nhập bằng số (20.000.000 hoặc 20000000 đều được).\n"
-                                 "Vốn ≥ cược gốc > 0; cắt lỗ 1–100%; chốt lời ≥ 1%; giới hạn tay là số nguyên ≥ 0.",
-                                 parent=self.root)
+                raise ValueError("Vốn và chốt lời phải là số hợp lệ.\n"
+                                 "Vốn nhập kiểu 20,000,000; chốt lời ≥ 1%.")
+            if values["take_profit_pct"] < 1:
+                raise ValueError("Chốt lời phải ≥ 1%.")
+            profile = self.profile_var.get()
+            stakes = ME.ladder_stakes(profile, self._ladder_from_inputs())
+            if stakes[0] > values["capital"] or values["capital"] <= 0:
+                raise ValueError("Vốn (%s) phải lớn hơn 0 và không nhỏ hơn bậc 1 (%s)." % (
+                    M.fmt_money(values["capital"]), M.fmt_money(stakes[0])))
+        except ValueError as exc:
+            messagebox.showerror("Thông số chưa hợp lệ", str(exc), parent=self.root)
             return
+        book = M.MoneyBook(unit=stakes[0], **values)
+        for var, stake in zip(self.ladder_vars, stakes):
+            var.set(M.fmt_input_money(stake))
+        self.ladder_store[profile] = [var.get() for var in self.ladder_vars]
+        self.entries["capital"].set(M.fmt_input_money(values["capital"]))
         if not messagebox.askyesno("Tạo phiên mới", "Lưu bản sao phiên hiện tại, dừng giả lập và bắt đầu với vốn mới?", parent=self.root):
             return
         if not self._save_state():
@@ -1017,7 +1280,9 @@ class BCRApp:
         except OSError as exc:
             messagebox.showerror("Không lưu được bản sao", str(exc), parent=self.root)
             return
-        self.sim = LiveSimulation(book)
+        self.sim = LiveSimulation(book, profile=profile, ladder=stakes)
+        self._sync_cycle_strip()
+        self._sync_method_texts()
         self.verified.set(False)
         self.history_size = -1
         self._save_state()
@@ -1035,9 +1300,17 @@ class BCRApp:
             data = json.loads(self.state_file.read_text(encoding="utf-8"))
             settings = data.get("settings", {})
             self.sim.money = M.MoneyBook(**{k: settings[k] for k in (
-                "capital", "unit", "stop_loss_pct", "take_profit_pct", "max_hands") if k in settings})
+                "capital", "unit", "take_profit_pct") if k in settings})
+            profile = settings.get("profile", ME.DEFAULT_PROFILE)
+            if profile in ME.PROFILES:
+                try:
+                    self.sim.set_method(profile, settings.get("ladder"))
+                except ValueError:
+                    self.sim.set_method(profile, None)
+                self.ladder_store[profile] = [M.fmt_input_money(s) for s in self.sim.ladder]
             self.chrome_startup_var.set(bool(settings.get("chrome_startup", False)))
             self.cdp_var.set(bool(settings.get("chrome_cdp", False)))
+            self.auto_cycle_var.set(bool(settings.get("auto_cycle", True)))
             scale = settings.get("ui_scale", DEFAULT_UI_SCALE)
             if isinstance(scale, (int, float)) and not isinstance(scale, bool) and 50 <= scale <= 150:
                 self.ui_scale = int(scale)
@@ -1062,9 +1335,11 @@ class BCRApp:
             return False
         book = self.sim.money
         data = dict(format="live-v2", log=self.sim.log,
-                    settings=dict(capital=book.start_capital, unit=book.unit, stop_loss_pct=book.stop_loss_pct,
-                                  take_profit_pct=book.take_profit_pct, max_hands=book.max_hands,
+                    settings=dict(capital=book.start_capital, unit=book.unit,
+                                  take_profit_pct=book.take_profit_pct,
+                                  profile=self.sim.profile, ladder=self.sim.ladder,
                                   chrome_startup=self.chrome_startup_var.get(), chrome_cdp=self.cdp_var.get(),
+                                  auto_cycle=self.auto_cycle_var.get(),
                                   chrome_url=BR.START_URL, ui_scale=self.ui_scale),
                     money={key: getattr(book, key) for key in MONEY_FIELDS})
         try:

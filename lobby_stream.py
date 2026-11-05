@@ -9,6 +9,7 @@ Không gọi API nội bộ, không đọc cookie/token, không bấm nút cư�
 import json
 import re
 import time
+from urllib.parse import urlsplit
 
 import browser as BR
 
@@ -126,6 +127,36 @@ TILE_BOX_JS = """(() => {
     }
     return {reason: 'tile_not_found'};
 })()"""
+
+
+EVO_ENTRY_JS = """(() => {
+    if (window !== window.top) return {reason: 'not_top_frame'};
+    const items = [...document.querySelectorAll('.game-item[data-subprovider="EVO"]')];
+    if (!items.length) return {reason: 'evo_item_not_found'};
+    const score = (item) => {
+        const img = item.querySelector('img');
+        return (((img && img.alt) || '').trim().toLowerCase() === 'evolution') ? 0 : 1;
+    };
+    const found = [];
+    for (const item of items) {
+        const b = item.querySelector('button.btn-main') || item.querySelector('button');
+        if (b && !b.disabled) found.push({b, s: score(item)});
+    }
+    if (!found.length) return {reason: 'evo_button_not_found'};
+    found.sort((x, y) => x.s - y.s);
+    if (found.length > 1 && found[0].s === found[1].s) {
+        return {reason: 'evo_button_ambiguous', count: found.length};
+    }
+    const btn = found[0].b;
+    btn.scrollIntoView({block: 'center'});
+    const rect = btn.getBoundingClientRect();
+    if (rect.width < 8 || rect.height < 8 || rect.top < 0 || rect.bottom > innerHeight
+            || rect.left < 0 || rect.right > innerWidth) return {reason: 'evo_button_offscreen'};
+    return {x: rect.x + rect.width / 2, y: rect.y + rect.height / 2,
+            label: (btn.innerText || btn.getAttribute('title') || '').trim().slice(0, 40)};
+})()"""
+
+HASH_JS = "location.hash = %s"
 
 
 class LobbyStream:
@@ -328,6 +359,146 @@ class LobbyStream:
             return False, "Đã bấm ô bàn nhưng chưa chuyển vào bàn %s." % table_id
         except Exception as exc:
             return False, "Không mở được bàn (%s)." % type(exc).__name__
+        finally:
+            if ws is not None:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+
+    def back_to_lobby(self, wait_seconds=25):
+        """Đổi hash về danh sách bàn Baccarat để rời màn hình bàn mà không tải lại trang."""
+        import websocket
+
+        ws = None
+        try:
+            page = self.session._cdp_page()
+            url = (page or {}).get("url", "")
+            if not BR.is_lobby_url(url):
+                return False, "Không có tab sảnh Evolution trong Chrome CDP 9222."
+            route = BR.lobby_list_url(url)
+            ws = websocket.create_connection(BR.validated_endpoint(page), suppress_origin=True,
+                                             timeout=BR.SCRIPT_TIMEOUT, redirect_limit=0,
+                                             http_no_proxy=["127.0.0.1", "localhost", "::1"])
+            self._command(ws, "Runtime.enable")
+            if not self._wait_context(ws):
+                return False, "Không lấy được ngữ cảnh trang sảnh để trở về danh sách bàn."
+            self._command(ws, "Runtime.evaluate", {
+                "expression": HASH_JS % json.dumps(urlsplit(route).fragment),
+                "contextId": self.contexts[0]})
+            deadline = time.monotonic() + wait_seconds
+            while time.monotonic() < deadline:
+                time.sleep(1.5)
+                page = self.session._cdp_page() or {}
+                if "table_id" not in urlsplit(page.get("url", "")).fragment and self._lobby_context(ws)[0]:
+                    self.note = "Đã về danh sách bàn Baccarat."
+                    return True, "Đã rời bàn · danh sách bàn Baccarat hiển thị trở lại."
+            return False, ("Đã đổi route nhưng %d giây chưa thấy lại danh sách bàn; "
+                           "bấm “Vào sảnh EVO” để thử lại." % wait_seconds)
+        except Exception as exc:
+            return False, "Không về được danh sách bàn (%s)." % type(exc).__name__
+        finally:
+            if ws is not None:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+
+    def _wait_lobby_page(self, portal_socket, wait_seconds):
+        """Chờ tab sảnh EVO; nếu sảnh nằm trong iframe của trang vào thì nhận ra ở đó."""
+        deadline = time.monotonic() + wait_seconds
+        while time.monotonic() < deadline:
+            time.sleep(1.5)
+            try:
+                pages = self.session._cdp_pages()
+            except Exception:
+                continue
+            lobby = next((page for page in pages if BR.is_lobby_url(page.get("url"))), None)
+            if lobby is not None:
+                return lobby, False
+            if not any(BR.is_portal_url(page.get("url")) for page in pages):
+                continue  # trang vào đã tự chuyển sang hướng khác; chờ lượt sau.
+            try:
+                if self._lobby_context(portal_socket)[0] is not None:
+                    return None, True
+            except Exception:
+                continue
+        return None, False
+
+    def _wait_context(self, ws, seconds=6.0):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline and not self.contexts:
+            try:
+                self._command(ws, "Runtime.evaluate", {"expression": "1", "returnByValue": True})
+            except Exception:
+                break
+        return bool(self.contexts)
+
+    def open_lobby_from_portal(self, wait_seconds=30):
+        """Bấm “Chơi game” của Evolution trên trang vào, rồi bật route Baccarat của sảnh.
+
+        Chỉ điều hướng giữa trang vào và sảnh, không chạm khu vực đặt cược.
+        """
+        import websocket
+
+        def connect(page):
+            return websocket.create_connection(
+                BR.validated_endpoint(page), suppress_origin=True, timeout=BR.SCRIPT_TIMEOUT,
+                redirect_limit=0, http_no_proxy=["127.0.0.1", "localhost", "::1"])
+
+        ws = None
+        self._reset()
+        try:
+            portal = next((page for page in self.session._cdp_pages()
+                           if BR.is_portal_url(page.get("url"))), None)
+            if portal is None:
+                return False, ("Không có tab trang vào %s trong Chrome CDP 9222; hãy mở %s "
+                               "và đăng nhập." % (BR.PORTAL_HOST, BR.START_URL))
+            ws = connect(portal)
+            self._command(ws, "Runtime.enable")
+            box, reason = None, "evo_button_not_found"
+            for context_id in list(self.contexts):
+                value = self._value(ws, EVO_ENTRY_JS, context_id)
+                if not isinstance(value, dict):
+                    continue
+                if "x" in value:
+                    box = value
+                    break
+                reason = value.get("reason", reason)
+            if box is None:
+                return False, "Không bấm được nút “Chơi game” của Evolution (%s)." % reason
+            for event in ("mouseMoved", "mousePressed", "mouseReleased"):
+                params = {"type": event, "x": box["x"], "y": box["y"]}
+                if event != "mouseMoved":
+                    params.update(button="left", clickCount=1)
+                self._command(ws, "Input.dispatchMouseEvent", params)
+            lobby, embedded = self._wait_lobby_page(ws, wait_seconds)
+            ws.close()
+            ws = None
+            if embedded:
+                self.note = "Sảnh Evolution hiện trong trang vào."
+                return True, "Đã vào sảnh qua iframe · bấm “Quét toàn sảnh” để lấy lịch sử bàn."
+            if lobby is None:
+                return False, ("Đã bấm nhưng %d giây chưa thấy tab sảnh Evolution; "
+                               "trang vào có thể đòi đăng nhập trước." % wait_seconds)
+            url = lobby.get("url", "")
+            route = BR.lobby_url_with_route(url)
+            if route == url:
+                self.note = "Đã vào sảnh Evolution."
+                return True, "Đã vào sảnh Evolution · %s" % BR._safe_url(url)
+            self._reset()
+            ws = connect(lobby)
+            self._command(ws, "Runtime.enable")
+            if not self._wait_context(ws):
+                return True, ("Đã vào sảnh nhưng chưa đổi được route Baccarat; "
+                              "bấm “Quét toàn sảnh” để thử lại.")
+            self._command(ws, "Runtime.evaluate", {
+                "expression": HASH_JS % json.dumps(urlsplit(route).fragment),
+                "contextId": self.contexts[0]})
+            self.note = "Đã đổi link sảnh sang danh sách bàn Baccarat."
+            return True, "Đã vào sảnh và mở danh sách bàn Baccarat · %s" % BR._safe_url(route)
+        except Exception as exc:
+            return False, "Không vào được sảnh Evolution (%s)." % type(exc).__name__
         finally:
             if ws is not None:
                 try:

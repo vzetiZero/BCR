@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-"""Kiểm chứng phương pháp 3-3 bằng mô phỏng Monte Carlo.
+"""Kiểm chứng các phương pháp vào cầu bằng mô phỏng Monte Carlo.
 
-Chạy:  python backtest.py [số_ván]
+Chạy:  python backtest.py [số_ván] [3-3|3-2]
 Mỗi tay được rút độc lập theo xác suất Baccarat chuẩn 8 bộ bài:
 Banker 45.86%, Player 44.62%, Tie 9.52% (hoa hồng Banker 5%).
 """
@@ -33,8 +33,9 @@ def gen_shoe(rng, mean=65, spread=8):
     return [draw(rng) for _ in range(n)]
 
 
-def play_method(shoe, restart_after_bust=False):
+def play_method(shoe, profile=ME.DEFAULT_PROFILE, ladder=None, restart_after_bust=False):
     """Đi hết ván theo phương pháp. Trả về thống kê một ván."""
+    stakes = ME.ladder_stakes(profile, ladder)
     results = []
     state = {"started": False, "ladder_step": 0, "hands_in_block": 0, "strong": None}
     pnl = 0.0
@@ -49,20 +50,20 @@ def play_method(shoe, restart_after_bust=False):
         if bust:
             results.append(raw)
             continue
-        p = ME.plan(results, BASE_STAKE, state["ladder_step"], state["hands_in_block"],
-                      state["started"], state["strong"])
+        p = ME.plan(results, stakes, state["ladder_step"], state["hands_in_block"],
+                      state["started"], state["strong"], profile)
         if p["action"] == "halt":
             if restart_after_bust:
                 state = {"started": True, "ladder_step": 0, "hands_in_block": state["hands_in_block"],
                          "strong": state["strong"]}
-                p = ME.plan(results, BASE_STAKE, 0, state["hands_in_block"], True, state["strong"])
+                p = ME.plan(results, stakes, 0, state["hands_in_block"], True, state["strong"], profile)
                 bust = False
             else:
                 bust = True
                 results.append(raw)
                 continue
         if p["action"] in ("start", "bet"):
-            state, res = ME.advance(state, raw, p["side"], p["stake"])
+            state, res = ME.advance(state, raw, p["side"], p["stake"], profile)
             state["strong"] = p["strong"]
             pnl += res["delta"]
             bets += 1
@@ -116,7 +117,7 @@ def report(name, rows):
     print("  Lãi/lỗ trung bình 1 ván : %s" % _signed(total / len(rows)))
     print("  Lãi/lỗ trung bình 1 tay : %s" % _signed(total / bets if bets else 0))
     print("  %% ván có lãi            : %.1f%%" % (positive / len(rows) * 100))
-    print("  %% ván cháy ladder 6 bậc : %.1f%%" % (busts / len(rows) * 100))
+    print("  %% ván cháy hết ladder   : %.1f%%" % (busts / len(rows) * 100))
     print("  Ván lỗ nặng nhất        : %s" % _signed(min(pnls)))
     print("  Ván lãi cao nhất        : %s" % _signed(max(pnls)))
     print("  Sụt vốn sâu nhất 1 ván  : %s" % _signed(min(r["drawdown"] for r in rows)))
@@ -132,17 +133,23 @@ def _signed(value):
 
 def main():
     shoes = int(sys.argv[1]) if len(sys.argv) > 1 else 20000
+    profiles = [ME.DEFAULT_PROFILE] if len(sys.argv) < 3 else sys.argv[2].split(",")
+    for profile in profiles:
+        stakes = ME.ladder_stakes(profile)
+        print("\n########## Phương pháp %s · khối %d tay ##########" % (profile, ME.block_hands(profile)))
+        print("Mô phỏng %d ván. Bậc cược: %s." % (
+            shoes, "-".join(M.fmt_money(s) for s in stakes)))
+
+        rng = random.Random(20261105)
+        dataset = [gen_shoe(rng) for _ in range(shoes)]
+
+        report("Phương pháp %s (dừng khi cháy ladder)" % profile,
+               [play_method(s, profile, stakes) for s in dataset])
+        report("Phương pháp %s (nối lại sau khi cháy)" % profile,
+               [play_method(s, profile, stakes, restart_after_bust=True) for s in dataset])
+
     rng = random.Random(20261105)
-    print("Mô phỏng %d ván. Cược gốc %s, ladder %s." % (
-        shoes, M.fmt_money(BASE_STAKE),
-        "-".join(M.fmt_money(s) for s in ME.ladder_stakes(BASE_STAKE))))
-
     dataset = [gen_shoe(rng) for _ in range(shoes)]
-    hands = sum(len(s) for s in dataset)
-
-    report("Phương pháp 3-3 (dừng khi cháy ladder)", [play_method(s) for s in dataset])
-    report("Phương pháp 3-3 (nối lại sau khi cháy)",
-           [play_method(s, restart_after_bust=True) for s in dataset])
     report("Mốc so sánh: cược đều 100k cửa Banker mọi tay",
            [play_flat(s, E.BANKER) for s in dataset])
     report("Mốc so sánh: cược đều 100k cửa Player mọi tay",

@@ -11,17 +11,19 @@ import re
 import subprocess
 import threading
 import time
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlsplit, urlencode, urlunsplit
 from urllib.request import urlopen
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROFILE_DIR = os.path.join(HERE, "chrome_profile")
 READER_JS = os.path.join(HERE, "extension", "reader.js")
 DRIVER_PATH = os.path.join(HERE, "drivers", "chromedriver.exe")
-DEFAULT_URL = "https://ivi4sibf.kurxcbnpmjvc.link/frontend/evo/r3/#category=all_games&game=baccarat&see=baccarat"
-SITE_HOST = urlsplit(DEFAULT_URL).hostname
-START_URL = "https://m.9vnv.com/vn/casino_evo?from=casino"
+LOBBY_HOST_SUFFIX = "evo-games.com"
+LOBBY_PATH = "/frontend/evo/r3"
+LOBBY_ROUTE = "category=all_games&game=baccarat&see=baccarat"
+START_URL = "https://www.neo179.com/gamelobby/live"
 PORTAL_HOST = urlsplit(START_URL).hostname
+PORTAL_PATH = urlsplit(START_URL).path
 WIN_W, WIN_H = 600, 800
 MAX_FRAME_DEPTH = 4
 MAX_SCAN_FRAMES = 64
@@ -39,24 +41,83 @@ CHROME_CANDIDATES = (
 )
 
 
-def valid_site_url(url):
-    """Chỉ HTTPS đúng host, cổng mặc định, không userinfo hoặc URL cục bộ."""
+def is_lobby_host(host):
+    """Sảnh Evolution đổi tên mirror liên tục nên chỉ cần khớp đuôi *.evo-games.com."""
+    return (isinstance(host, str)
+            and (host == LOBBY_HOST_SUFFIX or host.endswith("." + LOBBY_HOST_SUFFIX)))
+
+
+def is_lobby_url(url):
+    """URL sảnh EVO thật: https, đuôi host evo-games, đúng đường dẫn lobby, không userinfo."""
     if not isinstance(url, str) or not url or "\\" in url:
         return False
     if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in url):
         return False
     try:
         parsed = urlsplit(url)
-        host_ok = parsed.hostname == SITE_HOST or (
-            parsed.hostname == PORTAL_HOST and parsed.path == "/vn/casino_evo"
-            and parsed.query == "from=casino" and not parsed.fragment)
-        return (parsed.scheme == "https" and host_ok
+        return (parsed.scheme == "https" and is_lobby_host(parsed.hostname)
+                and parsed.path.startswith(LOBBY_PATH)
                 and parsed.username is None and parsed.password is None
-                and parsed.port in (None, 443)
-                and parsed.netloc.lower() in (SITE_HOST, SITE_HOST + ":443",
-                                               PORTAL_HOST, PORTAL_HOST + ":443"))
+                and parsed.port in (None, 443))
     except (ValueError, TypeError):
         return False
+
+
+def is_portal_url(url):
+    """Trang vào cổng: chỉ dùng https://www.neo179.com/gamelobby/live."""
+    if not isinstance(url, str) or "\\" in url:
+        return False
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in url):
+        return False
+    try:
+        parsed = urlsplit(url)
+        return (parsed.scheme == "https" and parsed.hostname == PORTAL_HOST
+                and parsed.path.startswith(PORTAL_PATH)
+                and parsed.username is None and parsed.password is None
+                and parsed.port in (None, 443))
+    except (ValueError, TypeError):
+        return False
+
+
+def valid_site_url(url):
+    """Chỉ HTTPS đúng host, cổng mặc định, không userinfo hoặc URL cục bộ."""
+    return is_lobby_url(url) or is_portal_url(url)
+
+
+def _with_baccarat_route(parsed, merged):
+    for key, value in parse_qsl(LOBBY_ROUTE, keep_blank_values=True):
+        if any(k == key and v == value for k, v in merged):
+            continue
+        merged = [(k, v) for k, v in merged if k != key]
+        merged.append((key, value))
+    fragment = urlencode(merged)
+    if fragment == parsed.fragment:
+        return urlunsplit(parsed)
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, parsed.query, fragment))
+
+
+def lobby_url_with_route(url):
+    """Giữ nguyên host/đường dẫn của redirect thật, chỉ bổ sung route baccarat trong hash.
+
+    Màn hình bàn đã mở (hash có table_id) giữ nguyên; chỉ danh sách sảnh được đổi route.
+    """
+    if not is_lobby_url(url):
+        return ""
+    parsed = urlsplit(url)
+    merged = parse_qsl(parsed.fragment, keep_blank_values=True)
+    if any(key == "table_id" for key, _ in merged):
+        return url
+    return _with_baccarat_route(parsed, merged)
+
+
+def lobby_list_url(url):
+    """URL danh sách bàn trên cùng host/đường dẫn: bỏ table_id của màn hình bàn để về sảnh."""
+    if not is_lobby_url(url):
+        return ""
+    parsed = urlsplit(url)
+    merged = [(key, value) for key, value in parse_qsl(parsed.fragment, keep_blank_values=True)
+              if key != "table_id"]
+    return _with_baccarat_route(parsed, merged)
 
 
 def _safe_url(url):
@@ -183,7 +244,7 @@ class BrowserSession:
         self.cdp_attached = False
         self.mode = ""
         self.note = ""
-        self.url = DEFAULT_URL
+        self.url = START_URL
         self.lock = threading.RLock()
         self._reader = None
         self._reader_mtime_ns = None
@@ -210,10 +271,18 @@ class BrowserSession:
                      timeout=SCRIPT_TIMEOUT) as response:
             return json.load(response)
 
+    def _cdp_pages(self):
+        return [page for page in self._cdp_json("list")
+                if isinstance(page, dict) and page.get("type") == "page"
+                and valid_site_url(page.get("url"))]
+
     def _cdp_page(self):
-        return next((page for page in self._cdp_json("list")
-                     if isinstance(page, dict) and page.get("type") == "page"
-                     and valid_site_url(page.get("url"))), None)
+        pages = self._cdp_pages()
+        # Ưu tiên tab sảnh EVO; nếu sảnh nằm trong iframe của trang vào thì lấy trang vào.
+        for page in pages:
+            if is_lobby_url(page.get("url")):
+                return page
+        return pages[0] if pages else None
 
     def attach(self):
         """Gắn Chrome hiện có qua CDP; không mở, đóng hay điều hướng tab."""
@@ -226,7 +295,8 @@ class BrowserSession:
             self.last_error = ""
             try:
                 if self._cdp_page() is None:
-                    self.note = "Không có tab đúng site trong Chrome CDP 9222."
+                    self.note = ("Không có tab nào trong Chrome CDP 9222 mở %s hoặc sảnh EVO "
+                                 "(*.%s)." % (PORTAL_HOST, LOBBY_HOST_SUFFIX))
                     self.last_diag = {"reason": "no_approved_tab"}
                     self.connection_state = "waiting"
                     return False
@@ -240,7 +310,8 @@ class BrowserSession:
                 self.mode = "cdp"
                 self.cdp_attached = True
                 self._driver_info = info
-                self.note = "Đã gắn Chrome hiện có · CDP 9222; chỉ đọc, giữ nguyên phiên đăng nhập."
+                self.note = ("Đã gắn Chrome hiện có · CDP 9222; chỉ đọc, giữ nguyên phiên đăng nhập. "
+                             "Bấm “Vào sảnh EVO” để mở sảnh.")
                 self.connection_state = "waiting"
                 return True
             except Exception as exc:
@@ -257,10 +328,12 @@ class BrowserSession:
                     return True
                 self.note = "CDP đang tạm dừng; mở lại tab đúng site hoặc ngắt kết nối trước khi mở Chrome mới."
                 return False
-            url = DEFAULT_URL if url is None else url
+            url = START_URL if url is None else url
             if not valid_site_url(url):
-                self.note = ("URL không được phép: chỉ dùng https://%s với cổng 443, "
-                             "không userinfo; không hỗ trợ file hoặc trang khác." % SITE_HOST)
+                self.note = ("URL không được phép: chỉ https://%s%s hoặc sảnh EVO "
+                             "https://<mirror>.%s%s; cổng 443, không userinfo, không hỗ trợ "
+                             "file hay trang khác." % (PORTAL_HOST, PORTAL_PATH,
+                                                       LOBBY_HOST_SUFFIX, LOBBY_PATH))
                 self.last_error = self.note
                 if self.driver is None:
                     self.connection_state = "error"
@@ -410,14 +483,17 @@ class BrowserSession:
             return self._reader
 
     def _reader_script(self):
-        # Root tự xác nhận host; iframe được đọc dưới tab gốc đã duyệt.
+        # Root tự xác nhận thuộc đuôi sảnh EVO; iframe được đọc dưới tab gốc đã duyệt.
         return """
             if (window === window.top) {
                 const u = new URL(location.href);
-                if (u.protocol !== 'https:' || u.hostname !== arguments[0] ||
+                const suffix = arguments[0];
+                if (u.protocol !== 'https:' ||
+                    (u.hostname !== suffix && !u.hostname.endsWith('.' + suffix)) ||
+                    !u.pathname.startsWith('%s') ||
                     (u.port && u.port !== '443') || u.username || u.password) return null;
             }
-        """ + self.reader_src() + """
+        """ % LOBBY_PATH + self.reader_src() + """
             const report = window.__BCR_SCAN();
             const u = new URL(location.href);
             const safe = /^(https?:)$/.test(u.protocol) ? u.origin + u.pathname : '';
@@ -540,7 +616,7 @@ class BrowserSession:
                     self.connection_state = "waiting"
                     self.last_diag = {"reason": "no_default_context"}
                     return []
-                expression = "(function(){\n%s\n})(%s)" % (self._reader_script(), json.dumps(SITE_HOST))
+                expression = "(function(){\n%s\n})(%s)" % (self._reader_script(), json.dumps(LOBBY_HOST_SUFFIX))
                 reports = []
                 best_count = -1
                 while self.last_frames < len(contexts):
@@ -623,14 +699,13 @@ class BrowserSession:
                     return []
                 if not self._baccarat_route_set:
                     try:
-                        parsed = urlsplit(driver.current_url)
-                        if parsed.hostname == SITE_HOST and parsed.path.startswith("/frontend/evo/r3/"):
-                            if "table_id=" in parsed.fragment or "game=baccarat&see=baccarat" in parsed.fragment:
-                                self._baccarat_route_set = True
-                            elif parsed.fragment in ("", "category=all_games"):
+                        current = driver.current_url
+                        route = lobby_url_with_route(current)
+                        if route:
+                            if route != current:
                                 driver.execute_script("location.hash = arguments[0]",
-                                                      "category=all_games&game=baccarat&see=baccarat")
-                                self._baccarat_route_set = True
+                                                      urlsplit(route).fragment)
+                            self._baccarat_route_set = True
                     except Exception:
                         pass
                 # Root được kiểm tra lại ngay trong JS; frame khác origin chỉ được
@@ -665,7 +740,7 @@ class BrowserSession:
                             stack.extend(path + (i,) for i in reversed(range(count)))
                         elif n:
                             limited = True
-                        rep = _clean_report(driver.execute_script(script, SITE_HOST))
+                        rep = _clean_report(driver.execute_script(script, LOBBY_HOST_SUFFIX))
                     except (InvalidSessionIdException, NoSuchWindowException):
                         raise
                     except (NoSuchFrameException, StaleElementReferenceException, IndexError):

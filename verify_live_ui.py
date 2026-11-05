@@ -51,6 +51,10 @@ def begin():
     with patch("app.messagebox.askyesno", return_value=True):
         app.apply_settings()
     assert len(list(state.parent.glob("bcr-session-*.json"))) == 1
+    assert app.entries["capital"].get() == "20,000,000", app.entries["capital"].get()
+    assert [v.get() for v in app.ladder_vars] == ["100,000", "300,000", "700,000", "1,500,000",
+                                                  "3,100,000", "6,400,000"], app.ladder_vars[0].get()
+    assert app.sim.money.capital == 20_000_000
     screenshot("ui-settings.png")
     app.nav_buttons["history"].invoke()
     with patch("app.messagebox.showinfo") as info:

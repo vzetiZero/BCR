@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """Theo dõi vốn, cược và các ngưỡng dừng của một phiên chơi."""
 
+import re
+
 FLAT, PERCENT, MARTINGALE = "flat", "percent", "martingale"
 
 BET_MODE_NAME = {
@@ -17,18 +19,29 @@ def fmt_money(value):
     return "{:,.0f}".format(value).replace(",", ".")
 
 
+def fmt_input_money(value):
+    """Nhóm hàng nghìn bằng dấu phẩy cho ô nhập: 2,000,000 để nhìn rõ mốc triệu."""
+    return "{:,.0f}".format(value)
+
+
+def parse_money(text):
+    """Đọc ô nhập tiền: 2,000,000 · 2.000.000 · 2000000 đều cho ra 2000000."""
+    digits = re.sub(r"[.,]", "", str(text).strip())
+    if not re.fullmatch(r"[-+]?\d+", digits):
+        raise ValueError(str(text))
+    return float(digits)
+
+
 class MoneyBook:
     def __init__(self, capital=20000000, unit=100000, mode=FLAT, percent=5.0,
-                 stop_loss_pct=30.0, take_profit_pct=25.0, max_hands=0, mtg_cap=5):
+                 take_profit_pct=25.0, mtg_cap=5):
         self.capital = max(0, float(capital))
         self.start_capital = self.capital
         self.balance = self.capital
         self.unit = max(1, float(unit))
         self.mode = mode
         self.percent = max(0.1, float(percent))
-        self.stop_loss_pct = max(1.0, float(stop_loss_pct))
         self.take_profit_pct = max(1.0, float(take_profit_pct))
-        self.max_hands = max(0, int(max_hands))
         self.mtg_cap = max(1, int(mtg_cap))
         self.hands_played = 0
         self.wins = 0
@@ -98,14 +111,9 @@ class MoneyBook:
         return self.balance - self.start_capital
 
     def check_limits(self):
-        lost_pct = (self.start_capital - self.balance) / self.start_capital * 100 if self.start_capital else 0
         won_pct = (self.balance - self.start_capital) / self.start_capital * 100 if self.start_capital else 0
-        if lost_pct >= self.stop_loss_pct:
-            self.blocked = ("STOP_LOSS", "Thua %.0f%% vốn (%s). NGỪNG — đã tới ngưỡng cắt lỗ." % (lost_pct, fmt_money(self.start_capital - self.balance)))
-        elif won_pct >= self.take_profit_pct:
+        if won_pct >= self.take_profit_pct:
             self.blocked = ("TAKE_PROFIT", "Lãi %.0f%% vốn (%s). NGỪNG — đã chốt lời." % (won_pct, fmt_money(self.profit)))
-        elif self.max_hands and self.hands_played >= self.max_hands:
-            self.blocked = ("MAX_HANDS", "Đánh đủ %d tay của phiên. Kết thúc phiên." % self.hands_played)
         elif self.balance < self.unit:
             self.blocked = ("NO_CAPITAL", "Vốn còn lại thấp hơn 1 đơn vị cược. Không còn gì để đánh.")
         else:

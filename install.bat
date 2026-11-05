@@ -83,7 +83,7 @@ if not %errorlevel%==0 (
 echo.
 echo [OK] Cai dat hoan tat.
 echo Mo ung dung: double-click Chay_BCR.bat
-echo   - "Mo Chrome" hoac "Gan Chrome dang mo" (CDP localhost 9222) de dung cau that.
+echo   - "Mo Chrome" hoac "Gan Chrome dang mo" (CDP localhost 9222) roi bam "Vao sanh EVO".
 echo   - "Quet toan sanh" roi "Tu mo ban dat chuan" de vao ban va gia lap duoi tay that.
 echo   - Ung dung chi doc cau va gia lap cuoc, khong dat cuoc that.
 pause

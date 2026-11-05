@@ -24,8 +24,8 @@ function canvas(history, {id = 'tableABC', title = 'Baccarat Tốc Độ A', typ
 }
 
 function scan(canvases) {
-  const ctx = {window: {}, location: {href: 'https://ivi4sibf.kurxcbnpmjvc.link/frontend/evo/r3/?token=not-output#category=all_games',
-    origin: 'https://ivi4sibf.kurxcbnpmjvc.link', pathname: '/frontend/evo/r3/'},
+  const ctx = {window: {}, location: {href: 'https://tmrw17k36as.evo-games.com/frontend/evo/r3/?token=not-output#category=all_games',
+    origin: 'https://tmrw17k36as.evo-games.com', pathname: '/frontend/evo/r3/'},
     document: {title: 'Lobby', querySelector: () => ({}), querySelectorAll: selector => {
       assert.equal(selector, '[data-role="history-roads"] canvas');
       return canvases;
@@ -129,8 +129,8 @@ function beadRoad(names) {
   };
 }
 
-function scanTableScreen(beads, href = 'https://ivi4sibf.kurxcbnpmjvc.link/frontend/evo/r3/#category=all_games&table_id=suropcmnbqpabwko') {
-  const ctx = {window: {}, location: {href, origin: 'https://ivi4sibf.kurxcbnpmjvc.link', pathname: '/frontend/evo/r3/'},
+function scanTableScreen(beads, href = 'https://tmrw17k36as.evo-games.com/frontend/evo/r3/#category=all_games&table_id=suropcmnbqpabwko') {
+  const ctx = {window: {}, location: {href, origin: 'https://tmrw17k36as.evo-games.com', pathname: '/frontend/evo/r3/'},
     document: {title: 'Baccarat', querySelector: selector => {
       assert.equal(selector, '[data-role="table-tile"]');
       return null;
@@ -166,4 +166,72 @@ test('rejects unknown bead symbols and oversized table roads', () => {
 
 test('skips bead containers without readable items', () => {
   assert.equal(scanTableScreen([beadRoad([])]).tables.length, 0);
+});
+
+// EVO_ENTRY_JS song song với luồng bấm nút ở lobby_stream.py: doc truc tiep tu nguồn Python.
+const entrySource = /EVO_ENTRY_JS = """([\s\S]*?)"""/.exec(
+  fs.readFileSync(__dirname + '/lobby_stream.py', 'utf8'))[1];
+
+function evoItem({subprovider = 'EVO', alt = 'Evolution', disabled = false,
+                  rect = {x: 200, y: 400, width: 120, height: 40}, afterScroll = null} = {}) {
+  const button = {
+    disabled,
+    innerText: 'Chơi game',
+    getAttribute: (key) => (key === 'title' ? '' : null),
+    scrollIntoView: () => { if (afterScroll) Object.assign(button.current, afterScroll); },
+    getBoundingClientRect: () => ({...button.current,
+      bottom: button.current.y + button.current.height,
+      right: button.current.x + button.current.width}),
+    current: {...rect},
+  };
+  const node = {
+    querySelector: (selector) => {
+      if (selector === 'img') return {alt};
+      return (selector === 'button.btn-main' || selector === 'button') ? button : null;
+    },
+  };
+  return {subprovider, node};
+}
+
+function portalScan(items, {inIframe = false, innerHeight = 800, innerWidth = 600} = {}) {
+  const ctx = {innerHeight, innerWidth,
+    document: {querySelectorAll: (selector) => {
+      assert.equal(selector, '.game-item[data-subprovider="EVO"]');
+      return items.filter((item) => item.subprovider === 'EVO').map((item) => item.node);
+    }}};
+  const win = {};
+  win.top = inIframe ? {frameElement: true} : win;
+  ctx.window = win;
+  vm.createContext(ctx);
+  return JSON.parse(JSON.stringify(vm.runInContext(entrySource, ctx)));
+}
+
+test('takes the pointer position of the Evolution play button on the entry page', () => {
+  const box = portalScan([evoItem({subprovider: 'SA'}), evoItem()]);
+  assert.equal(box.x, 260);
+  assert.equal(box.y, 420);
+  assert.equal(box.label, 'Chơi game');
+});
+
+test('scrolls a below-the-fold play button into view before measuring it', () => {
+  const box = portalScan([evoItem({rect: {x: 200, y: 900, width: 120, height: 40},
+                                    afterScroll: {x: 200, y: 400, width: 120, height: 40}})]);
+  assert.equal(box.y, 420);
+});
+
+test('refuses to click an iframe, a missing tile or a disabled button', () => {
+  assert.deepEqual(portalScan([evoItem()], {inIframe: true}), {reason: 'not_top_frame'});
+  assert.deepEqual(portalScan([evoItem({subprovider: 'SA'})]), {reason: 'evo_item_not_found'});
+  assert.deepEqual(portalScan([evoItem({disabled: true})]), {reason: 'evo_button_not_found'});
+  assert.deepEqual(portalScan([evoItem({rect: {x: 200, y: 900, width: 120, height: 40}})]),
+                   {reason: 'evo_button_offscreen'});
+});
+
+test('prefers the Evolution tile and stops when two tiles look identical', () => {
+  const picked = portalScan([evoItem({alt: 'Ezugi', rect: {x: 0, y: 100, width: 120, height: 40}}),
+                             evoItem({rect: {x: 200, y: 100, width: 120, height: 40}})]);
+  assert.equal(picked.x, 260);
+  const ambiguous = portalScan([evoItem(), evoItem()]);
+  assert.equal(ambiguous.reason, 'evo_button_ambiguous');
+  assert.equal(ambiguous.count, 2);
 });

@@ -1,34 +1,59 @@
 # -*- coding: utf-8 -*-
-"""Phương pháp vào cầu 3-3: lọc bàn, đánh 3 tay bên mạnh -> 3 tay bên kia, gấp thếp 6 bậc.
+"""Các phương pháp vào cầu: lọc bàn, đánh khối bên mạnh -> bên đổi, bậc cược nhập tay theo khối.
 
 Quy tắc của người dùng:
 1. Chọn bàn: đã đi 15-20 tay, cầu ngắn (không có bệt từ 7 tay trở lên), chưa từng có cầu 3-3.
-2. Cầu đang mạnh bên nào -> đánh 3 tay bên đó, rồi đổi sang bên kia 3 tay (khối 6 tay).
-3. Ăn thì quay về cược gốc 100k. Bậc gấp thếp tối đa 6 tay.
+2. Cầu đang mạnh bên nào -> đánh mấy tay đầu khối bên đó, rồi đổi sang bên kia mấy tay còn lại.
+   Khối 3-3 đi 6 tay, khối 3-2 đi 5 tay.
+3. Thắng thì quay về bậc 1. Thua thì sang bậc kế tiếp trong danh sách mức cược người dùng nhập.
 4. Cầu hoà (Tie) vẫn tính là 1 tay của chu kỳ; tiền được hoàn lại nên không lên bậc.
 """
+
+import math
 
 import engine as E
 import money as M
 
-BET_CYCLE = 3           # số tay mỗi bên trong khối 3-3
-BLOCK_HANDS = 6         # 3 tay bên mạnh + 3 tay bên kia
-LADDER_MULT = [1, 3, 7, 15, 31, 64]   # x cược gốc: 100k-300k-700k-1.5tr-3.1tr-6.4tr
-MAX_LADDER = len(LADDER_MULT)
+PROFILES = {          # (số tay bên mạnh, số tay bên đổi) của một khối
+    "3-3": (3, 3),
+    "3-2": (3, 2),
+}
+DEFAULT_PROFILE = "3-3"
+# Mức cược mặc định chỉ để điền sẵn vào ô nhập; người dùng tự đổi từng bậc, không nhân cứng.
+DEFAULT_LADDER = {
+    "3-3": [100_000, 300_000, 700_000, 1_500_000, 3_100_000, 6_400_000],
+    "3-2": [40_000, 160_000, 360_000, 740_000, 1_700_000],
+}
+PROFILE_LABEL = {"3-3": "3-3 · 6 tay (3 mạnh + 3 đổi)", "3-2": "3-2 · 5 tay (3 mạnh + 2 đổi)"}
 STREAK_IS_BET = 7       # từ 7 tay liên tiếp tính là bệt -> loại bàn
 MIN_HANDS = 15
 MAX_HANDS = 20
 LOOKBACK_STRONG = 10    # số tay phân thắng bại gần nhất để xác định bên mạnh
 
 
+def block_hands(profile):
+    return sum(PROFILES[profile])
+
+
+def strong_hands(profile):
+    return PROFILES[profile][0]
+
+
+def ladder_stakes(profile, ladder=None):
+    """Chuẩn hoá danh sách mức cược: đúng số tay của khối, mỗi mức là số dương."""
+    stakes = list(DEFAULT_LADDER[profile] if ladder is None else ladder)
+    need = block_hands(profile)
+    if len(stakes) != need:
+        raise ValueError("Phương pháp %s cần đúng %d mức cược, đang có %d mức." % (profile, need, len(stakes)))
+    if not all(math.isfinite(float(s)) and float(s) > 0 for s in stakes):
+        raise ValueError("Mỗi bậc cược phải là một số lớn hơn 0.")
+    return [float(s) for s in stakes]
+
+
 def parse_road(text):
     """Đọc cầu dạng chữ: B=Banker, P=Player, T=Hoà. Mọi ký tự khác bị bỏ qua."""
     mapping = {"B": E.BANKER, "P": E.PLAYER, "T": E.TIE}
     return [mapping[ch] for ch in text.upper() if ch in mapping]
-
-
-def ladder_stakes(base_stake):
-    return [base_stake * m for m in LADDER_MULT]
 
 
 def has_long_streak(results, limit=STREAK_IS_BET):
@@ -98,10 +123,12 @@ def check_table(results, min_hands=MIN_HANDS, max_hands=MAX_HANDS):
     }
 
 
-def plan(results, base_stake=100000, ladder_step=0, hands_in_block=0, started=False,
-         strong=None, min_hands=MIN_HANDS, max_hands=MAX_HANDS):
-    """Bàn tay tiếp theo nên làm gì. Trả về cửa, số tiền, vị trí trong khối 3-3."""
-    stakes = ladder_stakes(base_stake)
+def plan(results, stakes, ladder_step=0, hands_in_block=0, started=False,
+         strong=None, profile=DEFAULT_PROFILE, min_hands=MIN_HANDS, max_hands=MAX_HANDS):
+    """Bàn tay tiếp theo nên làm gì. Trả về cửa, số tiền, vị trí trong khối theo phương pháp đã chọn."""
+    stakes = ladder_stakes(profile, stakes)
+    cycle = strong_hands(profile)
+    block = block_hands(profile)
     info = check_table(results, min_hands, max_hands)
 
     if not started:
@@ -110,33 +137,35 @@ def plan(results, base_stake=100000, ladder_step=0, hands_in_block=0, started=Fa
                 c["detail"] for c in info["checks"] if not c["ok"]), "checks": info["checks"],
                 "block_pos": 0, "ladder_step": 0, "strong": info["strong"]}
         return {"action": "start", "side": info["strong"], "stake": stakes[0],
-                "reason": "Bàn đủ điều kiện. Cầu mạnh bên %s -> đánh 3 tay đầu khối." % E.SIDE_NAME[info["strong"]],
+                "reason": "Bàn đủ điều kiện. Cầu mạnh bên %s -> đánh %d tay đầu khối %s." % (
+                    E.SIDE_NAME[info["strong"]], cycle, profile),
                 "checks": info["checks"], "block_pos": 0, "ladder_step": 0, "strong": info["strong"]}
 
     if strong is None:
         strong = info["strong"] or E.BANKER
     weak = E.PLAYER if strong == E.BANKER else E.BANKER
 
-    if hands_in_block >= BLOCK_HANDS or (started and hands_in_block == 0):
+    if hands_in_block >= block or (started and hands_in_block == 0):
         hands_in_block = 0          # sang khối mới, tính lại bên mạnh
         strong = info["strong"] or strong
         weak = E.PLAYER if strong == E.BANKER else E.BANKER
 
     pos = hands_in_block
-    side = strong if pos < BET_CYCLE else weak
+    side = strong if pos < cycle else weak
     streak_side, streak_len = has_long_streak(results)
     already_33, _ = has_3_3(results)
 
-    if ladder_step >= MAX_LADDER:
+    if ladder_step >= len(stakes):
         return {"action": "halt", "side": None, "stake": 0,
-                "reason": "Đã thua hết %d bậc gấp thếp (mất %s). Dừng, quay về cược gốc %s." % (
-                    MAX_LADDER, M.fmt_money(sum(stakes)), M.fmt_money(base_stake)),
+                "reason": "Đã thua hết %d bậc gấp thếp (mất %s). Dừng, quay về bậc 1 %s." % (
+                    len(stakes), M.fmt_money(sum(stakes)), M.fmt_money(stakes[0])),
                 "checks": info["checks"], "block_pos": pos, "ladder_step": ladder_step, "strong": strong}
 
     stake = stakes[ladder_step]
-    label = "3 tay bên mạnh" if pos < BET_CYCLE else "3 tay bên đổi"
-    reason = "%s: tay %d/%d của khối, bậc %d/%d -> bắt %s %s." % (
-        label, pos + 1, BLOCK_HANDS, ladder_step + 1, MAX_LADDER, E.SIDE_NAME[side], M.fmt_money(stake))
+    label = "%d tay bên mạnh" % cycle if pos < cycle else "%d tay bên đổi" % (block - cycle)
+    reason = "%s: tay %d/%d của khối %s, bậc %d/%d -> bắt %s %s." % (
+        label, pos + 1, block, profile, ladder_step + 1, len(stakes),
+        E.SIDE_NAME[side], M.fmt_money(stake))
     if streak_side and streak_len >= STREAK_IS_BET:
         reason += " Cẩn thận: bàn vừa xuất hiện bệt %d tay." % streak_len
     if already_33:
@@ -155,11 +184,11 @@ def settle(bet_side, result, stake, commission=0.95):
     return -stake, "loss", "up"
 
 
-def advance(state, result, bet_side, stake):
+def advance(state, result, bet_side, stake, profile=DEFAULT_PROFILE):
     """Cập nhật trạng thái sau một tay. state: dict(ladder_step, hands_in_block, started, strong)."""
     delta, outcome, step_action = settle(bet_side, result, stake)
     state = dict(state)
-    state["hands_in_block"] = 0 if state.get("hands_in_block", 0) + 1 >= BLOCK_HANDS \
+    state["hands_in_block"] = 0 if state.get("hands_in_block", 0) + 1 >= block_hands(profile) \
         else state["hands_in_block"] + 1
     if step_action == "up":
         state["ladder_step"] = state.get("ladder_step", 0) + 1
