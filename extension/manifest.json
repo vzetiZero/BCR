@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "BCR 3-3 Road Reader",
+  "version": "1.0",
+  "description": "Doc bang cau Baccarat dang hien thi va gui ve app BCR tren may nay (http://127.0.0.1:8777). Chi doc, khong dat cuoc, khong gui di dau khac.",
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["reader.js", "content.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "host_permissions": ["http://127.0.0.1:8777/*"]
+}

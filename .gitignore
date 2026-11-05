@@ -1,0 +1,26 @@
+# Profile Chrome dang nhap (chua cookie ca nhan) - khong bao gio push
+chrome_profile/
+
+# Driver Selenium tai file (tai lai bang install.bat)
+drivers/
+
+# Cache Python
+__pycache__/
+*.py[cod]
+
+# Trang thai may nguoi dung (von, loi, phien choi)
+bcr_state.json
+bcr-session-*.json
+live_reports.jsonl
+
+# Bang chung live / anh man hinh
+live-road-evidence.json
+live_canvas_check.json
+live-road-canvas.png
+site-live-check.png
+ui-*.png
+
+# File tam khi chuan doan
+tmp_*
+*.bak
+backtest_report.txt
