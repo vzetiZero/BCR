@@ -16,6 +16,7 @@ import engine as E
 import lobby_stream as LS
 import method as ME
 import money as M
+import table_bets as TB
 
 HERE = Path(__file__).resolve().parent
 STATE_FILE = HERE / "bcr_state.json"
@@ -23,7 +24,9 @@ SCAN_SECONDS = 4
 FAST_SCAN = 1.5
 LIVE_STALE = 30
 ENTRY_WAIT = 75
-MAX_CYCLE_SWEEPS = 6
+# Vòng tự tìm bàn không có trần số lần: nghỉ CYCLE_RETRY_SECONDS giữa hai lượt quét.
+CYCLE_RETRY_SECONDS = 15
+CHIP_REFRESH = 3
 BG, PANEL, NAV = "#f3f6fa", "#ffffff", "#111e32"
 TEXT, MUTED, LINE = "#172b45", "#718198", "#e5ebf2"
 ACCENT, PALE = "#087f78", "#e8f5f2"
@@ -93,7 +96,7 @@ def row_problem(row, now=None, check_fresh=True):
     if row.get("stable", 0) < 2:
         return "Chờ hai lần đọc giống nhau để xác nhận dữ liệu."
     if not row.get("table_id") and (row["label"].lower().startswith("ban ") or not re.search(r"\d", row["label"])):
-        return "Chưa nhận diện rõ mã bàn. Không thể bắt đầu giả lập."
+        return "Chưa nhận diện rõ mã bàn. Không thể bắt đầu theo dõi."
     return ""
 
 
@@ -150,7 +153,7 @@ class LiveSimulation:
             self.note = "Cầu đã thay đổi trong lúc dừng. Đối chiếu và xác nhận lại."
             return False
         if not verified:
-            self.note = "Cần xác nhận cầu và loại bàn Baccarat chuẩn trước khi giả lập."
+            self.note = "Cần xác nhận cầu và loại bàn Baccarat chuẩn trước khi theo dõi."
             return False
         if self.money.blocked:
             self.note = self.money.blocked[1]
@@ -264,7 +267,14 @@ class BCRApp:
         self.auto_start_deadline = 0.0
         self.cycle_waiting = False
         self.cycle_attempts = 0
+        self.cycle_retry_at = 0.0
         self.cycle_table_key = None
+        self.session_lost = False
+        self.trace_file = self.state_file.with_name("bcr_trace.jsonl")
+        self.chip_live = None
+        self.chip_check = None
+        self.chip_read_at = 0.0
+        self.chip_busy = False
         self.stream = LS.LobbyStream(self.browser)
         self.sweep_note_text = "Quét sảnh để tìm bàn đạt 3 điều kiện."
         self.next_scan = 0
@@ -272,16 +282,29 @@ class BCRApp:
         self.state_read_error = False
         self.ui_scale = DEFAULT_UI_SCALE
         self.chrome_startup_var = tk.BooleanVar(value=False)
-        self.cdp_var = tk.BooleanVar(value=False)
+        # Mặc định BẬT: app tự mở Chrome bằng chromedriver kèm cổng 9222, nên mọi
+        # đường đọc (WebSocket sảnh, bấm ô bàn) chạy được mà người dùng không phải
+        # giữ hay gắn cửa sổ Chrome nào khác.
+        self.cdp_var = tk.BooleanVar(value=True)
         self.auto_cycle_var = tk.BooleanVar(value=True)
+        self.auto_hunt_var = tk.BooleanVar(value=True)
+        self.favorites_only = tk.BooleanVar(value=True)
+        self.human_mouse_var = tk.BooleanVar(value=True)
+        self._last_sweep_favorites = False
+        self.chrome_fullscreen_var = tk.BooleanVar(value=BR.WIN_FULLSCREEN)
+        self.chrome_w_var = tk.StringVar(value=str(BR.WIN_W))
+        self.chrome_h_var = tk.StringVar(value=str(BR.WIN_H))
+        self.chrome_scale_var = tk.StringVar(value=str(int(BR.WIN_SCALE * 100)))
         self.verified = tk.BooleanVar(value=False)
         self.only_eligible = tk.BooleanVar(value=False)
+        self.chip_unit_var = tk.StringVar(value=str(TB.DEFAULT_CHIP_UNIT))
         self.search = tk.StringVar()
         self.connection_text = "Chưa kết nối Chrome."
         self._load_state()
+        self.stream.human_mouse = self.human_mouse_var.get()
         self.base_tk_scaling = float(root.tk.call("tk", "scaling"))
         root.tk.call("tk", "scaling", self.base_tk_scaling * self.ui_scale / 100)
-        root.title("BCR · Live Method Lab — Giả lập 3-3 / 3-2")
+        root.title("BCR · Theo dõi 3-3 / 3-2")
         root.configure(bg=BG)
         root.geometry("1200x900+20+20")
         root.minsize(960, 720)
@@ -344,7 +367,8 @@ class BCRApp:
         connect.pack(fill="x", pady=(0, 12))
         row = tk.Frame(connect, bg=PANEL)
         row.pack(fill="x", padx=14, pady=(10, 2))
-        self.connection_label = self._label(row, "CHROME · 600 × 800", 10, bold=True, anchor="w")
+        self.connection_label = self._label(
+            row, self._window_text(self._window_config()), 10, bold=True, anchor="w")
         self.connection_label.pack(side="left", fill="x", expand=True)
         self.open_button = self._button(row, "Mở Chrome", self.start_browser, True)
         self.open_button.pack(side="right")
@@ -357,20 +381,28 @@ class BCRApp:
         self.connection_note.pack(fill="x", padx=14, pady=(0, 8))
         sweep_row = tk.Frame(connect, bg=PANEL)
         sweep_row.pack(fill="x", padx=14, pady=(0, 10))
-        self.enter_lobby_button = self._button(sweep_row, "Vào sảnh EVO", self.enter_lobby)
+        self.enter_lobby_button = self._button(sweep_row, "Nhận tab sảnh", self.enter_lobby)
         self.enter_lobby_button.pack(side="left")
         self.sweep_button = self._button(sweep_row, "Quét toàn sảnh", self.sweep_lobby)
         self.sweep_button.pack(side="left", padx=6)
         self.auto_open_button = self._button(sweep_row, "Tự mở bàn đạt chuẩn", lambda: self.auto_open_table(True))
         self.auto_open_button.pack(side="left", padx=6)
-        self.sweep_note = self._label(sweep_row, "Bấm “Vào sảnh EVO” để mở sảnh từ trang vào; bấm “Quét toàn sảnh” "
-                                                 "để lấy lịch sử, đối chiếu hai nguồn, mở bàn đạt 3 điều kiện và giả "
-                                                 "lập từ ván kế tiếp. Đủ tay của khối là tự về sảnh tìm bàn mới.",
-                                      9, MUTED, anchor="w", justify="left", wraplength=680)
+        tk.Checkbutton(sweep_row, text="Chỉ bàn Ưa thích", variable=self.favorites_only,
+                       command=self._save_state, bg=PANEL, fg=TEXT, selectcolor=PALE,
+                       activebackground=PANEL, activeforeground=ACCENT,
+                       font=("Segoe UI", 9)).pack(side="left", padx=(6, 2))
+        self.sweep_note = self._label(sweep_row, "Bạn tự vào %s → EVO → Baccarat trong cửa sổ Chrome, rồi bấm "
+                                                 "“Nhận tab sảnh” để app ghép tab đó. Bấm “Quét toàn sảnh” để lấy "
+                                                 "lịch sử, đối chiếu hai nguồn, mở bàn đạt 3 điều kiện và theo dõi "
+                                                 "từ ván kế tiếp. “Chỉ bàn Ưa thích” bật mặc định: app bấm ô Ưa "
+                                                 "thích của sảnh và chỉ quét các bàn đã thích. App không đổi link "
+                                                 "phiên EVO. Đủ tay của khối là tự về sảnh tìm bàn mới." %
+                                                      BR.PORTAL_HOST,
+                                      9, MUTED, anchor="w", justify="left", wraplength=640)
         self.sweep_note.pack(side="left", fill="x", expand=True, padx=10)
         self.step_label = self._label(main, "", 9, MUTED, anchor="w")
         self.step_label.pack(fill="x", pady=(0, 12))
-        self._label(main, "Chỉ mô phỏng, không đặt tiền.", 9, MUTED, anchor="w").pack(
+        self._label(main, "Chỉ đối chiếu dữ liệu, không gửi lệnh đặt tiền.", 9, MUTED, anchor="w").pack(
             side="bottom", fill="x", pady=(10, 0))
         self.stack = tk.Frame(main, bg=BG)
         self.stack.pack(fill="both", expand=True)
@@ -449,6 +481,13 @@ class BCRApp:
         self._sync_cycle_strip()
         self.checks_label = self._label(plan, "", 9, MUTED, anchor="w", justify="left")
         self.checks_label.pack(fill="x", padx=14, pady=6)
+        self.chip_title = self._label(plan, "CHIP TRÊN BÀN", 9, MUTED, True, anchor="w")
+        self.chip_title.pack(fill="x", padx=14, pady=(2, 0))
+        self.chip_status = self._label(plan, "Chưa đọc chip.", 10, MUTED, True, anchor="w", justify="left",
+                                       wraplength=330)
+        self.chip_status.pack(fill="x", padx=14)
+        self.chip_detail = self._label(plan, "", 9, MUTED, anchor="w", justify="left", wraplength=330)
+        self.chip_detail.pack(fill="x", padx=14, pady=(0, 8))
         self.verify_check = tk.Checkbutton(plan, text="Cầu khớp site · bàn chuẩn B 0,95 / P 1:1",
                                           variable=self.verified, bg=PANEL, fg=TEXT, selectcolor=PALE,
                                           activebackground=PANEL, font=("Segoe UI", 9), anchor="w")
@@ -508,7 +547,7 @@ class BCRApp:
         self.history_note = self._label(card, "", 10, MUTED, anchor="w", justify="left")
         self.history_note.pack(fill="x", padx=14, pady=(0, 12))
         self.history_tree = self._tree(card, (("time", "GIỜ", 75), ("table", "BÀN", 170),
-                        ("hand", "TAY", 45), ("bet", "GIẢ LẬP", 80), ("result", "KẾT QUẢ", 80),
+                        ("hand", "TAY", 45), ("bet", "KẾ HOẠCH", 80), ("result", "KẾT QUẢ", 80),
                         ("stake", "CƯỢC", 110), ("delta", "LÃI / LỖ", 110), ("balance", "VỐN", 125)))
         self.history_tree.tag_configure("win", foreground=GREEN)
         self.history_tree.tag_configure("loss", foreground=RED)
@@ -564,6 +603,11 @@ class BCRApp:
                                           command=self._save_state, bg=PANEL, fg=TEXT, selectcolor=PALE,
                                           activebackground=PANEL, font=("Segoe UI", 10))
         self.cycle_check.pack(anchor="w")
+        self.hunt_check = tk.Checkbutton(cycle, text="Tự quét tìm bàn cho tới khi vào được (nghỉ %d giây giữa các lượt)" % CYCLE_RETRY_SECONDS,
+                                         variable=self.auto_hunt_var, command=self._save_state,
+                                         bg=PANEL, fg=TEXT, selectcolor=PALE, activebackground=PANEL,
+                                         font=("Segoe UI", 10))
+        self.hunt_check.pack(anchor="w")
         self.cycle_rule = self._label(cycle, "", 9, MUTED, justify="left")
         self.cycle_rule.pack(anchor="w", pady=(4, 0))
         self._sync_method_texts()
@@ -581,11 +625,48 @@ class BCRApp:
                     9, MUTED).pack(anchor="w", pady=(6, 0))
         self._label(card, "Kết nối Chrome", 13, bold=True).pack(anchor="w", padx=20, pady=(24, 8))
         for var, text in ((self.chrome_startup_var, "Tự mở Chrome khi khởi động ứng dụng"),
-                          (self.cdp_var, "Mở CDP localhost 9222 (cần mở lại Chrome)")):
+                          (self.cdp_var, "Chrome app mở có cổng 9222 (mặc định bật, để quét cả sảnh)")):
             tk.Checkbutton(card, text=text, variable=var, command=self._save_state, bg=PANEL,
                            activebackground=PANEL, font=("Segoe UI", 10)).pack(anchor="w", padx=16)
+        tk.Checkbutton(card, text="Chuột người thật khi bấm sảnh/ô bàn (WindMouse + ghost-cursor)",
+                       variable=self.human_mouse_var, command=self.apply_mouse_setting, bg=PANEL,
+                       fg=TEXT, selectcolor=PALE, activebackground=PANEL,
+                       font=("Segoe UI", 10)).pack(anchor="w", padx=16)
+        window = tk.Frame(card, bg=PANEL)
+        window.pack(fill="x", padx=16, pady=(10, 0))
+        tk.Checkbutton(window, text="Toàn màn hình (mặc định là cửa sổ thường)",
+                       variable=self.chrome_fullscreen_var,
+                       command=self.apply_window_settings, bg=PANEL, fg=TEXT, selectcolor=PALE,
+                       activebackground=PANEL, font=("Segoe UI", 10)).pack(anchor="w")
+        size_row = tk.Frame(window, bg=PANEL)
+        size_row.pack(anchor="w", pady=(8, 0))
+        inputs = (("Ngang", self.chrome_w_var, 7), ("Dọc", self.chrome_h_var, 7),
+                  ("Tỉ lệ Chrome (%)", self.chrome_scale_var, 6))
+        for title, var, width in inputs:
+            self._label(size_row, title, 10, MUTED).pack(side="left", padx=(0, 6))
+            tk.Entry(size_row, textvariable=var, width=width, font=("Segoe UI", 11),
+                     relief="solid", bd=1).pack(side="left", padx=(0, 14), ipady=4)
+        self._button(size_row, "Lưu & áp dụng cửa sổ", self.apply_window_settings).pack(side="left")
+        self._label(window, "Cỡ cửa sổ 800×600 – 7680×4320, tỉ lệ 50–200%. Toàn màn hình bỏ qua hai ô "
+                            "kích thước. Tỉ lệ render là cờ khởi động nên chỉ đổi được khi mở lại "
+                            "Chrome; khi Chrome đang mở, nút trên sửa ngay hình dạng cửa sổ.",
+                    9, MUTED, justify="left").pack(anchor="w", pady=(6, 0))
         self._label(card, "Đăng nhập trong Chrome để bắt đầu đọc bàn.",
                     9, MUTED, justify="left").pack(anchor="w", padx=20, pady=10)
+        chips = tk.Frame(card, bg=PANEL)
+        chips.pack(fill="x", padx=20, pady=(8, 0))
+        self._label(chips, "Chip trên bàn", 13, bold=True).pack(anchor="w")
+        self._label(chips, "Số in trên chip là đơn vị hiển thị. Chip “20” = %s đ khi đơn vị là 1.000. "
+                            "App đọc mệnh giá thật của khay để gợi ý cần bấm chip nào." %
+                   M.fmt_money(TB.DEFAULT_CHIP_UNIT), 9, MUTED, justify="left").pack(anchor="w")
+        unit_row = tk.Frame(chips, bg=PANEL)
+        unit_row.pack(anchor="w", pady=(8, 0))
+        self._label(unit_row, "1 đơn vị chip = (đ)", 10, MUTED).pack(side="left", padx=(0, 8))
+        tk.Entry(unit_row, textvariable=self.chip_unit_var, width=9,
+                 font=("Segoe UI", 11), relief="solid", bd=1).pack(side="left", ipady=4)
+        self._button(unit_row, "Lưu đơn vị chip", self.apply_chip_unit).pack(side="left", padx=8)
+        self.chip_unit_note = self._label(chips, "", 9, MUTED, justify="left")
+        self.chip_unit_note.pack(anchor="w", pady=(6, 0))
 
     def _bind_money_input(self, entry, var):
         """Ô nhập tiền chỉ nhận chữ số và tự chèn dấu phân cách hàng nghìn khi gõ."""
@@ -672,12 +753,13 @@ class BCRApp:
             self.cycle_check.config(text="Đủ %d tay là tự rời bàn, quét sảnh tìm bàn mới" % hands)
             self.cycle_rule.config(
                 text="Mỗi bàn chỉ đi một khối %s: %d tay bên mạnh + %d tay bên đổi. Hết %d tay, app đưa tab về "
-                     "danh sách bàn Baccarat, quét lại sảnh và mở một bàn đạt 3 điều kiện khác." % (
-                         profile, strong, hands - strong, hands))
+                     "danh sách bàn Baccarat, quét lại sảnh và mở một bàn đạt 3 điều kiện khác. Chưa tìm được bàn "
+                     "thì app tự lặp lại toàn bộ quy trình sau %d giây, không giới hạn số lượt, chỉ dừng khi vào "
+                     "được bàn." % (profile, strong, hands - strong, hands, CYCLE_RETRY_SECONDS))
         if hasattr(self, "step_label"):
             self.step_label.config(text=(
-                "01  Đăng nhập %s     /     02  Vào sảnh EVO     /     03  Quét sảnh     /     "
-                "04  Đối chiếu kết quả     /     05  Đủ %d tay (%s) · tự đổi bàn" % (
+                "01  Đăng nhập %s     /     02  Tự vào sảnh Baccarat rồi bấm “Nhận tab sảnh”     /     "
+                "03  Quét sảnh     /     04  Đối chiếu kết quả     /     05  Đủ %d tay (%s) · tự đổi bàn" % (
                     BR.PORTAL_HOST, hands, profile)))
 
     def _scroll_page(self, event):
@@ -693,20 +775,106 @@ class BCRApp:
         for name, button in self.nav_buttons.items():
             button.config(bg="#25364e" if name == key else NAV, fg="white" if name == key else "#b8c6d8")
 
+    def _window_config(self):
+        return BR.normalize_window((self.chrome_w_var.get(), self.chrome_h_var.get()),
+                                   self.chrome_scale_var.get(), self.chrome_fullscreen_var.get())
+
+    def _window_pos(self, window):
+        if window["fullscreen"]:
+            return None
+        return (max(20, self.root.winfo_screenwidth() - window["width"] - 20), 30)
+
+    def _window_text(self, window):
+        return ("CHROME · toàn màn hình · tỉ lệ %d%%" % window["percent"] if window["fullscreen"]
+                else "CHROME · %d × %d · tỉ lệ %d%%" % (window["width"], window["height"],
+                                                         window["percent"]))
+
+    def apply_window_settings(self):
+        window = self._window_config()
+        # Ô nhập được viết lại đúng giá trị đã kẹp để người dùng thấy con số app thật dùng.
+        self.chrome_w_var.set(str(window["width"]))
+        self.chrome_h_var.set(str(window["height"]))
+        self.chrome_scale_var.set(str(window["percent"]))
+        self._save_state()
+        pos = self._window_pos(window)
+        self.connection_text = self._window_text(window)
+        if not self.browser.connected:
+            self.sweep_note_text = ("Đã lưu cấu hình cửa sổ Chrome (%s). Mở Chrome là app áp dụng "
+                                    "luôn; đổi tỉ lệ thì cần mở lại Chrome." % self._window_text(
+                                        window).replace("CHROME · ", ""))
+            self.refresh()
+            return
+        self.chrome_busy = True
+        def work():
+            try:
+                sized, note = self.browser.resize_window(window, pos=pos)
+                self.events.put(("window_applied", (sized, note)))
+            except Exception as exc:
+                self.events.put(("window_applied", (False, "Không đổi được cửa sổ (%s)." % type(exc).__name__)))
+        threading.Thread(target=work, daemon=True).start()
+        self.refresh()
+
+    def apply_chip_unit(self):
+        """Lưu quy đổi đơn vị chip (số trên chip -> VNĐ) để gợi ý mệnh giá đúng."""
+        raw = self.chip_unit_var.get().strip()
+        try:
+            unit = int(M.parse_money(raw))
+        except (ValueError, TypeError):
+            unit = 0
+        if unit <= 0:
+            messagebox.showerror("Đơn vị chip chưa hợp lệ",
+                                 "Nhập số tiền cho 1 đơn vị chip, ví dụ 1,000.", parent=self.root)
+            return
+        self.chip_unit_var.set(M.fmt_input_money(unit))
+        self._save_state()
+        self.chip_live = None
+        self.chip_read_at = 0.0
+        self._update_chip_status()
+        messagebox.showinfo("Đã lưu đơn vị chip",
+                            "1 đơn vị chip = %s đ. Chip “20” tương ứng %s đ." % (
+                                M.fmt_money(unit), M.fmt_money(unit * 20)), parent=self.root)
+
+    def apply_mouse_setting(self):
+        """Bật/tắt chuột người thật ngay cho lượt bấm sảnh kế tiếp."""
+        enabled = bool(self.human_mouse_var.get())
+        self.stream.human_mouse = enabled
+        self.sweep_note_text = ("Đã bật chuột người thật (WindMouse + ghost-cursor) cho các cú bấm sảnh."
+                                if enabled else "Đã tắt chuột người thật; dùng cú bấm 3 sự kiện như cũ.")
+        self._save_state()
+        self.refresh()
+
     def start_browser(self):
         if self.chrome_busy or self.exit_requested:
             return
         self.chrome_busy = True
         self.connection_text = "Đang mở Chrome và ghép driver tương thích…"
         cdp = bool(self.cdp_var.get())
-        pos = (max(20, self.root.winfo_screenwidth() - BR.WIN_W - 20), 30)
+        window = self._window_config()
+        pos = self._window_pos(window)
         def work():
             try:
-                if not self.browser.alive() and not self.browser.start(BR.START_URL, pos=pos, cdp=cdp):
+                # Khi CDP bật, ưu tiên ghép tab Chrome/profile đang sống. Không mở WebDriver
+                # thứ hai lên cùng profile vì launch token của EVO có thể chỉ dùng một lần.
+                attached = cdp and self.browser.attach()
+                if (cdp and not attached
+                        and self.browser.last_diag.get("reason") == "evo_entry_auth_error"):
+                    self.events.put(("open_error", self.browser.note))
+                    return
+                if not attached and not self.browser.alive() and not self.browser.start(
+                        BR.START_URL, pos=pos, cdp=cdp, window=window):
                     self.events.put(("open_error", self.browser.last_error))
                     return
-                self.events.put(("opened", self.browser.driver_info
-                                 + " · Đăng nhập thủ công rồi bấm “Vào sảnh EVO”."))
+                size_note = self.browser.resize_window(window, pos=pos)[1]
+                # Chrome do driver mở tự tạo cổng 9222; cổng chưa lên thì mọi lượt quét
+                # sảnh sẽ thất bại im lặng, nên phải nói rõ ngay từ dòng kết nối.
+                port_note = ""
+                if cdp and not attached and not self.browser.wait_for_cdp():
+                    port_note = (" · Chrome đã mở nhưng cổng 9222 chưa lên nên chưa quét được cả sảnh, "
+                                 "app chỉ đọc cầu trên màn hình. Bấm “Mở Chrome” lại sau khi tắt hết "
+                                 "cửa sổ Chrome khác.")
+                self.events.put(("opened", "%s · %s%s · Đăng nhập và tự vào sảnh Baccarat, "
+                                            "rồi bấm “Nhận tab sảnh”." % (
+                                                self.browser.driver_info, size_note, port_note)))
             except Exception as exc:
                 self.events.put(("open_error", str(exc).splitlines()[0][:240]))
         threading.Thread(target=work, daemon=True).start()
@@ -717,9 +885,13 @@ class BCRApp:
             return
         self.chrome_busy = True
         self.connection_text = "Đang kết nối Chrome hiện có qua CDP 9222; không mở lại trang…"
+        window = self._window_config()
+        pos = self._window_pos(window)
         def work():
             try:
                 ok = self.browser.attach()
+                if ok:
+                    self.browser.resize_window(window, pos=pos)
                 self.events.put(("opened" if ok else "open_error", self.browser.note))
             except Exception as exc:
                 self.events.put(("open_error", "Không kết nối được Chrome (%s)." % type(exc).__name__))
@@ -740,19 +912,20 @@ class BCRApp:
         if self.chrome_busy or self.sweep_busy or self.exit_requested:
             return
         if not self._cdp_available():
-            self.sweep_note_text = ("Chưa bật CDP: bấm “Chơi game” của Evolution trong cửa sổ Chrome, "
-                                    "app sẽ tự đọc khi có tab sảnh."
+            self.sweep_note_text = ("Chưa bật CDP: vào trang Baccarat trong cửa sổ Chrome rồi gắn Chrome "
+                                    "đang mở để app nhận tab."
                                     if self.browser.driver is not None else "Gắn Chrome đang mở trước.")
             self.refresh()
             return
         self.sweep_busy = True
-        self.sweep_note_text = "Đang bấm “Chơi game” của Evolution trên trang vào…"
+        self.session_lost = False  # người dùng chủ động nhận lại tab sau khi đăng nhập
+        self.sweep_note_text = "Đang tìm tab sảnh Baccarat bạn đã tự mở…"
         def work():
             try:
-                ok, note = self.stream.open_lobby_from_portal()
+                ok, note = self.stream.find_lobby_tab()
                 self.events.put(("lobby_entered", (ok, note)))
             except Exception as exc:
-                self.events.put(("lobby_entered", (False, "Không vào được sảnh (%s)." % type(exc).__name__)))
+                self.events.put(("lobby_entered", (False, "Không nhận được tab sảnh (%s)." % type(exc).__name__)))
         threading.Thread(target=work, daemon=True).start()
         self.refresh()
 
@@ -764,10 +937,13 @@ class BCRApp:
             self.refresh()
             return
         self.sweep_busy = True
-        self.sweep_note_text = "Đang quét sảnh…"
+        favorites = self.favorites_only.get()
+        self._last_sweep_favorites = favorites
+        self.sweep_note_text = ("Đang quét sảnh · chỉ bàn Ưa thích…" if favorites
+                                else "Đang quét sảnh…")
         def work():
             try:
-                rows = self.stream.sweep()
+                rows = self.stream.sweep(favorites_only=favorites)
                 self.events.put(("sweep", (rows, self.stream.last_error, self.stream.diag, time.time())))
             except Exception as exc:
                 self.events.put(("sweep", ([], type(exc).__name__, {}, time.time())))
@@ -795,21 +971,17 @@ class BCRApp:
             if info["eligible"]:
                 candidates.append((info["hands"], row, info))
         if not candidates:
-            if allow_sweep:
-                if self.cycle_waiting and self.cycle_attempts >= MAX_CYCLE_SWEEPS:
-                    self.cycle_waiting = False
-                    self.cycle_attempts = 0
-                    self.sweep_note_text = ("Chưa tìm được bàn đạt 3 điều kiện sau %d lần quét lại sảnh. "
-                                            "Bấm “Tự mở bàn đạt chuẩn” khi cần." % MAX_CYCLE_SWEEPS)
-                    self.refresh()
-                    return
-                if self.cycle_waiting:
-                    self.cycle_attempts += 1
-                self.sweep_note_text = "Chưa có bàn vừa được đối chiếu hai nguồn. Đang quét lại sảnh…"
-                self.sweep_lobby()
-            else:
-                self.sweep_note_text = "Chưa có bàn đạt 3 điều kiện. Quét lại sảnh."
+            if self._schedule_cycle_retry("Chưa có bàn đạt 3 điều kiện"):
+                return
+            if self.cycle_waiting or not allow_sweep:
+                self.sweep_note_text = ("Chưa có bàn đạt 3 điều kiện · bấm “Quét toàn sảnh” để thử lại, "
+                                        "hoặc bật “Tự quét tìm bàn” để app tự lặp cho tới khi vào được.")
                 self.refresh()
+                return
+            self.cycle_attempts += 1
+            self.sweep_note_text = "Chưa có bàn đạt 3 điều kiện (lượt %d) · đang quét lại sảnh…" % (
+                self.cycle_attempts)
+            self.sweep_lobby()
             return
         candidates.sort(key=lambda item: (abs(item[0] - ME.MIN_HANDS), item[1]["label"].casefold()))
         hands, row, info = candidates[0]
@@ -827,23 +999,41 @@ class BCRApp:
         threading.Thread(target=work, daemon=True).start()
         self.refresh()
 
+    def _schedule_cycle_retry(self, reason, exclude_key=None):
+        """Vòng tìm bàn không có trần số lần: nghỉ CYCLE_RETRY_SECONDS rồi quét lại, tới khi vào được bàn."""
+        if self.session_lost:
+            return False
+        if not (self.cycle_waiting and self.auto_hunt_var.get()) or self.exit_requested:
+            return False
+        if exclude_key:
+            self.cycle_table_key = exclude_key
+        self.cycle_attempts += 1
+        self.cycle_retry_at = time.time() + CYCLE_RETRY_SECONDS
+        self.sweep_note_text = ("%s · tự quét lại sau %d giây (đã thử %d lượt)." % (
+            reason, CYCLE_RETRY_SECONDS, self.cycle_attempts))
+        self.refresh()
+        return True
+
     def leave_table_for_lobby(self):
-        """Hết khối 6 tay: đưa tab về danh sách bàn rồi lặp lại quy trình quét - chọn - mở bàn."""
+        """Hết khối tay: đưa tab về danh sách bàn rồi tự lặp quét - chọn - mở bàn tới khi vào được."""
         if not self.auto_cycle_var.get() or self.exit_requested:
-            return
-        if self.chrome_busy or self.sweep_busy or self.open_table_busy:
-            self.cycle_waiting = False
-            self.sweep_note_text = "Chưa tự đổi bàn được vì app đang bận; bấm “Quét toàn sảnh” để chạy lại."
-            self.refresh()
-            return
-        if not self._cdp_available():
-            self.cycle_waiting = False
-            self.sweep_note_text = "Chu trình tự đổi bàn dừng: chưa gắn Chrome."
-            self.refresh()
             return
         self.cycle_waiting = True
         self.cycle_attempts = 0
         self.cycle_table_key = self.sim.table_key
+        self.cycle_retry_at = 0.0
+        self._trace("block_done", dict(table=self.sim.table_key, hands=self.sim.cycle_hands))
+        if self.chrome_busy or self.sweep_busy or self.open_table_busy:
+            self.cycle_retry_at = time.time() + CYCLE_RETRY_SECONDS
+            self.sweep_note_text = ("App đang bận nên việc đổi bàn hẹn quét lại sau %d giây."
+                                    % CYCLE_RETRY_SECONDS)
+            self.refresh()
+            return
+        if not self._cdp_available():
+            self.cycle_retry_at = time.time() + CYCLE_RETRY_SECONDS
+            self.sweep_note_text = ("Chưa gắn Chrome · sẽ tự quét tìm bàn ngay khi kết nối lại.")
+            self.refresh()
+            return
         self.sweep_busy = True
         self.sweep_note_text = "Đã đi đủ %d tay · rời bàn, về danh sách bàn Baccarat…" % self.sim.cycle_hands
         def work():
@@ -880,6 +1070,69 @@ class BCRApp:
                 self.events.put(("scan", ([], str(exc).splitlines()[0][:180], time.time())))
         threading.Thread(target=work, daemon=True).start()
 
+    def request_chip_read(self, force=False):
+        """Đọc chip thật đang đặt trên bàn ở thread nền; không chặn UI, không bấm gì."""
+        now = time.time()
+        if self.chip_busy or self.exit_requested:
+            return
+        if not force and now - self.chip_read_at < CHIP_REFRESH:
+            return
+        if not self.browser.connected or not self.sim.table_key:
+            return
+        self.chip_busy = True
+        self.chip_read_at = now
+        unit = self._chip_unit()
+        def work():
+            try:
+                live = TB.read(self.browser, unit=unit)
+            except Exception as exc:
+                live = {"ok": False, "error": type(exc).__name__}
+            self.events.put(("chips", live))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _chip_unit(self):
+        """Số tiền cho 1 đơn vị chip; giá trị sai thì về mức mặc định để không chia nhầm."""
+        try:
+            unit = int(M.parse_money(self.chip_unit_var.get().strip()))
+        except (ValueError, TypeError):
+            return TB.DEFAULT_CHIP_UNIT
+        return unit if unit > 0 else TB.DEFAULT_CHIP_UNIT
+
+    def _update_chip_status(self):
+        """So chip thật với kế hoạch đang chốt và vẽ trạng thái khớp/lệch."""
+        if not hasattr(self, "chip_status"):
+            return
+        plan = self.sim.pending or self.sim.plan()
+        unit = (self.chip_live or {}).get("unit") or TB.DEFAULT_CHIP_UNIT
+        self.chip_check = ME.compare_chips(plan.get("side"), plan.get("stake") or 0,
+                                           self.chip_live, unit=unit)
+        check = self.chip_check
+        status = check["status"]
+        self.chip_status.config(text="%s · %s" % (ME.CHIP_STATUS_LABEL.get(status, status), check["note"]),
+                                fg={"match": GREEN, "no_bet": MUTED, "unknown": MUTED}.get(status, RED))
+        live = self.chip_live or {}
+        lines = []
+        chips = check.get("suggested_chips") or []
+        if chips and check["side"]:
+            lines.append("Cần bấm: %s (%d chip) = %s đ" % (
+                " + ".join(str(c) for c in chips), len(chips), M.fmt_money(check["expected"])))
+        if live.get("ok"):
+            parts = []
+            for side in ("B", "P", "T"):
+                entry = (live.get("spots") or {}).get(side) or {}
+                if entry.get("amount_vnd"):
+                    chips_txt = " + ".join(str(c) for c in entry.get("chips", []))
+                    parts.append("%s %s%s" % (E.SIDE_NAME[side], M.fmt_money(entry["amount_vnd"]),
+                                              (" [" + chips_txt + "]") if chips_txt else ""))
+            lines.append("Trên bàn: %s" % (" · ".join(parts) if parts else "chưa có chip"))
+            if live.get("total") is not None:
+                lines.append("Tổng đặt: %s đ" % M.fmt_money(live["total"]))
+        elif live.get("error"):
+            lines.append("Chưa đọc được chip (%s)." % live["error"])
+        else:
+            lines.append("Vào bàn để đọc chip đang đặt.")
+        self.chip_detail.config(text="\n".join(lines))
+
     def poll(self):
         if self.closing:
             return
@@ -890,7 +1143,7 @@ class BCRApp:
                 self.connection_text = data
                 self.next_scan = 0
                 if kind != "opened":
-                    self.sim.pause("Chưa kết nối Chrome. Giả lập đã dừng.")
+                    self.sim.pause("Chưa kết nối Chrome. Phiên theo dõi đã dừng.")
                     self.tables.clear()
             elif kind == "scan":
                 self.scan_busy = False
@@ -899,29 +1152,51 @@ class BCRApp:
                     self.connection_text = "Đọc cầu chưa thành công: " + error
                     self.tables.clear()
                     self.verified.set(False)
+                    if self._auth_blame():
+                        self._session_lost_step(error)
+                        continue
                     self.sim.pause("Mất kết nối/đọc cầu lỗi. Hãy đối chiếu lại trước khi tiếp tục.")
                 else:
+                    self.session_lost = False
                     self._ingest_reports(reports, observed_at)
                     n = sum(len(rep.get("tables", [])) for rep in reports)
                     self.connection_text = ("Đang đọc %d bàn." % n if n else "Chưa thấy bàn Baccarat.")
             elif kind == "sweep":
                 self.sweep_busy = False
                 rows, error, diag, observed_at = data
-                if error:
-                    self.sweep_note_text = "Quét toàn sảnh không thành công: " + error
+                self._trace("sweep", dict(rows=len(rows or []), error=bool(error), diag=diag or {}))
+                if error and self._auth_blame():
+                    self._session_lost_step("Quét sảnh không thành công: " + error)
+                elif error:
+                    self.sweep_note_text = "Quét sảnh không thành công: " + error
+                    self._schedule_cycle_retry(self.sweep_note_text)
                 elif not rows:
-                    self.sweep_note_text = ("Chưa đọc được lịch sử bàn ở sảnh. Bấm “Vào sảnh EVO” rồi chờ quét lại."
-                                            if self.cycle_waiting else
-                                            "Chưa nhận được lịch sử. Mở sảnh Baccarat rồi quét lại.")
+                    self.sweep_note_text = (
+                        "Chưa có bàn nào trong mục Ưa thích đọc được lịch sử. Hãy thêm bàn vào Ưa thích "
+                        "trên sảnh rồi quét lại."
+                        if self._last_sweep_favorites else
+                        ("Chưa đọc được lịch sử bàn ở sảnh. Mở tab sảnh Baccarat rồi bấm "
+                         "“Nhận tab sảnh” để app tự quét tiếp."
+                         if self.cycle_waiting else
+                         "Chưa nhận được lịch sử. Mở sảnh Baccarat rồi quét lại."))
+                    self._schedule_cycle_retry(self.sweep_note_text)
                 else:
+                    self.session_lost = False
                     self._ingest_reports([{"tables": rows, "page": {}, "diag": {}}], observed_at)
                     for row in rows:
                         stored = self.tables.get("id:" + row["table_id"])
                         # WebSocket và cầu đang vẽ là hai nguồn đọc độc lập cùng cho một chuỗi.
                         if stored and row["road_match"] and stored["stable"] < 2:
                             stored["stable"] = 2
-                    self.sweep_note_text = "Đã quét %d bàn · %d bàn khớp lịch sử." % (
-                        len(rows), sum(1 for r in rows if r["road_match"]))
+                    # Quét Ưa thích chỉ tin danh sách vừa lọc: bỏ bàn cũ ngoài danh sách
+                    # để vòng tự mở bàn không chọn nhầm bàn không còn là ưa thích.
+                    if self._last_sweep_favorites:
+                        allowed = {"id:" + row["table_id"] for row in rows if row.get("table_id")}
+                        self.tables = {key: value for key, value in self.tables.items()
+                                       if key in allowed or key == self.sim.table_key}
+                    self.sweep_note_text = "Đã quét %d bàn%s · %d bàn khớp lịch sử." % (
+                        len(rows), " trong mục Ưa thích" if self._last_sweep_favorites else "",
+                        sum(1 for r in rows if r["road_match"]))
                     # Bàn được mở bằng đúng ô bàn của sảnh nên phiên đăng nhập không bị động vào.
                     if not self.sim.running:
                         self.auto_open_table(allow_sweep=self.cycle_waiting,
@@ -930,15 +1205,24 @@ class BCRApp:
                 self.sweep_busy = False
                 ok, note = data
                 self.sweep_note_text = note
+                self._trace("lobby_tab", dict(ok=ok))
                 if ok:
+                    self.session_lost = False
                     self.next_scan = 0
+            elif kind == "window_applied":
+                self.chrome_busy = False
+                ok, note = data
+                self.sweep_note_text = note if ok else "Đã lưu cấu hình. " + note
             elif kind == "cycle_back":
                 self.sweep_busy = False
                 ok, note = data
                 self.sweep_note_text = note
+                self._trace("cycle_back", dict(ok=ok))
                 if ok:
                     self.sweep_lobby()
-                else:
+                elif self._auth_blame():
+                    self._session_lost_step(note)
+                elif not self._schedule_cycle_retry(note):
                     self.cycle_waiting = False
                     self.refresh()
             elif kind == "table_opened":
@@ -946,25 +1230,102 @@ class BCRApp:
                 ok, note, key = data
                 self.sweep_note_text = note
                 if ok and key in self.tables:
+                    self.session_lost = False
                     self.sim.bind(self.tables[key])
                     self.verified.set(False)
                     self.auto_start_table_key = key
                     self.auto_start_deadline = time.time() + ENTRY_WAIT
                     self.sweep_note_text = "Đã vào bàn · đang xác nhận dữ liệu…"
                     self.next_scan = 0
+                    self.chip_live = None
+                    self.chip_read_at = 0.0
+                elif not ok:
+                    self._trace("table_open_failed", dict(key=key))
+                    if self._auth_blame():
+                        self._session_lost_step(note)
+                    else:
+                        self._schedule_cycle_retry(note, exclude_key=key or self.cycle_table_key)
+            elif kind == "chips":
+                self.chip_busy = False
+                self.chip_live = data
         self._auto_start_verified_table()
         if self.sim.process(self.tables.get(self.sim.table_key)):
             self._save_state()
         if self.sim.cycle_done:
             self.sim.cycle_done = False
             self.leave_table_for_lobby()
+        self.request_chip_read()
         now = time.time()
         if (not self.exit_requested and now >= self.next_scan and not self.scan_busy
                 and not self.chrome_busy and not self.sweep_busy and self.browser.connected):
             self.next_scan = now + (FAST_SCAN if (self.auto_start_table_key or self.sim.running) else SCAN_SECONDS)
             self._scan()
+        self._resume_cycle_hunt(now)
         self.refresh()
         self.poll_id = self.root.after(500, self.poll)
+
+    def _tab_snapshot(self):
+        """Liệt kê an toàn các tab đang mở để vết chẩn đoán giải thích được lần mất phiên."""
+        try:
+            pages = self.browser._cdp_pages() or []
+        except Exception as exc:
+            return [{"kind": "error", "url": type(exc).__name__}]
+        rows = []
+        for page in pages:
+            url = page.get("url", "") if isinstance(page, dict) else ""
+            rows.append(dict(
+                kind=("lobby" if BR.is_lobby_url(url) else "portal" if BR.is_portal_url(url)
+                      else "entry" if BR.is_evo_entry_url(url) else "other"),
+                title=str((page or {}).get("title") or "")[:40], url=BR._safe_url(url)))
+        return rows
+
+    def _trace(self, kind, detail=None):
+        """Một dòng nhật ký thô (không token, không cookie) làm bằng chứng cho lần chạy thật."""
+        try:
+            row = dict(ts=round(time.time(), 3), at=time.strftime("%H:%M:%S"), kind=kind,
+                       note=str(self.sweep_note_text or "")[:180], tabs=self._tab_snapshot())
+            if detail:
+                row["detail"] = detail
+            with open(self.trace_file, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(row, ensure_ascii=False)[:2400] + "\n")
+        except Exception:
+            pass
+
+    def _auth_blame(self):
+        """Sảnh đang báo mất phiên thật, chứ không chỉ chưa tải xong."""
+        if getattr(self.stream, "session_lost", False):
+            return True
+        diag = getattr(self.browser, "last_diag", None)
+        return isinstance(diag, dict) and diag.get("reason") == "authentication_required"
+
+    def _session_lost_step(self, note):
+        """Mất phiên là dấu dừng: tắt vòng tự quét để app không bấm tiếp lên trang lỗi."""
+        self.session_lost = True
+        self.cycle_waiting = False
+        self.cycle_attempts = 0
+        self.cycle_retry_at = 0.0
+        self.cycle_table_key = None
+        self.auto_start_table_key = None
+        self.sim.pause("Sảnh báo phiên Evolution không còn hợp lệ. Đăng nhập lại trang gốc, "
+                       "bấm thẻ Evolution một lần, rồi bấm “Nhận tab sảnh”.")
+        self.sweep_note_text = note
+        self._trace("session_lost")
+        self.refresh()
+
+    def _resume_cycle_hunt(self, now):
+        """Hết thời gian nghỉ 15 giây: tự chạy lại quét - chọn - vào bàn, không có trần số lượt."""
+        if not (self.cycle_waiting and self.auto_hunt_var.get() and self.cycle_retry_at
+                and now >= self.cycle_retry_at):
+            return
+        self.cycle_retry_at = 0.0
+        if self.exit_requested or self.sim.running or self.auto_start_table_key:
+            return
+        if self.chrome_busy or self.sweep_busy or self.open_table_busy or not self._cdp_available():
+            self.cycle_retry_at = now + CYCLE_RETRY_SECONDS
+            return
+        self.sweep_note_text = "Đang tự quét tìm bàn đạt chuẩn (lượt %d)…" % (self.cycle_attempts + 1)
+        self._trace("hunt_retry", dict(attempt=self.cycle_attempts + 1))
+        self.sweep_lobby()
 
     def _ingest_reports(self, reports, now=None):
         now = time.time() if now is None else now
@@ -1037,10 +1398,11 @@ class BCRApp:
             return
         self.verified.set(True)
         if self.sim.arm_at_entry(row):
-            self.sweep_note_text = "Đã vào bàn và bắt đầu giả lập · %s" % self.sim.note
+            self.sweep_note_text = "Đã vào bàn và bắt đầu theo dõi · %s" % self.sim.note
             self.auto_start_table_key = None
             self.cycle_waiting = False
             self.cycle_attempts = 0
+            self.cycle_retry_at = 0.0
             self.cycle_table_key = None
         else:
             self.sweep_note_text = "Chưa thể bắt đầu: " + self.sim.note
@@ -1074,7 +1436,7 @@ class BCRApp:
             if row.get("read_error"):
                 verdict, status = row["read_error"], "Cần đối chiếu"
             elif row.get("game_type") and row["game_type"] != "baccarat":
-                verdict, status = "Bàn đặc biệt · không giả lập", "Đọc được Canvas"
+                verdict, status = "Bàn đặc biệt · không theo dõi", "Đọc được Canvas"
             elif not road_is_current(row):
                 status = "Chưa đối chiếu 2 nguồn"
             elif problem and not row["conflict"] and row["stable"] >= 2 and "mã bàn" in problem:
@@ -1091,7 +1453,7 @@ class BCRApp:
 
     def load_live_selected(self):
         if self.sim.running:
-            self.sim.note = "Hãy tạm dừng giả lập trước khi đổi bàn."
+            self.sim.note = "Hãy tạm dừng theo dõi trước khi đổi bàn."
         else:
             selected = self.live_tree.selection()
             row = self.tables.get(selected[0]) if selected else None
@@ -1105,6 +1467,9 @@ class BCRApp:
     def toggle_simulation(self):
         if self.sim.running:
             self.sim.pause()
+            # Người dùng bấm dừng thì vòng tự tìm bàn dừng theo, không mở bàn ngoài ý muốn.
+            self.cycle_waiting = False
+            self.cycle_retry_at = 0.0
         elif self.chrome_busy or not self.browser.connected:
             self.sim.note = "Mở Chrome và chờ đọc được bàn thật trước khi bắt đầu."
         else:
@@ -1127,6 +1492,7 @@ class BCRApp:
             self.kpi_values[i].config(text=value, fg=(GREEN if book.profit >= 0 else RED) if i in (1, 2) else TEXT)
             self.kpi_notes[i].config(text=note)
         self.connection_note.config(text=self.connection_text)
+        self.connection_label.config(text=self._window_text(self._window_config()))
         self.open_button.config(state="disabled" if self.chrome_busy else "normal")
         self.attach_button.config(state="disabled" if self.chrome_busy else "normal")
         self.disconnect_button.config(text="Ngắt kết nối" if self.browser.mode == "cdp" else "Đóng")
@@ -1145,7 +1511,7 @@ class BCRApp:
         self.plan_side.config(text=E.SIDE_NAME.get(side, "CHỜ BÀN").upper(), fg=COLORS.get(side, MUTED))
         self.plan_stake.config(text=("%s đ · bậc %d/%d · %s" % (
             M.fmt_money(plan["stake"]), min(plan["ladder_step"] + 1, len(self.sim.ladder)),
-            len(self.sim.ladder), "đã chốt" if self.sim.running else "dự kiến")) if side else "Chưa chốt cược giả lập")
+            len(self.sim.ladder), "đã chốt" if self.sim.running else "dự kiến")) if side else "Chưa có kế hoạch")
         strong = plan["strong"]
         for i, label in enumerate(self.cycle_labels):
             cell_side = strong if i < ME.strong_hands(self.sim.profile) else (
@@ -1154,6 +1520,7 @@ class BCRApp:
             label.config(text=cell_side or str(i + 1), bg=COLORS.get(cell_side, BG) if active else BG,
                          fg="white" if active else COLORS.get(cell_side, MUTED))
         self.checks_label.config(text="\n".join(("Đạt · " if c["ok"] else "Chờ · ") + c["name"] for c in plan["checks"]))
+        self._update_chip_status()
         self.verify_check.config(state="disabled" if self.sim.running else "normal")
         self.start_button.config(text="Tạm dừng" if self.sim.running else "Bắt đầu")
         self.sim_note.config(text=self.sim.note, fg=ACCENT if self.sim.running else MUTED)
@@ -1179,7 +1546,7 @@ class BCRApp:
         canvas.delete("all")
         if key == "equity":
             if not self.sim.log:
-                canvas.create_text(w / 2, h / 2, text="Chưa có tay giả lập từ site", fill=MUTED, font=("Segoe UI", 11))
+                canvas.create_text(w / 2, h / 2, text="Chưa có dữ liệu đối chiếu từ site", fill=MUTED, font=("Segoe UI", 11))
                 return
             values = [self.sim.money.start_capital] + [r["balance_after"] for r in self.sim.log]
             low, high = min(values), max(values)
@@ -1217,7 +1584,7 @@ class BCRApp:
 
     def export_csv(self):
         if not self.sim.log:
-            messagebox.showinfo("Chưa có dữ liệu", "Chưa có tay giả lập để xuất.", parent=self.root)
+            messagebox.showinfo("Chưa có dữ liệu", "Chưa có dữ liệu đối chiếu để xuất.", parent=self.root)
             return
         path = filedialog.asksaveasfilename(parent=self.root, defaultextension=".csv", filetypes=[("CSV", "*.csv")],
                                           initialfile="bcr-live-%s.csv" % time.strftime("%Y%m%d-%H%M%S"))
@@ -1271,7 +1638,7 @@ class BCRApp:
             var.set(M.fmt_input_money(stake))
         self.ladder_store[profile] = [var.get() for var in self.ladder_vars]
         self.entries["capital"].set(M.fmt_input_money(values["capital"]))
-        if not messagebox.askyesno("Tạo phiên mới", "Lưu bản sao phiên hiện tại, dừng giả lập và bắt đầu với vốn mới?", parent=self.root):
+        if not messagebox.askyesno("Tạo phiên mới", "Lưu bản sao phiên hiện tại, dừng theo dõi và bắt đầu với vốn mới?", parent=self.root):
             return
         if not self._save_state():
             return
@@ -1309,8 +1676,22 @@ class BCRApp:
                     self.sim.set_method(profile, None)
                 self.ladder_store[profile] = [M.fmt_input_money(s) for s in self.sim.ladder]
             self.chrome_startup_var.set(bool(settings.get("chrome_startup", False)))
-            self.cdp_var.set(bool(settings.get("chrome_cdp", False)))
+            self.cdp_var.set(bool(settings.get("chrome_cdp", True)))
             self.auto_cycle_var.set(bool(settings.get("auto_cycle", True)))
+            self.auto_hunt_var.set(bool(settings.get("auto_hunt", True)))
+            self.favorites_only.set(bool(settings.get("favorites_only", True)))
+            self.human_mouse_var.set(bool(settings.get("human_mouse", True)))
+            saved_unit = settings.get("chip_unit", TB.DEFAULT_CHIP_UNIT)
+            if isinstance(saved_unit, (int, float)) and not isinstance(saved_unit, bool) and saved_unit > 0:
+                self.chip_unit_var.set(M.fmt_input_money(int(saved_unit)))
+            saved_window = settings.get("chrome_window")
+            if isinstance(saved_window, dict):
+                loaded = BR.normalize_window((saved_window.get("width"), saved_window.get("height")),
+                                             saved_window.get("percent"), saved_window.get("fullscreen"))
+                self.chrome_fullscreen_var.set(loaded["fullscreen"])
+                self.chrome_w_var.set(str(loaded["width"]))
+                self.chrome_h_var.set(str(loaded["height"]))
+                self.chrome_scale_var.set(str(loaded["percent"]))
             scale = settings.get("ui_scale", DEFAULT_UI_SCALE)
             if isinstance(scale, (int, float)) and not isinstance(scale, bool) and 50 <= scale <= 150:
                 self.ui_scale = int(scale)
@@ -1334,12 +1715,20 @@ class BCRApp:
             self.sim.pause("Không thể lưu phiên: file cũ chưa đọc được. Dữ liệu gốc được giữ nguyên.")
             return False
         book = self.sim.money
+        window = self._window_config()
         data = dict(format="live-v2", log=self.sim.log,
                     settings=dict(capital=book.start_capital, unit=book.unit,
                                   take_profit_pct=book.take_profit_pct,
                                   profile=self.sim.profile, ladder=self.sim.ladder,
                                   chrome_startup=self.chrome_startup_var.get(), chrome_cdp=self.cdp_var.get(),
                                   auto_cycle=self.auto_cycle_var.get(),
+                                  auto_hunt=self.auto_hunt_var.get(),
+                                  favorites_only=self.favorites_only.get(),
+                                  human_mouse=self.human_mouse_var.get(),
+                                  chip_unit=self._chip_unit(),
+                                  chrome_window=dict(width=window["width"], height=window["height"],
+                                                     percent=window["percent"],
+                                                     fullscreen=window["fullscreen"]),
                                   chrome_url=BR.START_URL, ui_scale=self.ui_scale),
                     money={key: getattr(book, key) for key in MONEY_FIELDS})
         try:

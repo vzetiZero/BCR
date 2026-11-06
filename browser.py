@@ -11,20 +11,35 @@ import re
 import subprocess
 import threading
 import time
-from urllib.parse import parse_qsl, urlsplit, urlencode, urlunsplit
+from urllib.parse import urlsplit, urlunsplit
 from urllib.request import urlopen
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROFILE_DIR = os.path.join(HERE, "chrome_profile")
 READER_JS = os.path.join(HERE, "extension", "reader.js")
 DRIVER_PATH = os.path.join(HERE, "drivers", "chromedriver.exe")
-LOBBY_HOST_SUFFIX = "evo-games.com"
 LOBBY_PATH = "/frontend/evo/r3"
-LOBBY_ROUTE = "category=all_games&game=baccarat&see=baccarat"
 START_URL = "https://www.neo179.com/gamelobby/live"
 PORTAL_HOST = urlsplit(START_URL).hostname
 PORTAL_PATH = urlsplit(START_URL).path
-WIN_W, WIN_H = 600, 800
+WIN_W, WIN_H = 1200, 900
+# Giá trị mở đầu cho cửa sổ thường; người dùng sửa trong Cài đặt → Cửa sổ Chrome và
+# app lưu vào bcr_state.json nên các con số dưới đây chỉ là mức dự phòng.
+# Tỉ lệ render là cờ khởi động nên chỉ đổi có hiệu lực ở lần mở Chrome kế tiếp.
+WIN_SCALE = 0.8
+WIN_FULLSCREEN = False
+SCALE_MIN, SCALE_MAX = 50, 200
+SIZE_MIN, SIZE_MAX = (800, 600), (7680, 4320)
+# Sảnh EVO mở từ trang vào chỉ còn sống nhờ các nhịp tim của chính tab trang vào.
+# Chrome giảm nhịp/đóng băng tab bị che hoặc bị ẩn nên nhịp tim tắt, sảnh đang tốt
+# chuyển thành "User authentication failed (EV.7)". Ba cờ dưới giữ nhịp JS đầy đủ
+# cho mọi tab, không đổi dữ liệu gửi đi.
+KEEPALIVE_FLAGS = [
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+    "--disable-background-timer-throttling",
+    "--disable-features=CalculateNativeWinOcclusion",
+]
 MAX_FRAME_DEPTH = 4
 MAX_SCAN_FRAMES = 64
 PAGE_LOAD_TIMEOUT = 20
@@ -42,13 +57,44 @@ CHROME_CANDIDATES = (
 
 
 def is_lobby_host(host):
-    """Sảnh Evolution đổi tên mirror liên tục nên chỉ cần khớp đuôi *.evo-games.com."""
-    return (isinstance(host, str)
-            and (host == LOBBY_HOST_SUFFIX or host.endswith("." + LOBBY_HOST_SUFFIX)))
+    """Sảnh Evolution đổi mirror liên tục nên chỉ cần một tên miền DNS công khai.
+
+    Không nhận IP, localhost hay tên nội bộ. Đường dẫn /frontend/evo/r3 được kiểm
+    tra riêng trong is_lobby_url; nhờ vậy mirror hiện tại vẫn dùng được mà không
+    phải sửa danh sách đuôi cứng mỗi lần site đổi tên.
+    """
+    if not isinstance(host, str) or not 4 <= len(host) <= 253:
+        return False
+    if host != host.lower() or host.startswith(".") or host.endswith(".") or ".." in host:
+        return False
+    if host == "localhost" or host.endswith(".localhost") or host.endswith(".local"):
+        return False
+    if re.fullmatch(r"[0-9.]+", host) or ":" in host:
+        return False
+    return re.fullmatch(
+        r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+        r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+", host) is not None
 
 
 def is_lobby_url(url):
-    """URL sảnh EVO thật: https, đuôi host evo-games, đúng đường dẫn lobby, không userinfo."""
+    """URL sảnh EVO thật: https, tên miền công khai, đúng đường dẫn lobby, không userinfo."""
+    if not isinstance(url, str) or not url or "\\" in url:
+        return False
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in url):
+        return False
+    try:
+        parsed = urlsplit(url)
+        path = parsed.path
+        return (parsed.scheme == "https" and is_lobby_host(parsed.hostname)
+                and (path == LOBBY_PATH or path.startswith(LOBBY_PATH + "/"))
+                and parsed.username is None and parsed.password is None
+                and parsed.port in (None, 443))
+    except (ValueError, TypeError):
+        return False
+
+
+def is_evo_entry_url(url):
+    """One-time Evolution handoff; it is never a readable lobby."""
     if not isinstance(url, str) or not url or "\\" in url:
         return False
     if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in url):
@@ -56,9 +102,8 @@ def is_lobby_url(url):
     try:
         parsed = urlsplit(url)
         return (parsed.scheme == "https" and is_lobby_host(parsed.hostname)
-                and parsed.path.startswith(LOBBY_PATH)
-                and parsed.username is None and parsed.password is None
-                and parsed.port in (None, 443))
+                and parsed.path == "/entry" and parsed.username is None
+                and parsed.password is None and parsed.port in (None, 443))
     except (ValueError, TypeError):
         return False
 
@@ -82,42 +127,6 @@ def is_portal_url(url):
 def valid_site_url(url):
     """Chỉ HTTPS đúng host, cổng mặc định, không userinfo hoặc URL cục bộ."""
     return is_lobby_url(url) or is_portal_url(url)
-
-
-def _with_baccarat_route(parsed, merged):
-    for key, value in parse_qsl(LOBBY_ROUTE, keep_blank_values=True):
-        if any(k == key and v == value for k, v in merged):
-            continue
-        merged = [(k, v) for k, v in merged if k != key]
-        merged.append((key, value))
-    fragment = urlencode(merged)
-    if fragment == parsed.fragment:
-        return urlunsplit(parsed)
-    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, parsed.query, fragment))
-
-
-def lobby_url_with_route(url):
-    """Giữ nguyên host/đường dẫn của redirect thật, chỉ bổ sung route baccarat trong hash.
-
-    Màn hình bàn đã mở (hash có table_id) giữ nguyên; chỉ danh sách sảnh được đổi route.
-    """
-    if not is_lobby_url(url):
-        return ""
-    parsed = urlsplit(url)
-    merged = parse_qsl(parsed.fragment, keep_blank_values=True)
-    if any(key == "table_id" for key, _ in merged):
-        return url
-    return _with_baccarat_route(parsed, merged)
-
-
-def lobby_list_url(url):
-    """URL danh sách bàn trên cùng host/đường dẫn: bỏ table_id của màn hình bàn để về sảnh."""
-    if not is_lobby_url(url):
-        return ""
-    parsed = urlsplit(url)
-    merged = [(key, value) for key, value in parse_qsl(parsed.fragment, keep_blank_values=True)
-              if key != "table_id"]
-    return _with_baccarat_route(parsed, merged)
 
 
 def _safe_url(url):
@@ -221,17 +230,79 @@ def validated_endpoint(page):
     return endpoint
 
 
-def build_flags(pos=None, cdp=False):
+def cdp_port_closed(exc):
+    """Cổng 9222 đóng = Chrome mà người dùng nhìn thấy không phải Chrome do app mở
+    (không có --remote-debugging-port). Phải nói rõ để người dùng không đi tìm “lỗi
+    đăng nhập” trong khi app chưa cắm được vào cửa sổ nào."""
+    reason = getattr(exc, "reason", None)
+    return isinstance(exc, ConnectionRefusedError) or isinstance(reason, ConnectionRefusedError)
+
+
+CDP_CLOSED_NOTE = (
+    "Không có Chrome nào đang mở ở chế độ app dùng (CDP 9222). Cửa sổ Chrome bạn thấy "
+    "không do app mở nên app không thao tác được trong đó. Hãy tắt cửa sổ Chrome đó đi "
+    "(tránh hai phiên cùng tài khoản — nguyên nhân site báo “Bạn đã đăng xuất”), bấm "
+    "“Mở Chrome” trong app rồi đăng nhập lại một lần.")
+
+
+def chrome_launch_failure_note(exc):
+    """Lỗi hay gặp nhất khi mở Chrome là profile chrome_profile đang bị cửa sổ Chrome
+    khác giữ: Chrome vừa mở tự thoát, chromedriver chỉ báo SessionNotCreatedError chung
+    chung. Phải nói thẳng cách mở khoá vì cùng tình trạng hai cửa sổ cũng là nguồn gây
+    hộp “Bạn đã đăng xuất” của site."""
+    text = str(exc).lower()
+    if ("already in use" in text or "user data directory" in text
+            or "chrome instance exited" in text or "devtoolsactiveport" in text):
+        return ("Chrome của app không mở được vì profile “%s” đang bị một cửa sổ Chrome khác "
+                "giữ. Hãy tắt hết cửa sổ Chrome rồi bấm “Mở Chrome” lại — mở hai cửa sổ cùng "
+                "một tài khoản là nguyên nhân site đá phiên “Bạn đã đăng xuất”."
+                % os.path.basename(PROFILE_DIR))
+    return ("Không mở được Chrome (%s). Kiểm tra Chrome, driver, mạng hoặc profile đang được dùng; "
+            "không mở cửa sổ thay thế và không đóng Chrome có sẵn." % type(exc).__name__)
+
+
+def _window_number(value, default):
+    """Chấp nhận số người dùng gõ kiểu Việt ("1280,5") mà không cần chuẩn hoá trước."""
+    try:
+        return float(str(value).strip().replace(",", "."))
+    except (TypeError, ValueError):
+        return default
+
+
+def normalize_window(size=None, scale=None, fullscreen=None):
+    """Đổi ô nhập của người dùng thành cấu hình cửa sổ an toàn (chặn số 0/âm/cỡ điên rồ).
+
+    Kích thước được kẹp trong SIZE_MIN..SIZE_MAX, tỉ lệ trong SCALE_MIN..SCALE_MAX phần trăm.
+    """
+    try:
+        width, height = size[0], size[1]
+    except (TypeError, IndexError):
+        width = height = None
+    percent = int(round(_window_number(scale, WIN_SCALE * 100)))
+    return {
+        "width": min(SIZE_MAX[0], max(SIZE_MIN[0], int(_window_number(width, WIN_W)))),
+        "height": min(SIZE_MAX[1], max(SIZE_MIN[1], int(_window_number(height, WIN_H)))),
+        "percent": min(SCALE_MAX, max(SCALE_MIN, percent)),
+        "fullscreen": WIN_FULLSCREEN if fullscreen is None else bool(fullscreen),
+    }
+
+
+def build_flags(pos=None, cdp=False, window=None):
+    window = normalize_window() if window is None else window
     flags = [
         "--user-data-dir=%s" % PROFILE_DIR,
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-background-networking",
-        "--window-size=%d,%d" % (WIN_W, WIN_H),
+    ] + KEEPALIVE_FLAGS + [
+        "--window-size=%d,%d" % (window["width"], window["height"]),
+        "--force-device-scale-factor=%s" % (window["percent"] / 100.0),
     ]
+    if window["fullscreen"]:
+        flags.append("--start-fullscreen")
     if cdp:
         flags.append("--remote-debugging-port=%d" % CDP_PORT)
-    if pos:
+    if pos and not window["fullscreen"]:
         flags.append("--window-position=%d,%d" % pos)
     return flags
 
@@ -249,12 +320,12 @@ class BrowserSession:
         self._reader = None
         self._reader_mtime_ns = None
         self._selected_handle = None
-        self._baccarat_route_set = False
         self._driver_info = "Chưa kết nối Chrome."
         self.last_frames = 0
         self.last_diag = {}
         self.last_error = ""
         self.connection_state = "closed"
+        self._last_cdp_targets = []
 
     @property
     def connected(self):
@@ -272,7 +343,8 @@ class BrowserSession:
             return json.load(response)
 
     def _cdp_pages(self):
-        return [page for page in self._cdp_json("list")
+        self._last_cdp_targets = self._cdp_json("list")
+        return [page for page in self._last_cdp_targets
                 if isinstance(page, dict) and page.get("type") == "page"
                 and valid_site_url(page.get("url"))]
 
@@ -295,8 +367,17 @@ class BrowserSession:
             self.last_error = ""
             try:
                 if self._cdp_page() is None:
+                    if any(isinstance(item, dict) and item.get("type") == "page"
+                           and is_evo_entry_url(item.get("url"))
+                           for item in self._last_cdp_targets):
+                        self.note = ("Evolution đang dừng ở /entry: token mở game đã bị từ chối hoặc hết hạn "
+                                     "(EV.3/EV.7). App không tải lại hay sửa link này; đăng nhập lại ở trang gốc "
+                                     "rồi mở EVO từ nút của site.")
+                        self.last_diag = {"reason": "evo_entry_auth_error"}
+                        self.connection_state = "waiting"
+                        return False
                     self.note = ("Không có tab nào trong Chrome CDP 9222 mở %s hoặc sảnh EVO "
-                                 "(*.%s)." % (PORTAL_HOST, LOBBY_HOST_SUFFIX))
+                                 "(https://<mirror>%s)." % (PORTAL_HOST, LOBBY_PATH))
                     self.last_diag = {"reason": "no_approved_tab"}
                     self.connection_state = "waiting"
                     return False
@@ -311,16 +392,100 @@ class BrowserSession:
                 self.cdp_attached = True
                 self._driver_info = info
                 self.note = ("Đã gắn Chrome hiện có · CDP 9222; chỉ đọc, giữ nguyên phiên đăng nhập. "
-                             "Bấm “Vào sảnh EVO” để mở sảnh.")
+                             "Bạn tự vào sảnh Baccarat rồi bấm “Nhận tab sảnh”.")
                 self.connection_state = "waiting"
                 return True
             except Exception as exc:
-                self.note = "Không gắn được Chrome CDP 9222 (%s)." % type(exc).__name__
+                self.note = CDP_CLOSED_NOTE if cdp_port_closed(exc) else \
+                    "Không gắn được Chrome CDP 9222 (%s)." % type(exc).__name__
                 self.last_error = self.note
                 self.connection_state = "error"
                 return False
 
-    def start(self, url=None, pos=(1290, 30), cdp=False):
+    def wait_for_cdp(self, seconds=15):
+        """Chrome do driver mở tự tạo cổng 9222, thường muộn hơn lệnh launch vài giây.
+        Biết sớm để báo đúng: cổng lên rồi thì quét được cả sảnh, chưa lên thì app chỉ
+        đọc được cầu đang hiển thị trên màn hình."""
+        deadline = time.monotonic() + max(0, seconds)
+        while True:
+            try:
+                self._cdp_json("version")
+                return True
+            except Exception:
+                if time.monotonic() >= deadline:
+                    return False
+            time.sleep(0.5)
+
+    @staticmethod
+    def _browser_command(ws, request_id, method, params):
+        ws.send(json.dumps({"id": request_id, "method": method, "params": params}))
+        deadline = time.monotonic() + COMMAND_TIMEOUT
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("cdp_timeout")
+            ws.settimeout(remaining)
+            message = json.loads(ws.recv())
+            if message.get("id") != request_id:
+                continue
+            if "error" in message:
+                raise RuntimeError("cdp_browser_command_failed")
+            return message.get("result", {})
+
+    def resize_window(self, window=None, pos=None):
+        """Đưa cửa sổ Chrome về cấu hình người dùng qua CDP: toàn màn hình hoặc kích thước tùy chọn.
+
+        Tỉ lệ render là cờ khởi động nên phần này chỉ đổi hình dạng cửa sổ; note luôn nêu
+        tỉ lệ đang lưu để người dùng biết cần mở lại Chrome khi vừa sửa tỉ lệ.
+        """
+        import websocket
+
+        window = normalize_window() if window is None else window
+        try:
+            page = self._cdp_page()
+        except Exception as exc:
+            return False, "Không tìm được tab Chrome CDP 9222 để đổi cửa sổ (%s)." % type(exc).__name__
+        target_id = page.get("id") if isinstance(page, dict) else None
+        if not (isinstance(target_id, str)
+                and re.fullmatch(r"[A-Za-z0-9_-]{1,120}", target_id)):
+            return False, "Không xác định được tab để tìm cửa sổ Chrome."
+        try:
+            ws = websocket.create_connection(validated_endpoint(self._cdp_json("version")),
+                                             suppress_origin=True, timeout=SCRIPT_TIMEOUT,
+                                             redirect_limit=0,
+                                             http_no_proxy=["127.0.0.1", "localhost", "::1"])
+        except Exception as exc:
+            return False, "Không mở được kênh CDP của Chrome (%s)." % type(exc).__name__
+        scale_note = "tỉ lệ %d%% (áp dụng khi mở lại Chrome)" % window["percent"]
+        try:
+            window_id = self._browser_command(ws, 1, "Browser.getWindowForTarget",
+                                              {"targetId": target_id}).get("windowId")
+            if window["fullscreen"]:
+                self._browser_command(ws, 2, "Browser.setWindowBounds",
+                                      {"windowId": window_id, "bounds": {"windowState": "normal"}})
+                self._browser_command(ws, 3, "Browser.setWindowBounds",
+                                      {"windowId": window_id,
+                                       "bounds": {"windowState": "fullscreen"}})
+                return True, "Đã đưa Chrome về toàn màn hình · %s." % scale_note
+            self._browser_command(ws, 2, "Browser.setWindowBounds",
+                                  {"windowId": window_id, "bounds": {"windowState": "normal"}})
+            bounds = {"width": window["width"], "height": window["height"],
+                      "windowState": "normal"}
+            if pos:
+                bounds.update(left=int(pos[0]), top=int(pos[1]))
+            self._browser_command(ws, 3, "Browser.setWindowBounds",
+                                  {"windowId": window_id, "bounds": bounds})
+            return True, "Đã đưa Chrome về %d × %d · %s." % (
+                window["width"], window["height"], scale_note)
+        except Exception as exc:
+            return False, "Không đổi được kích thước cửa sổ Chrome (%s)." % type(exc).__name__
+        finally:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+    def start(self, url=None, pos=(1290, 30), cdp=False, window=None):
         with self.lock:
             if self.cdp_attached:
                 if self.alive():
@@ -331,9 +496,8 @@ class BrowserSession:
             url = START_URL if url is None else url
             if not valid_site_url(url):
                 self.note = ("URL không được phép: chỉ https://%s%s hoặc sảnh EVO "
-                             "https://<mirror>.%s%s; cổng 443, không userinfo, không hỗ trợ "
-                             "file hay trang khác." % (PORTAL_HOST, PORTAL_PATH,
-                                                       LOBBY_HOST_SUFFIX, LOBBY_PATH))
+                             "https://<mirror>%s; cổng 443, không userinfo, không hỗ trợ "
+                             "file hay trang khác." % (PORTAL_HOST, PORTAL_PATH, LOBBY_PATH))
                 self.last_error = self.note
                 if self.driver is None:
                     self.connection_state = "error"
@@ -352,22 +516,20 @@ class BrowserSession:
                 if not chrome:
                     raise FileNotFoundError("chrome.exe")
                 kind, why = driver_for()
-                self._start_driver(chrome, url, pos, kind, cdp)
+                self._start_driver(chrome, url, pos, kind, cdp, window)
                 self.mode = "driver"
                 self.note = why + " · Đăng nhập thủ công; chỉ đọc kết quả, cược chỉ mô phỏng."
                 self.connection_state = "waiting"
                 return True
             except Exception as exc:
                 # Không đưa lỗi WebDriver thô (có thể chứa URL/token) vào UI.
-                self.note = ("Không mở được Chrome (%s). Kiểm tra Chrome, driver, mạng "
-                             "hoặc profile đang được dùng; không mở cửa sổ thay thế "
-                             "và không đóng Chrome có sẵn." % type(exc).__name__)
+                self.note = chrome_launch_failure_note(exc)
                 self.last_error = self.note
                 self.connection_state = "error"
                 self.mode = ""
                 return False
 
-    def _start_driver(self, chrome, url, pos, kind, cdp=False):
+    def _start_driver(self, chrome, url, pos, kind, cdp=False, window=None):
         from selenium import webdriver
         from selenium.webdriver.chrome.options import Options
         from selenium.webdriver.chrome.service import Service
@@ -375,7 +537,7 @@ class BrowserSession:
         opts = Options()
         opts.binary_location = chrome
         opts.page_load_strategy = "eager"
-        for flag in build_flags(pos, cdp):
+        for flag in build_flags(pos, cdp, window):
             opts.add_argument(flag)
         service = Service(DRIVER_PATH) if kind == "local" else Service()
         driver = None
@@ -483,17 +645,17 @@ class BrowserSession:
             return self._reader
 
     def _reader_script(self):
-        # Root tự xác nhận thuộc đuôi sảnh EVO; iframe được đọc dưới tab gốc đã duyệt.
+        # Root tự xác nhận đúng sảnh EVO; iframe được đọc dưới tab gốc đã duyệt.
+        # Không truyền hostname vào JS: mirror đổi liên tục, chỉ cố định đường dẫn.
         return """
             if (window === window.top) {
                 const u = new URL(location.href);
-                const suffix = arguments[0];
+                const p = u.pathname;
                 if (u.protocol !== 'https:' ||
-                    (u.hostname !== suffix && !u.hostname.endsWith('.' + suffix)) ||
-                    !u.pathname.startsWith('%s') ||
+                    (p !== '%s' && !p.startsWith('%s/')) ||
                     (u.port && u.port !== '443') || u.username || u.password) return null;
             }
-        """ % LOBBY_PATH + self.reader_src() + """
+        """ % (LOBBY_PATH, LOBBY_PATH) + self.reader_src() + """
             const report = window.__BCR_SCAN();
             const u = new URL(location.href);
             const safe = /^(https?:)$/.test(u.protocol) ? u.origin + u.pathname : '';
@@ -505,7 +667,7 @@ class BrowserSession:
             if (report.page.table_id)
                 for (const t of report.tables) if (!t.table_id) t.table_id = report.page.table_id;
             report.diag.frame = safe;
-            report.diag.auth_required = /User authentication failed|your session may be expired|Error Code:\\s*EV\\.7/i.test(document.body ? document.body.innerText : '');
+            report.diag.auth_required = /User authentication failed|your session may be expired|Error Code:\\s*EV\\.7|Bạn đã đăng xuất|You have been logged out/i.test(document.body ? document.body.innerText : '');
             return report;
         """
 
@@ -616,7 +778,7 @@ class BrowserSession:
                     self.connection_state = "waiting"
                     self.last_diag = {"reason": "no_default_context"}
                     return []
-                expression = "(function(){\n%s\n})(%s)" % (self._reader_script(), json.dumps(LOBBY_HOST_SUFFIX))
+                expression = "(function(){\n%s\n})()" % self._reader_script()
                 reports = []
                 best_count = -1
                 while self.last_frames < len(contexts):
@@ -697,17 +859,8 @@ class BrowserSession:
                 if root is None:
                     self.last_diag = {"status": self.connection_state, "reason": "no_approved_tab"}
                     return []
-                if not self._baccarat_route_set:
-                    try:
-                        current = driver.current_url
-                        route = lobby_url_with_route(current)
-                        if route:
-                            if route != current:
-                                driver.execute_script("location.hash = arguments[0]",
-                                                      urlsplit(route).fragment)
-                            self._baccarat_route_set = True
-                    except Exception:
-                        pass
+                # Không bao giờ sửa URL/hash của sảnh EVO: phiên launch của site gắn với
+                # đúng ngữ cảnh đã mở. Đổi hash có thể làm EVO tải lại /entry và trả 403/EV.7.
                 # Root được kiểm tra lại ngay trong JS; frame khác origin chỉ được
                 # tiếp cận qua cây iframe của root đã duyệt. Lọc URL trước cả RPC.
                 script = self._reader_script()
@@ -740,7 +893,7 @@ class BrowserSession:
                             stack.extend(path + (i,) for i in reversed(range(count)))
                         elif n:
                             limited = True
-                        rep = _clean_report(driver.execute_script(script, LOBBY_HOST_SUFFIX))
+                        rep = _clean_report(driver.execute_script(script))
                     except (InvalidSessionIdException, NoSuchWindowException):
                         raise
                     except (NoSuchFrameException, StaleElementReferenceException, IndexError):

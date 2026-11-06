@@ -1,22 +1,28 @@
 """In-memory live simulation and URL regressions; no UI, browser, or state files."""
 
 import sys
+import re
 
 sys.dont_write_bytecode = True
 
 from copy import deepcopy
 import json
+import math
+import random
 from types import MethodType, SimpleNamespace
 import unittest
 from unittest.mock import Mock, call, mock_open, patch
 from urllib.parse import urlsplit
+from urllib.error import URLError
 
 import app
 import browser as BR
 import engine as E
+import human_mouse as HM
 import lobby_stream as LS
 import method as ME
 import money as M
+import table_bets as TB
 
 
 BASELINE = "BPBPBPBPBPBPBPB"
@@ -845,6 +851,9 @@ class LobbyEntryTests(unittest.TestCase):
     def setUp(self):
         self.session = Mock()
         self.stream = LS.LobbyStream(self.session)
+        # Giữ bản bấm 3 sự kiện cố định để các test cũ đếm đúng số lệnh CDP;
+        # test riêng bên dưới bật human_mouse để kiểm tra đường lướt nhiều điểm.
+        self.stream.human_mouse = False
         self.sockets = []
 
         def connect(endpoint, **kwargs):
@@ -867,50 +876,63 @@ class LobbyEntryTests(unittest.TestCase):
                   "params": {"context": {"id": 7, "auxData": {"isDefault": True}}}},
                  {"id": 1, "result": {}},
                  {"id": 2, "result": {"result": {"value": value}}},
-                 {"id": 3, "result": {}}, {"id": 4, "result": {}}, {"id": 5, "result": {}}]]
+                 {"id": 3, "result": {}}, {"id": 4, "result": {}},
+                 {"id": 5, "result": {}}, {"id": 6, "result": {}}]]
 
-    def test_clicks_the_evolution_button_then_sets_the_baccarat_route(self):
+    def test_clicks_the_evolution_button_and_opens_the_lobby_without_rewriting_the_url(self):
         box = {"x": 320.5, "y": 640.25, "label": "Chơi game"}
-        portal = self.click_transcript(box)
-        lobby = [[{"method": "Runtime.executionContextCreated",
-                   "params": {"context": {"id": 9, "auxData": {"isDefault": True}}}},
-                  {"id": 1, "result": {}},
-                  {"id": 2, "result": {}}]]
-        self.scripted = portal + lobby
+        self.scripted = self.click_transcript(box)
         self.session._cdp_pages.side_effect = [[self.PORTAL], [self.PORTAL, self.LOBBY]]
         ok, note = self.stream.open_lobby_from_portal()
         self.assertTrue(ok, note)
-        self.assertIn("danh sách bàn Baccarat", note)
-        portal_socket, lobby_socket = self.sockets
+        self.assertIn("sảnh Evolution", note)
+        portal_socket, = self.sockets
         clicks = [message for message in portal_socket.sent
                   if message["method"] == "Input.dispatchMouseEvent"]
         self.assertEqual([message["params"]["type"] for message in clicks],
                          ["mouseMoved", "mousePressed", "mouseReleased"])
         self.assertEqual({message["params"]["x"] for message in clicks}, {box["x"]})
-        self.assertTrue(lobby_socket.closed and portal_socket.closed)
-        evaluate = [message for message in lobby_socket.sent if message["method"] == "Runtime.evaluate"]
-        self.assertEqual(evaluate[0]["params"]["expression"],
-                         'location.hash = "category=all_games&game=baccarat&see=baccarat"')
-        self.assertEqual(evaluate[0]["params"]["contextId"], 9)
+        self.assertTrue(portal_socket.closed)
+        self.assertNotIn("location.hash", json.dumps(portal_socket.sent))
 
-    def test_uses_the_portal_tab_and_keeps_a_tab_that_is_already_routed(self):
+    def test_uses_the_portal_tab_and_leaves_a_tab_that_is_already_open_untouched(self):
         self.session._cdp_pages.return_value = [self.PORTAL, dict(self.LOBBY, url=LOBBY_URL)]
         self.scripted = self.click_transcript({"x": 10.0, "y": 20.0})
         ok, note = self.stream.open_lobby_from_portal()
         self.assertTrue(ok, note)
-        self.assertEqual(len(self.sockets), 1, "Sảnh đã đúng route thì không sửa hash nữa")
+        self.assertEqual(len(self.sockets), 1, "Không mở thêm kênh CDP vào tab sảnh đã có")
+        self.assertNotIn("location.hash", json.dumps(self.sockets[0].sent))
 
     def test_reports_why_the_evolution_button_was_not_clickable(self):
-        for reason in ("evo_item_not_found", "evo_button_not_found", "evo_button_offscreen",
-                       "not_top_frame"):
+        for reason in ("evo_item_not_found", "evo_button_not_found", "evo_button_pending",
+                       "evo_card_blocked", "evo_button_ambiguous"):
             with self.subTest(reason=reason):
                 self.sockets, self.scripted = [], self.click_transcript({"reason": reason})
                 self.session._cdp_pages.return_value = [self.PORTAL]
-                ok, note = self.stream.open_lobby_from_portal()
+                # wait_seconds=0: không chờ retry cuộn-nút-render, lấy ngay lý do của lượt đọc đầu.
+                ok, note = self.stream.open_lobby_from_portal(wait_seconds=0)
                 self.assertFalse(ok)
                 self.assertIn(reason, note)
                 self.assertNotIn("Input.dispatchMouseEvent",
                                  [message["method"] for message in self.sockets[0].sent])
+
+    def test_an_iframe_answer_never_ends_the_retry_or_the_report(self):
+        # Mọi iframe đều trả not_top_frame nên lý do đó vô nghĩa; chỉ khung chính được tin.
+        self.sockets, self.scripted = [], self.click_transcript({"reason": "not_top_frame"})
+        self.session._cdp_pages.return_value = [self.PORTAL]
+        ok, note = self.stream.open_lobby_from_portal(wait_seconds=0)
+        self.assertFalse(ok)
+        self.assertNotIn("not_top_frame", note)
+
+    def test_clicks_the_evo_card_when_the_start_button_stays_hidden(self):
+        box = {"x": 167, "y": 479, "via": "card", "label": "LIVE-EVO"}
+        self.scripted = self.click_transcript(box)
+        self.session._cdp_pages.side_effect = [[self.PORTAL], [self.PORTAL, self.LOBBY]]
+        ok, note = self.stream.open_lobby_from_portal()
+        self.assertTrue(ok, note)
+        clicks = [message for message in self.sockets[0].sent
+                  if message["method"] == "Input.dispatchMouseEvent"]
+        self.assertEqual({message["params"]["x"] for message in clicks}, {box["x"]})
 
     def test_needs_an_approved_portal_tab_before_clicking_anything(self):
         self.session._cdp_pages.return_value = [dict(self.PORTAL, url="https://example.invalid/")]
@@ -928,7 +950,7 @@ class LobbyEntryTests(unittest.TestCase):
 
     def test_accepts_a_lobby_embedded_in_the_entry_page(self):
         portal = self.click_transcript({"x": 10.0, "y": 20.0})
-        portal[0].append({"id": 6, "result": {"result": {"value": {
+        portal[0].append({"id": 7, "result": {"result": {"value": {
             "tiles": [{"id": "t1", "title": "Baccarat A", "top": 40}],
             "scroll": {"top": 0, "max": 900, "client": 600}}}}})
         self.scripted = portal
@@ -938,9 +960,305 @@ class LobbyEntryTests(unittest.TestCase):
         self.assertIn("Quét toàn sảnh", note)
         self.assertEqual(len(self.sockets), 1, "Sảnh trong iframe thì không mở tab nào thêm")
 
+    def status_transcript(self, value):
+        return [[{"method": "Runtime.executionContextCreated",
+                  "params": {"context": {"id": 9, "auxData": {"isDefault": True}}}},
+                 {"id": 1, "result": {}},
+                 {"id": 2, "result": {"result": {"value": value}}}]]
+
+    def test_recognizes_the_baccarat_tab_the_user_opened_without_touching_it(self):
+        self.scripted = self.status_transcript({"tiles": 8, "loading": False})
+        self.session._cdp_pages.return_value = [self.PORTAL, dict(self.LOBBY, url=LOBBY_URL)]
+        ok, note = self.stream.find_lobby_tab()
+        self.assertTrue(ok, note)
+        self.assertIn("Đã nhận tab sảnh", note)
+        self.assertNotIn("location.hash", json.dumps(self.sockets[0].sent))
+        self.assertTrue(self.sockets[0].closed)
+
+    def test_accepts_a_lobby_tab_on_another_category_without_rewriting_its_url(self):
+        self.scripted = self.status_transcript({"tiles": 4, "loading": False})
+        self.session._cdp_pages.return_value = [self.PORTAL, self.LOBBY]
+        ok, note = self.stream.find_lobby_tab()
+        self.assertTrue(ok, note)
+        self.assertIn("Đã nhận tab sảnh", note)
+        socket, = self.sockets
+        self.assertNotIn("Input.dispatchMouseEvent", [m["method"] for m in socket.sent])
+        self.assertNotIn("location.hash", json.dumps(socket.sent))
+        self.assertTrue(socket.closed)
+
+    def test_keeps_an_open_table_screen_untouched_and_says_so(self):
+        table_url = LOBBY_URL + "&table_id=t1"
+        self.scripted = self.status_transcript({"tiles": 0, "roads": 1})
+        self.session._cdp_pages.return_value = [dict(self.LOBBY, url=table_url)]
+        ok, note = self.stream.find_lobby_tab()
+        self.assertTrue(ok, note)
+        self.assertIn("màn hình bàn", note)
+        self.assertNotIn("table_id", json.dumps(self.sockets[0].sent))
+        self.assertNotIn("location.hash", json.dumps(self.sockets[0].sent))
+
+    def test_asks_the_user_to_open_the_lobby_when_no_lobby_tab_exists(self):
+        self.session._cdp_pages.return_value = [self.PORTAL]
+        ok, note = self.stream.find_lobby_tab()
+        self.assertFalse(ok)
+        self.assertIn("Chưa thấy tab sảnh", note)
+        self.websocket.create_connection.assert_not_called()
+
+    def test_accepts_the_tab_when_the_health_read_cannot_answer(self):
+        self.scripted = [[]]
+        self.session._cdp_pages.return_value = [self.LOBBY]
+        ok, note = self.stream.find_lobby_tab()
+        self.assertTrue(ok, note)
+        self.assertIn("Đã nhận tab sảnh", note)
+
+    def test_reports_ev7_and_never_claims_the_expired_tab_is_ready(self):
+        self.scripted = self.status_transcript({"auth": True,
+                                                "body": "User authentication failed. Error Code: EV.7"})
+        self.session._cdp_pages.return_value = [self.LOBBY]
+        ok, note = self.stream.find_lobby_tab()
+        self.assertFalse(ok)
+        self.assertIn("EV.7", note)
+        self.assertIn("không đổi link", note)
+
+    def test_reports_a_launchgame_failure_instead_of_waiting_for_tiles(self):
+        self.scripted = self.status_transcript({"launch_failed": True,
+                                                "body": "Mở game không thành công"})
+        self.session._cdp_pages.return_value = [self.LOBBY]
+        ok, note = self.stream.find_lobby_tab()
+        self.assertFalse(ok)
+        self.assertIn("Mở game không thành công", note)
+
+
+    def test_a_chrome_without_the_debug_port_is_not_reported_as_a_missing_tab(self):
+        self.session._cdp_pages.side_effect = URLError(ConnectionRefusedError(10061, "chi tiết thô"))
+        ok, note = self.stream.find_lobby_tab()
+        self.assertFalse(ok)
+        self.assertIn("Mở Chrome", note)
+
+    def test_a_sweep_against_a_closed_debug_port_blames_the_window_not_the_lobby(self):
+        self.session._cdp_page.side_effect = URLError(ConnectionRefusedError(10061, "chi tiết thô"))
+        self.assertEqual(self.stream.sweep(max_seconds=1), [])
+        self.assertIn("Mở Chrome", self.stream.last_error)
+
+
+class LoggedOutModalDetectionTests(unittest.TestCase):
+    """Sảnh bản tiếng Việt báo mất phiên bằng hộp “Bạn đã đăng xuất. Vui lòng đóng cửa
+    sổ này lại rồi đăng nhập lại để chơi.” — không có dòng tiếng Anh nào, nên chỗ nào
+    chỉ dò “User authentication failed”/EV.7 sẽ coi trang chết là sảnh bình thường và
+    tiếp tục bấm, trong khi site đã đá phiên ra."""
+
+    MODAL = "Bạn đã đăng xuất. Vui lòng đóng cửa sổ này lại rồi đăng nhập lại để chơi. OK"
+    EV7 = "User authentication failed. Error Code:  EV.7"
+    HEALTHY = "Baccarat · 54 bàn đang mở · cầu đầy đủ"
+
+    def auth_pattern(self, script, label):
+        match = re.search(r"auth(?:_required)?\s*[:=]\s*/([^/]*)/i\.test", script)
+        self.assertIsNotNone(match, "%s không còn regex phát hiện mất phiên" % label)
+        return re.compile(match.group(1), re.IGNORECASE)
+
+    def scripts(self):
+        return ((LS.LOBBY_HEALTH_JS, "lobby_stream.LOBBY_HEALTH_JS"),
+                (BR.BrowserSession()._reader_script(), "browser.BrowserSession._reader_script"))
+
+    def test_both_auth_reads_accept_vietnamese_and_english_wording(self):
+        for script, label in self.scripts():
+            pattern = self.auth_pattern(script, label)
+            self.assertTrue(pattern.search(self.MODAL), "%s: hộp đăng xuất tiếng Việt bị bỏ qua" % label)
+            self.assertTrue(pattern.search(self.EV7), label)
+
+    def test_neither_read_calls_a_healthy_lobby_logged_out(self):
+        for script, label in self.scripts():
+            self.assertFalse(self.auth_pattern(script, label).search(self.HEALTHY), label)
+
+    def test_the_note_tells_the_user_to_sign_in_at_the_portal_not_to_edit_the_link(self):
+        note = LS.LobbyStream._health_note({"status": "auth", "entry": None})
+        self.assertIn("đăng nhập lại ở trang gốc", note)
+        self.assertIn("app không đổi link sảnh", note)
+
+
+class HumanMouseTests(unittest.TestCase):
+    """Chuột người thật: đường cong, đúng đích, không vượt trần sự kiện CDP."""
+
+    def test_windmouse_curves_but_finishes_exactly_on_the_target(self):
+        start, end = (10.0, 10.0), (420.5, 260.25)
+        points = HM.windmouse_points(start, end, rng=random.Random(7))
+        self.assertGreater(len(points), 3)
+        self.assertLessEqual(len(points), HM.MAX_POINTS)
+        self.assertEqual(points[-1], end)
+        dx, dy = end[0] - start[0], end[1] - start[1]
+        span = math.hypot(dx, dy)
+        offsets = [abs(dx * (y - start[1]) - dy * (x - start[0])) / span for x, y in points]
+        self.assertGreater(max(offsets), 1.0, "Đường phải cong, không phải đường thẳng tắp")
+
+    def test_bezier_style_also_finishes_on_the_target(self):
+        points = HM.bezier_points((4.0, 8.0), (333.0, 222.0), rng=random.Random(2))
+        self.assertGreater(len(points), 8)
+        self.assertEqual(points[-1], (333.0, 222.0))
+
+    def test_human_click_glides_then_presses_exactly_on_target(self):
+        sent = []
+        mouse = HM.HumanMouse(lambda method, params: sent.append((method, params)),
+                              rng=random.Random(3))
+        with patch("human_mouse.time.sleep"):
+            mouse.click(300.0, 200.0)
+        moved = [params for _, params in sent if params["type"] == "mouseMoved"]
+        pressed = [params for _, params in sent if params["type"] == "mousePressed"]
+        released = [params for _, params in sent if params["type"] == "mouseReleased"]
+        self.assertGreater(len(moved), 3, "Phải lướt nhiều điểm thay vì nhảy thẳng")
+        self.assertEqual([(p["x"], p["y"]) for p in pressed], [(300.0, 200.0)])
+        self.assertEqual([(p["x"], p["y"]) for p in released], [(300.0, 200.0)])
+        self.assertTrue(all(method == "Input.dispatchMouseEvent" for method, _ in sent))
+
+    def test_disabled_mouse_keeps_the_three_event_click(self):
+        sent = []
+        mouse = HM.HumanMouse(lambda method, params: sent.append((method, params)),
+                              enabled=False)
+        mouse.click(12.5, 34.25)
+        self.assertEqual([params["type"] for _, params in sent],
+                         ["mouseMoved", "mousePressed", "mouseReleased"])
+        self.assertEqual({params["x"] for _, params in sent}, {12.5})
+
+
+class FavoriteFilterTests(unittest.TestCase):
+    """Ô lọc Ưa thích: bấm đúng một lần, đọc đúng trạng thái, chỉ quét bàn đã thích."""
+
+    def test_turning_on_favorites_clicks_the_filter_once(self):
+        stream = LS.LobbyStream(Mock(), human_mouse=False)
+        stream._command = Mock()
+        stream._favorite_state = Mock(side_effect=[
+            {"x": 40.0, "y": 70.0, "active": False},
+            {"active": True},
+        ])
+        with patch("lobby_stream.time.sleep"):
+            ok, supported, note = stream._set_favorite_filter(Mock(), 9, True, wait_seconds=1)
+        self.assertTrue(ok, note)
+        self.assertTrue(supported)
+        types = [c.args[2]["type"] for c in stream._command.call_args_list
+                 if c.args[1] == "Input.dispatchMouseEvent"]
+        self.assertEqual(types, ["mouseMoved", "mousePressed", "mouseReleased"])
+        self.assertIn("Page.bringToFront", [c.args[1] for c in stream._command.call_args_list])
+
+    def test_already_on_favorites_never_clicks_again(self):
+        stream = LS.LobbyStream(Mock(), human_mouse=False)
+        stream._command = Mock()
+        stream._favorite_state = Mock(return_value={"active": True})
+        ok, supported, _ = stream._set_favorite_filter(Mock(), 9, True)
+        self.assertTrue(ok and supported)
+        stream._command.assert_not_called()
+
+    def test_missing_favorites_filter_is_reported_as_unsupported(self):
+        stream = LS.LobbyStream(Mock(), human_mouse=False)
+        stream._favorite_state = Mock(return_value={"reason": "favorite_filter_not_found"})
+        ok, supported, note = stream._set_favorite_filter(Mock(), 9, True)
+        self.assertFalse(ok)
+        self.assertFalse(supported)
+        self.assertIn("Ưa thích", note)
+
+    def test_sweep_keeps_only_the_tiles_still_visible_after_filtering(self):
+        stream = LS.LobbyStream(Mock(), human_mouse=False)
+        stream.session._cdp_page.return_value = dict(
+            id="table", type="page", url=LOBBY_URL,
+            webSocketDebuggerUrl="ws://127.0.0.1:9222/devtools/page/table")
+        snapshot = {
+            "tiles": [{"id": "t1", "title": "Baccarat 01", "road": []},
+                      {"id": "t2", "title": "Baccarat 02", "road": []}],
+            "scroll": {"top": 0, "max": 600, "client": 600},
+        }
+        results = [{"c": "R", "ties": 0, "pos": [0, 0]},
+                   {"c": "B", "ties": 0, "pos": [1, 0]}]
+        stream.histories = {
+            table_id: {"results": results, "source": "lobby.histories", "ts": 1.0, "messages": 1}
+            for table_id in ("t1", "t2", "t3")
+        }
+        stream._reset = Mock()
+        stream._command = Mock()
+        stream._wait_lobby_context = Mock(return_value=(9, snapshot))
+        stream._set_favorite_filter = Mock(return_value=(True, True, ""))
+        stream._favorite_state = Mock(return_value={"active": True})
+        stream._try_value = Mock(return_value=snapshot)
+        stream._evaluate = Mock(return_value={"result": {"value": snapshot}})
+        websocket = Mock(create_connection=Mock(return_value=Mock()))
+        with patch.dict(sys.modules, {"websocket": websocket}), patch("lobby_stream.time.sleep"):
+            rows = stream.sweep(max_seconds=1, favorites_only=True)
+        self.assertEqual([row["table_id"] for row in rows], ["t1", "t2"])
+        self.assertTrue(all(row["favorite"] for row in rows))
+        self.assertTrue(stream.diag["favorites_only"])
+        stream._set_favorite_filter.assert_called_once()
+        self.assertIs(stream._set_favorite_filter.call_args.args[2], True)
+
+    def starred_sweep(self, favorite_flags, with_histories=True, health=None):
+        """Dựng một lượt quét với sao “đã thích” ngay trong ô bàn (markup sảnh bản mới)."""
+        stream = LS.LobbyStream(Mock(), human_mouse=False)
+        stream.session._cdp_page.return_value = dict(
+            id="table", type="page", url=LOBBY_URL,
+            webSocketDebuggerUrl="ws://127.0.0.1:9222/devtools/page/table")
+        snapshot = {
+            "tiles": [{"id": "t%d" % index, "title": "Baccarat %d" % index, "road": [],
+                       "favorite": flag} for index, flag in enumerate(favorite_flags, start=1)],
+            "scroll": {"top": 0, "max": 600, "client": 600},
+        }
+        results = [{"c": "R", "ties": 0, "pos": [0, 0]}, {"c": "B", "ties": 0, "pos": [1, 0]}]
+        stream.histories = {
+            "t%d" % index: {"results": results, "source": "lobby.histories", "ts": 1.0, "messages": 1}
+            for index in range(1, len(favorite_flags) + 1)} if with_histories else {}
+        stream._reset = Mock()
+        stream._command = Mock()
+        stream._wait_lobby_context = Mock(return_value=(9, snapshot))
+        stream._set_favorite_filter = Mock(side_effect=AssertionError("khong duoc bam bo loc"))
+        stream._try_value = Mock(return_value=snapshot)
+        stream._evaluate = Mock(return_value={"result": {"value": snapshot}})
+        if health is not None:
+            stream._health = Mock(return_value=health)
+        websocket = Mock(create_connection=Mock(return_value=Mock()))
+        with patch.dict(sys.modules, {"websocket": websocket}), patch("lobby_stream.time.sleep"):
+            return stream, stream.sweep(max_seconds=1, favorites_only=True)
+
+    def test_starred_tables_are_read_straight_from_the_tiles_without_any_click(self):
+        stream, rows = self.starred_sweep([True, False, True])
+        self.assertEqual([row["table_id"] for row in rows], ["t1", "t3"])
+        self.assertTrue(all(row["favorite"] for row in rows))
+        self.assertEqual(stream.favorite_mode, "stars")
+        self.assertEqual(stream.diag["favorite_tiles"], 2)
+        stream._set_favorite_filter.assert_not_called()
+
+    def test_a_lobby_without_starred_tables_is_reported_instead_of_blamed_on_the_filter(self):
+        stream, rows = self.starred_sweep([False, False])
+        self.assertEqual(rows, [])
+        self.assertIn("Không có bàn nào được đánh dấu Ưa thích", stream.last_error)
+        stream._set_favorite_filter.assert_not_called()
+
+    def test_silent_history_feed_keeps_scrolling_and_then_blames_the_socket(self):
+        stream, rows = self.starred_sweep([True, True], with_histories=False)
+        self.assertEqual(rows, [])
+        self.assertIn("không gửi lịch sử bàn qua WebSocket", stream.last_error)
+        self.assertGreaterEqual(stream.diag["scroll_steps"], 10)
+        self.assertEqual(stream.diag["favorite_tiles"], 2)
+
+    def test_a_logged_out_lobby_stops_the_hunt_instead_of_blaming_the_socket(self):
+        """Hộp “Bạn đã đăng xuất” cũng khiến WebSocket im lặng. Nếu chỉ báo “sảnh không
+        gửi lịch sử” thì vòng 15 giây tiếp tục cuộn trên trang đã chết."""
+        stream, rows = self.starred_sweep(
+            [True], with_histories=False,
+            health={"status": "auth", "entry": None,
+                    "body": "Bạn đã đăng xuất. Vui lòng đóng cửa sổ này lại rồi đăng nhập lại để chơi."})
+        self.assertEqual(rows, [])
+        self.assertTrue(stream.session_lost)
+        self.assertNotIn("WebSocket", stream.last_error)
+        self.assertIn("đăng nhập lại ở trang gốc", stream.last_error)
+
+    def test_no_reader_script_asks_querySelector_for_a_namespaced_attribute(self):
+        """Selector dạng [xlink:href=…] ném SyntaxError trong JS: cả đoạn đọc bàn chết,
+        nên sảnh đang đầy bàn vẫn báo "chưa hiển thị danh sách bàn"."""
+        for name in sorted(dir(LS)):
+            script = getattr(LS, name)
+            if isinstance(script, str) and script.lstrip().startswith("(() =>"):
+                for selector in re.findall(r"""querySelectorAll?\(\s*['"]([^'"]+)['"]""", script):
+                    for part in selector.split(","):
+                        self.assertNotIn(":", part[part.index("["):] if "[" in part else "",
+                                         "%s: %r" % (name, part.strip()))
+
 
 class LobbyListReturnTests(unittest.TestCase):
-    """Rời màn hình bàn về danh sách bàn bằng cách đổi hash (CDP giả lập, không mở Chrome)."""
+    """Rời màn hình bàn bằng history.back(), không sửa hash (CDP giả lập, không mở Chrome)."""
 
     TABLE = dict(id="table", type="page",
                  url="https://tmrw17k36as.evo-games.com/frontend/evo/r3/#category=all_games&table_id=t1",
@@ -975,17 +1293,27 @@ class LobbyListReturnTests(unittest.TestCase):
         messages.append({"id": 3, "result": {"result": {"value": value}}})
         return [messages]
 
-    def test_drops_table_id_and_waits_for_the_tiles_to_come_back(self):
+    def test_uses_history_back_and_waits_for_the_tiles_to_come_back(self):
         self.scripted = self.transcript()
         self.session._cdp_page.side_effect = [self.TABLE, self.LIST]
         ok, note = self.stream.back_to_lobby()
         self.assertTrue(ok, note)
         self.assertIn("danh sách bàn Baccarat", note)
         evaluate = [message for message in self.sockets[0].sent if message["method"] == "Runtime.evaluate"]
-        self.assertEqual(evaluate[0]["params"]["expression"],
-                         'location.hash = "category=all_games&game=baccarat&see=baccarat"')
+        self.assertEqual(evaluate[0]["params"]["expression"], "history.back()")
         self.assertEqual(evaluate[0]["params"]["contextId"], 9)
+        self.assertNotIn("location.hash", json.dumps(self.sockets[0].sent))
         self.assertTrue(self.sockets[0].closed)
+
+    def test_no_history_back_when_the_tab_is_already_on_the_list(self):
+        # Mục lịch sử đầu của tab sảnh là /entry dùng một lần: quay lại đó là EVO báo
+        # "User authentication failed (EV.7)" dù tài khoản không mở ở đâu khác.
+        self.scripted = self.transcript()
+        self.session._cdp_page.return_value = self.LIST
+        ok, note = self.stream.back_to_lobby()
+        self.assertTrue(ok, note)
+        self.assertIn("đã ở danh sách bàn", note.lower())
+        self.assertNotIn("history.back()", json.dumps([socket.sent for socket in self.sockets]))
 
     def test_refuses_a_tab_that_is_not_the_lobby(self):
         self.scripted = self.transcript()
@@ -1001,6 +1329,16 @@ class LobbyListReturnTests(unittest.TestCase):
         ok, note = self.stream.back_to_lobby(wait_seconds=0)
         self.assertFalse(ok)
         self.assertIn("chưa thấy lại danh sách bàn", note)
+
+    def test_reports_ev7_if_the_returned_page_lost_the_session(self):
+        self.scripted = [[{"method": "Runtime.executionContextCreated",
+                           "params": {"context": {"id": 9, "auxData": {"isDefault": True}}}},
+                          {"id": 1, "result": {}}, {"id": 2, "result": {}},
+                          {"id": 3, "result": {"result": {"value": {"auth": True}}}}]]
+        self.session._cdp_page.side_effect = [self.TABLE, self.LIST]
+        ok, note = self.stream.back_to_lobby(wait_seconds=0)
+        self.assertFalse(ok)
+        self.assertIn("EV.7", note)
 
 
 class TableCycleTests(unittest.TestCase):
@@ -1026,7 +1364,11 @@ class TableCycleTests(unittest.TestCase):
             open_table_busy=False, exit_requested=False, _cdp_available=lambda: True,
             stream=Mock(back_to_lobby=Mock(return_value=(True, "Đã rời bàn · danh sách bàn Baccarat."))),
             events=Mock(), refresh=lambda: None, sweep_lobby=Mock(), sweep_note_text="",
-            cycle_waiting=False, cycle_attempts=0, cycle_table_key=None, auto_start_letters="")
+            cycle_waiting=False, cycle_attempts=0, cycle_retry_at=0.0, cycle_table_key=None,
+            auto_hunt_var=Mock(get=lambda: True), auto_start_letters="", auto_start_table_key=None,
+            session_lost=False, _trace=lambda *args, **kwargs: None,
+            _auth_blame=lambda: False)
+        host._schedule_cycle_retry = MethodType(app.BCRApp._schedule_cycle_retry, host)
         for key, value in changes.items():
             setattr(host, key, value)
         return host
@@ -1061,11 +1403,12 @@ class TableCycleTests(unittest.TestCase):
         self.assertEqual(captured, [], "Tắt chu trình thì không điều hướng Chrome")
         self.assertEqual(host.sweep_note_text, "")
 
-    def test_cycle_waits_if_chrome_is_not_attached(self):
+    def test_cycle_hops_the_retry_timer_when_chrome_is_not_attached(self):
         host = self.host(_cdp_available=lambda: False)
         app.BCRApp.leave_table_for_lobby(host)
-        self.assertFalse(host.cycle_waiting)
-        self.assertIn("chưa gắn Chrome", host.sweep_note_text)
+        self.assertTrue(host.cycle_waiting, "Chưa gắn Chrome vẫn phải giữ vòng tìm bàn")
+        self.assertEqual(host.cycle_retry_at, self.now + app.CYCLE_RETRY_SECONDS)
+        self.assertIn("Chưa gắn Chrome", host.sweep_note_text)
 
     def test_the_finished_table_is_not_offered_again(self):
         host = self.host(tables={"id:t1": self.row("t1"), "id:t2": self.row("t2")},
@@ -1076,19 +1419,124 @@ class TableCycleTests(unittest.TestCase):
         self.assertTrue(host.open_table_busy)
         host.stream.open_table.assert_called_once_with("t2")
 
-    def test_search_gives_up_after_the_allowed_retries(self):
-        host = self.host(cycle_waiting=True, cycle_attempts=app.MAX_CYCLE_SWEEPS)
-        app.BCRApp.auto_open_table(host, allow_sweep=True, exclude_key="id:t1")
-        self.assertFalse(host.cycle_waiting)
-        self.assertEqual(host.cycle_attempts, 0)
-        host.sweep_lobby.assert_not_called()
-        self.assertIn("Chưa tìm được bàn đạt 3 điều kiện", host.sweep_note_text)
+    def test_search_never_gives_up_hopes_after_the_sweeps(self):
+        for attempt in range(1, 40):
+            host = self.host(cycle_waiting=True, cycle_attempts=attempt)
+            self.assertTrue(app.BCRApp._schedule_cycle_retry(host, "Chưa có bàn đạt 3 điều kiện"))
+            self.assertTrue(host.cycle_waiting)
+            self.assertEqual(host.cycle_attempts, attempt + 1)
+            self.assertEqual(host.cycle_retry_at, self.now + app.CYCLE_RETRY_SECONDS)
+            host.sweep_lobby.assert_not_called()
 
-    def test_search_retries_the_sweep_while_cycling(self):
+    def test_no_eligible_table_arms_the_next_sweep_instead_of_re_sweeping_now(self):
         host = self.host(cycle_waiting=True, cycle_attempts=1)
         app.BCRApp.auto_open_table(host, allow_sweep=True, exclude_key="id:t1")
         self.assertEqual(host.cycle_attempts, 2)
+        self.assertEqual(host.cycle_retry_at, self.now + app.CYCLE_RETRY_SECONDS)
+        host.sweep_lobby.assert_not_called()
+        self.assertIn("tự quét lại sau %d giây" % app.CYCLE_RETRY_SECONDS, host.sweep_note_text)
+
+    def test_a_single_manual_sweep_button_still_sweeps_once(self):
+        host = self.host()
+        app.BCRApp.auto_open_table(host, allow_sweep=True)
+        self.assertFalse(host.cycle_waiting)
         host.sweep_lobby.assert_called_once_with()
+        self.assertEqual(host.cycle_retry_at, 0.0)
+
+    def test_retry_is_not_armed_when_the_user_turned_auto_hunt_off(self):
+        host = self.host(cycle_waiting=True, auto_hunt_var=Mock(get=lambda: False))
+        app.BCRApp.auto_open_table(host, allow_sweep=True, exclude_key="id:t1")
+        self.assertEqual(host.cycle_retry_at, 0.0)
+        host.sweep_lobby.assert_not_called()
+        self.assertIn("Tự quét tìm bàn", host.sweep_note_text)
+
+    def test_failed_join_rearms_the_hunt_on_the_next_table(self):
+        host = self.host(cycle_waiting=True, cycle_table_key="id:t1")
+        app.BCRApp._schedule_cycle_retry(host, "Không mở được bàn (RuntimeError).", exclude_key="id:t9")
+        self.assertEqual((host.cycle_table_key, host.cycle_retry_at),
+                         ("id:t9", self.now + app.CYCLE_RETRY_SECONDS))
+        self.assertTrue(host.cycle_waiting)
+
+    def test_back_to_lobby_failure_without_hunt_ends_the_cycle(self):
+        host = self.host(cycle_waiting=True, auto_hunt_var=Mock(get=lambda: False))
+        note = "Không về được sảnh (RuntimeError)."
+        if not app.BCRApp._schedule_cycle_retry(host, note):
+            host.cycle_waiting = False
+        self.assertFalse(host.cycle_waiting)
+        self.assertEqual(host.cycle_retry_at, 0.0)
+
+    def test_a_logged_out_lobby_ends_the_hunt_instead_of_clicking_the_error_page(self):
+        host = self.host(cycle_waiting=True, cycle_attempts=3, cycle_table_key="id:t1",
+                         cycle_retry_at=self.now + app.CYCLE_RETRY_SECONDS)
+        app.BCRApp._session_lost_step(host, "Site báo phiên Evolution đã hết hạn (EV.7).")
+        self.assertEqual((host.cycle_waiting, host.cycle_attempts, host.cycle_retry_at,
+                          host.cycle_table_key, host.session_lost), (False, 0, 0.0, None, True))
+        self.assertFalse(host.sim.running)
+        self.assertFalse(app.BCRApp._schedule_cycle_retry(host, "Chưa có bàn đạt 3 điều kiện"))
+        app.BCRApp._resume_cycle_hunt(host, self.now + 600)
+        host.sweep_lobby.assert_not_called()
+
+    def test_the_timer_starts_the_next_sweep_only_after_the_break(self):
+        host = self.host(cycle_waiting=True, cycle_attempts=1,
+                         cycle_retry_at=self.now + app.CYCLE_RETRY_SECONDS)
+        app.BCRApp._resume_cycle_hunt(host, self.now)
+        host.sweep_lobby.assert_not_called()
+        self.assertEqual(host.cycle_retry_at, self.now + app.CYCLE_RETRY_SECONDS)
+        self.now += app.CYCLE_RETRY_SECONDS
+        app.BCRApp._resume_cycle_hunt(host, self.now)
+        host.sweep_lobby.assert_called_once_with()
+        self.assertEqual(host.cycle_retry_at, 0.0)
+
+    def test_a_busy_app_pushes_the_retry_instead_of_jumping_the_queue(self):
+        host = self.host(cycle_waiting=True, sweep_busy=True, cycle_retry_at=self.now - 1)
+        app.BCRApp._resume_cycle_hunt(host, self.now)
+        host.sweep_lobby.assert_not_called()
+        self.assertEqual(host.cycle_retry_at, self.now + app.CYCLE_RETRY_SECONDS)
+
+    def test_the_timer_ignores_a_running_block_or_a_pending_entry(self):
+        for running, pending in ((True, None), (False, "id:t2")):
+            host = self.host(cycle_waiting=True, cycle_retry_at=self.now - 1)
+            host.sim.running = running
+            host.auto_start_table_key = pending
+            app.BCRApp._resume_cycle_hunt(host, self.now)
+            host.sweep_lobby.assert_not_called()
+            self.assertEqual(host.cycle_retry_at, 0.0)
+
+    def test_manual_pause_stops_the_auto_hunt(self):
+        host = self.host(cycle_waiting=True, cycle_retry_at=self.now + app.CYCLE_RETRY_SECONDS)
+        host.sim.running = True
+        host.tables = {"id:t1": self.row("t1")}
+        host.sim.table_key = "id:t1"
+        host.sim.letters = BASELINE
+        host.verified = Mock(get=lambda: True)
+        host.browser = Mock(connected=True)
+        host._save_state = Mock()
+        app.BCRApp.toggle_simulation(host)
+        self.assertFalse(host.sim.running)
+        self.assertEqual((host.cycle_waiting, host.cycle_retry_at), (False, 0.0))
+
+    def test_a_detached_chrome_keeps_the_hunt_waiting(self):
+        host = self.host(cycle_waiting=True, cycle_retry_at=self.now - 1,
+                         _cdp_available=lambda: False)
+        app.BCRApp._resume_cycle_hunt(host, self.now)
+        host.sweep_lobby.assert_not_called()
+        self.assertEqual(host.cycle_retry_at, self.now + app.CYCLE_RETRY_SECONDS)
+        self.assertTrue(host.cycle_waiting)
+
+    def test_joined_table_disarms_the_hunt(self):
+        row = self.row("t9")
+        row.update(source="evo-bead", screen_stable=2)
+        host = self.host(tables={"id:t9": row}, cycle_waiting=True, cycle_attempts=4,
+                         cycle_table_key="id:t1", auto_start_letters=row["letters"],
+                         auto_start_table_key="id:t9", verified=Mock(),
+                         auto_start_deadline=self.now + app.ENTRY_WAIT,
+                         cycle_retry_at=self.now + app.CYCLE_RETRY_SECONDS)
+        host.sim.arm_at_entry = Mock(return_value=True)
+        app.BCRApp._auto_start_verified_table(host)
+        self.assertEqual((host.cycle_waiting, host.cycle_attempts, host.cycle_retry_at,
+                          host.cycle_table_key), (False, 0, 0.0, None))
+        app.BCRApp._resume_cycle_hunt(host, self.now + 600)
+        self.assertFalse(host.cycle_waiting)
 
 
 class MethodBlockRegressionTests(unittest.TestCase):
@@ -1161,19 +1609,23 @@ class BrowserUrlRegressionTests(unittest.TestCase):
     def setUp(self):
         self.host = urlsplit(LOBBY_URL).hostname
         self.origin = "https://" + self.host
+        self.mirror = "https://ivi4sibf.kurxcbnpmjvc.link"
 
-    def test_only_exact_https_host_with_default_port_is_allowed(self):
+    def test_public_https_mirrors_with_default_port_are_allowed(self):
         self.assertTrue(BR.is_lobby_host(self.host))
         for url in (LOBBY_URL, self.origin + BR.LOBBY_PATH + "/",
                     self.origin + ":443/frontend/evo/r3/",
-                    "https://other-mirror.evo-games.com/frontend/evo/r3/#category=all_games",
+                    self.mirror + BR.LOBBY_PATH + "/#category=all_games&see=baccarat",
+                    "https://another-mirror.example.net/frontend/evo/r3/#category=all_games",
                     "https://" + self.host.upper() + BR.LOBBY_PATH + "/", BR.START_URL):
             with self.subTest(url=url):
                 self.assertTrue(BR.valid_site_url(url))
 
-    def test_lobby_needs_the_evo_host_suffix_and_the_lobby_path(self):
+    def test_lobby_needs_the_exact_evo_path(self):
         for url in (self.origin + "/", self.origin + "/other/path?table_id=01#category=all_games",
-                    self.origin + "/frontend/evo/", self.origin + "/frontend/other"):
+                    self.origin + "/frontend/evo/", self.origin + "/frontend/other",
+                    self.origin + "/frontend/evo/r3evil", self.mirror + "/frontend/evo",
+                    self.mirror + "/"):
             with self.subTest(url=url):
                 self.assertFalse(BR.valid_site_url(url))
         self.assertTrue(BR.valid_site_url(self.origin + BR.LOBBY_PATH + "/"))
@@ -1184,14 +1636,20 @@ class BrowserUrlRegressionTests(unittest.TestCase):
         self.assertFalse(BR.is_lobby_url(BR.START_URL))
         self.assertFalse(BR.is_portal_url(LOBBY_URL))
 
-    def test_unrelated_and_lookalike_hosts_are_rejected(self):
-        for host in ("example.invalid", "localhost", "127.0.0.1", "[::1]",
-                     "notevo-games.com", "evo-games.com.example.invalid",
-                     "prefix-evo-games.com", BR.LOBBY_HOST_SUFFIX + ".",
-                     self.host + ".example.invalid"):
+    def test_entry_is_detected_but_never_treated_as_a_lobby(self):
+        entry = self.mirror + "/entry"
+        self.assertTrue(BR.is_evo_entry_url(entry))
+        self.assertFalse(BR.is_lobby_url(entry))
+        self.assertFalse(BR.valid_site_url(entry))
+
+    def test_private_and_lookalike_hosts_are_rejected(self):
+        for host in ("localhost", "127.0.0.1", "127.0.0.2", "[::1]", "::1",
+                     "notevo.local", "host.local", ".example.net", "example.net.",
+                     "double..dot.example.net", "-bad.example.net", "bad-.example.net",
+                     "no-dot-host"):
             with self.subTest(host=host):
                 self.assertFalse(BR.valid_site_url("https://" + host + BR.LOBBY_PATH + "/"))
-        # Mirror là bản gốc của Evolution nên mọi tên con trong *.evo-games.com đều được đọc.
+        # Mirror đổi liên tục: mọi tên miền công khai có đúng đường dẫn đều được đọc.
         self.assertTrue(BR.valid_site_url("https://sub." + self.host + BR.LOBBY_PATH + "/"))
         for url in ("https://" + BR.PORTAL_HOST + "/",
                     "https://" + BR.PORTAL_HOST + "/gamelobby",
@@ -1201,7 +1659,8 @@ class BrowserUrlRegressionTests(unittest.TestCase):
                 self.assertFalse(BR.valid_site_url(url))
 
     def test_non_https_file_and_relative_urls_are_rejected(self):
-        for url in ("http://" + self.host, "ftp://" + self.host,
+        for url in ("http://" + self.host, "http://" + self.host + BR.LOBBY_PATH + "/",
+                    "ftp://" + self.host + BR.LOBBY_PATH,
                     "file:///C:/Users/Administrator/Desktop/BCR/test_live_app.py",
                     "file://" + self.host + "/", "data:text/plain,BPT",
                     "javascript:void(0)", "about:blank", "chrome://settings",
@@ -1212,13 +1671,16 @@ class BrowserUrlRegressionTests(unittest.TestCase):
     def test_all_userinfo_is_rejected_even_on_approved_host(self):
         for userinfo in ("user@", "user:password@", "@", ":@", "example.invalid@"):
             with self.subTest(userinfo=userinfo):
-                self.assertFalse(BR.valid_site_url("https://" + userinfo + self.host + "/"))
+                self.assertFalse(BR.valid_site_url(
+                    "https://" + userinfo + self.host + BR.LOBBY_PATH + "/"))
         self.assertFalse(BR.valid_site_url(self.origin + "@example.invalid/"))
 
     def test_nondefault_or_malformed_ports_are_rejected(self):
-        for port in ("80", "444", "8443", "0", "-1", "65536", "", "0443", "+443", "bad"):
+        for port in ("80", "444", "8443", "0", "-1", "65536", "bad"):
             with self.subTest(port=port):
-                self.assertFalse(BR.valid_site_url(self.origin + ":" + port + "/"))
+                self.assertFalse(BR.valid_site_url(
+                    self.origin + ":" + port + BR.LOBBY_PATH + "/"))
+        self.assertTrue(BR.valid_site_url(self.origin + ":443" + BR.LOBBY_PATH + "/"))
 
     def test_whitespace_control_characters_and_backslashes_are_rejected(self):
         for character in (" ", "\t", "\r", "\n", "\x00", "\x1f", "\x7f", "\u00a0", "\\"):
@@ -1233,17 +1695,14 @@ class BrowserUrlRegressionTests(unittest.TestCase):
             with self.subTest(url=url):
                 self.assertFalse(BR.valid_site_url(url))
 
-    def test_lobby_route_only_adds_baccarat_keys_to_the_lobby_page(self):
-        redirect = self.origin + BR.LOBBY_PATH + "/#category=all_games"
-        self.assertEqual(BR.lobby_url_with_route(redirect), LOBBY_URL)
-        self.assertEqual(BR.lobby_url_with_route(self.origin + BR.LOBBY_PATH + "/"),
-                         self.origin + BR.LOBBY_PATH + "/#" + BR.LOBBY_ROUTE)
-        self.assertEqual(BR.lobby_url_with_route(LOBBY_URL), LOBBY_URL)
-        # Màn hình bàn đã mở: giữ nguyên table_id, không quay lại danh sách.
-        table = self.origin + BR.LOBBY_PATH + "/#category=all_games&table_id=suropcmnbqpabwko"
-        self.assertEqual(BR.lobby_url_with_route(table), table)
-        for url in (BR.START_URL, "https://example.invalid/frontend/evo/r3/", "", None):
-            self.assertEqual(BR.lobby_url_with_route(url), "", url)
+    def test_lobby_detection_never_rewrites_the_launch_url(self):
+        session = BR.BrowserSession()
+        script = session._reader_script()
+        self.assertIn("'/frontend/evo/r3'", script)
+        self.assertNotIn("location.hash", script)
+        # Không còn helper đổi hash: URL launch của EVO phải được giữ nguyên.
+        self.assertFalse(hasattr(BR, "lobby_url_with_route"))
+        self.assertFalse(hasattr(BR, "lobby_list_url"))
 
     def test_start_guard_rejects_urls_before_any_browser_discovery_or_launch(self):
         # BrowserSession construction is pure; every external entry point is mocked.
@@ -1490,6 +1949,14 @@ class BrowserCdpRegressionTests(unittest.TestCase):
                 self.cdp_json.assert_called_once_with("list")
         self.websocket.create_connection.assert_not_called()
 
+    def test_attach_reports_entry_handoff_as_an_auth_problem(self):
+        self.metadata["list"] = [dict(self.page, url="https://mirror.example.net/entry")]
+        self.assertFalse(self.session.attach())
+        self.assertEqual(self.session.last_diag, {"reason": "evo_entry_auth_error"})
+        self.assertIn("/entry", self.session.note)
+        self.assertEqual(self.cdp_json.call_args_list, [call("list")])
+        self.websocket.create_connection.assert_not_called()
+
     def test_attach_skips_unapproved_targets_and_uses_first_approved_page(self):
         self.metadata["list"] = [dict(self.page, url="https://example.invalid/"),
                                  dict(self.page, type="iframe"), self.page]
@@ -1545,6 +2012,18 @@ class BrowserCdpRegressionTests(unittest.TestCase):
         self.assertNotIn("METADATA_SECRET", self.session.last_error)
         self.cdp_json.assert_called_once_with("list")
         self.websocket.create_connection.assert_not_called()
+
+    def test_a_chrome_without_the_debug_port_is_named_as_the_wrong_window(self):
+        # Chrome mở tay (không có --remote-debugging-port) làm /json/list ném
+        # ConnectionRefusedError; báo chung chung "URLError" khiến người dùng đi tìm lỗi
+        # đăng nhập, trong khi app chưa cắm được vào cửa sổ nào và tài khoản đang có
+        # hai phiên cùng lúc — nguyên nhân site đá "Bạn đã đăng xuất".
+        self.cdp_json.side_effect = URLError(ConnectionRefusedError(10061, "secret detail"))
+        self.assertFalse(self.session.attach())
+        self.assertEqual(self.session.connection_state, "error")
+        self.assertIn("Mở Chrome", self.session.note)
+        self.assertIn("Bạn đã đăng xuất", self.session.note)
+        self.assertNotIn("secret detail", self.session.note)
 
     def test_alive_missing_page_pauses_but_keeps_attachment(self):
         self.assertTrue(self.session.attach())
@@ -1688,7 +2167,7 @@ class BrowserCdpRegressionTests(unittest.TestCase):
                                                      "Target.getTargetInfo"])
                 for command, context_id in zip(commands[2:4], (11, 12)):
                     self.assertEqual(command["params"], dict(
-                        expression="(function(){\nreturn window.__BCR_SCAN();\n})(%s)" % json.dumps(BR.LOBBY_HOST_SUFFIX),
+                        expression="(function(){\nreturn window.__BCR_SCAN();\n})()",
                         contextId=context_id, returnByValue=True, silent=True,
                         timeout=BR.SCRIPT_TIMEOUT * 1000))
                 self.assertEqual(ws.recv.call_count, len(messages))
@@ -1791,6 +2270,226 @@ class BrowserCdpRegressionTests(unittest.TestCase):
         self.assertNotIn("SOCKET_SECRET", self.session.last_error)
         self.assert_commands(ws, ["Runtime.enable", "Target.getTargetInfo",
                                   "Runtime.evaluate", "Target.getTargetInfo"])
+
+
+class ChromeLaunchFailureNoteTests(unittest.TestCase):
+    """chromedriver báo lỗi thô (SessionNotCreatedError, message dài) — người dùng chỉ
+    cần biết một việc: có cửa sổ Chrome khác đang giữ profile của app."""
+
+    def test_a_locked_profile_is_named_as_another_chrome_window(self):
+        for message in ("session not created: Chrome instance exited. Ex: ChromeDriver "
+                        "failed to parse response with success: 0",
+                        "user data directory is already in use, exiting",
+                        "DevToolsActivePort file doesn't exist"):
+            with self.subTest(message=message):
+                self.assertIn("cửa sổ Chrome khác", BR.chrome_launch_failure_note(Exception(message)))
+
+    def test_other_launch_failures_keep_the_short_generic_note(self):
+        note = BR.chrome_launch_failure_note(FileNotFoundError("chrome.exe"))
+        self.assertIn("FileNotFoundError", note)
+        self.assertNotIn("chrome.exe", note, "đường dẫn thô không được lên UI")
+
+    def test_start_surfaces_the_locked_profile_note_and_launches_nothing_else(self):
+        session = BR.BrowserSession()
+        error = Exception("session not created: Chrome instance exited")
+        with patch.object(BR, "chrome_path", return_value="chrome.exe"), \
+             patch.object(BR, "driver_for", return_value=("local", "ok")), \
+             patch.object(BR.BrowserSession, "_start_driver", side_effect=error) as launch:
+            self.assertFalse(session.start())
+        self.assertEqual(launch.call_count, 1)
+        self.assertIsNone(session.driver)
+        self.assertEqual(session.mode, "")
+        self.assertEqual(session.connection_state, "error")
+        self.assertIn("cửa sổ Chrome khác", session.note)
+        self.assertEqual(session.last_error, session.note)
+
+    def test_wait_for_cdp_answers_as_soon_as_the_port_replies(self):
+        session = BR.BrowserSession()
+        with patch.object(BR.BrowserSession, "_cdp_json", return_value={"Browser": "Chrome/155"}) as probe:
+            self.assertTrue(session.wait_for_cdp(seconds=6))
+        self.assertEqual(probe.call_args_list, [call("version")])
+
+    def test_wait_for_cdp_gives_up_without_sleeping_when_the_port_never_opens(self):
+        session = BR.BrowserSession()
+        sleeper = patch("browser.time.sleep", side_effect=AssertionError("khong duoc nghi"))
+        sleep = sleeper.start()
+        self.addCleanup(sleeper.stop)
+        with patch.object(BR.BrowserSession, "_cdp_json", side_effect=ConnectionRefusedError):
+            self.assertFalse(session.wait_for_cdp(seconds=0))
+        sleep.assert_not_called()
+
+
+class WindowConfigTests(unittest.TestCase):
+    """Cấu hình cửa sổ Chrome do người dùng nhập; transcript CDP giả lập, không mở Chrome thật."""
+
+    def test_defaults_to_a_normal_window_at_80_percent(self):
+        window = BR.normalize_window()
+        self.assertEqual((window["fullscreen"], window["percent"]), (False, 80))
+
+    def test_clamps_user_values_and_accepts_comma_decimal(self):
+        flags = BR.build_flags(None, False, BR.normalize_window(
+            ("1280,5", "720,5"), "150", False))
+        self.assertIn("--window-size=1280,720", flags)
+        self.assertIn("--force-device-scale-factor=1.5", flags)
+        self.assertNotIn("--start-fullscreen", flags)
+        oversized = BR.normalize_window(("10", "10", ), "250", False)
+        self.assertEqual(oversized["percent"], BR.SCALE_MAX)
+        tiny = BR.normalize_window(("10", "10"), "1", False)
+        self.assertEqual((tiny["width"], tiny["height"], tiny["percent"]),
+                         (BR.SIZE_MIN[0], BR.SIZE_MIN[1], BR.SCALE_MIN))
+
+    def test_keepalive_flags_are_always_passed(self):
+        """Tab trang vào phải giữ nhịp JS đầy đủ, nếu không phiên EVO hết hạn giữa chừng."""
+        flags = BR.build_flags(None, False, BR.normalize_window())
+        for flag in BR.KEEPALIVE_FLAGS:
+            self.assertIn(flag, flags)
+
+    def test_garbage_input_falls_back_to_the_default_geometry(self):
+        window = BR.normalize_window(("abc", ""), "d", False)
+        self.assertEqual((window["width"], window["height"], window["percent"]),
+                         (BR.WIN_W, BR.WIN_H, 80))
+
+    def test_fullscreen_uses_window_state_and_never_a_position_flag(self):
+        window = BR.normalize_window((3000, 3000), 150, True)
+        self.assertIn("--start-fullscreen", BR.build_flags((100, 20), False, window))
+        self.assertNotIn("--window-position=100,20", BR.build_flags((100, 20), False, window))
+        self.assertIn("--window-position=100,20",
+                      BR.build_flags((100, 20), False, BR.normalize_window(fullscreen=False)))
+
+    class Socket:
+        def __init__(self, replies):
+            self.replies = replies
+            self.sent = []
+
+        def send(self, raw):
+            self.sent.append(json.loads(raw))
+
+        def recv(self):
+            return json.dumps(self.replies[self.sent[-1]["id"]])
+
+        def settimeout(self, _seconds):
+            pass
+
+        def close(self):
+            pass
+
+    def session_with_socket(self):
+        session = BR.BrowserSession()
+        socket = self.Socket({1: {"id": 1, "result": {"windowId": 42}},
+                              2: {"id": 2, "result": {}}, 3: {"id": 3, "result": {}}})
+        websocket = Mock(spec=["create_connection"])
+        websocket.create_connection.return_value = socket
+        page = dict(id="t1", url=LOBBY_URL,
+                    webSocketDebuggerUrl="ws://127.0.0.1:9222/devtools/page/t1")
+        for patcher in (patch.object(session, "_cdp_page", return_value=page),
+                        patch.object(session, "_cdp_json", return_value={
+                            "Browser": "Chrome/123.0",
+                            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/browser/abc"}),
+                        patch.dict(sys.modules, {"websocket": websocket})):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return session, socket
+
+    def test_resize_sends_a_normal_window_for_the_default_config(self):
+        session, socket = self.session_with_socket()
+        ok, note = session.resize_window()
+        self.assertTrue(ok, note)
+        self.assertEqual([message["params"]["bounds"] for message in socket.sent[1:]],
+                         [{"windowState": "normal"},
+                          {"width": BR.WIN_W, "height": BR.WIN_H, "windowState": "normal"}])
+        self.assertIn("%d × %d" % (BR.WIN_W, BR.WIN_H), note)
+        self.assertNotIn("toàn màn hình", note)
+
+    def test_resize_to_fullscreen_uses_window_state_then_reports_scale(self):
+        session, socket = self.session_with_socket()
+        ok, note = session.resize_window(BR.normalize_window(fullscreen=True))
+        self.assertTrue(ok, note)
+        self.assertEqual([message["params"]["bounds"] for message in socket.sent[1:]],
+                         [{"windowState": "normal"}, {"windowState": "fullscreen"}])
+        self.assertIn("toàn màn hình", note)
+
+    def test_resize_applies_the_custom_size_and_keeps_scale_as_a_restart_hint(self):
+        session, socket = self.session_with_socket()
+        ok, note = session.resize_window(BR.normalize_window((1280, 720), 80, False), pos=(40, 30))
+        self.assertTrue(ok, note)
+        self.assertEqual(socket.sent[-1]["params"]["bounds"],
+                         {"width": 1280, "height": 720, "windowState": "normal", "left": 40, "top": 30})
+        self.assertIn("1280 × 720", note)
+        self.assertIn("mở lại Chrome", note)
+
+
+class ChipMatchingTests(unittest.TestCase):
+    """Chip trên bàn hiển thị theo đơn vị nghìn; phải quy đổi VNĐ và ghép đúng mệnh giá."""
+
+    TRAY = [20, 50, 100, 500, 2000, 10000]
+
+    def live(self, banker=0, player=0, tie=0, unit=1000, denominations=None):
+        spots = {}
+        for side, units in (("B", banker), ("P", player), ("T", tie)):
+            spots[side] = {"amount": units, "amount_vnd": float(units * unit),
+                           "chips": [], "chips_vnd": []}
+        return {"ok": True, "unit": unit,
+                "denominations": self.TRAY if denominations is None else denominations,
+                "spots": spots, "total": float((banker + player + tie) * unit),
+                "total_units": banker + player + tie}
+
+    def test_chip_value_maps_thousands_to_vnd(self):
+        self.assertEqual(TB.decompose(20000)["chips"], [20])
+        self.assertEqual(TB.decompose(50000)["chips"], [50])
+        self.assertEqual(TB.decompose(100000)["chips"], [100])
+
+    def test_120_thousand_needs_one_100_and_one_20(self):
+        split = TB.decompose(120000)
+        self.assertTrue(split["exact"])
+        self.assertEqual(sorted(split["chips"]), [20, 100])
+        self.assertEqual(split["total_vnd"], 120000)
+
+    def test_140_thousand_needs_100_plus_two_20s(self):
+        split = TB.decompose(140000)
+        self.assertTrue(split["exact"])
+        self.assertEqual(split["chips"], [100, 20, 20])
+
+    def test_decomposition_reports_an_ungroupable_amount(self):
+        # Khay không có mệnh giá 10 nên 10.000 không ghép được.
+        split = TB.decompose(10000, 1000, [20, 50, 100])
+        self.assertFalse(split["exact"])
+        self.assertEqual(split["remainder_vnd"], 10000)
+
+    def test_compare_match_uses_vnd_not_chip_units(self):
+        result = ME.compare_chips("B", 120000, self.live(banker=120))
+        self.assertEqual(result["status"], "match")
+        self.assertEqual(sorted(result["suggested_chips"]), [20, 100])
+
+    def test_compare_flags_wrong_amount_and_still_suggests_chips(self):
+        result = ME.compare_chips("B", 140000, self.live(banker=120))
+        self.assertEqual(result["status"], "wrong_amount")
+        self.assertEqual(result["suggested_chips"], [100, 20, 20])
+
+    def test_compare_flags_wrong_side(self):
+        result = ME.compare_chips("P", 100000, self.live(banker=100))
+        self.assertEqual(result["status"], "wrong_side")
+
+    def test_compare_flags_extra_bets(self):
+        result = ME.compare_chips("B", 100000, self.live(banker=100, player=50000))
+        self.assertEqual(result["status"], "extra_bets")
+
+    def test_compare_no_bet_still_offers_the_chip_recipe(self):
+        result = ME.compare_chips("B", 100000, self.live())
+        self.assertEqual(result["status"], "no_bet")
+        self.assertEqual(result["suggested_chips"], [100])
+
+    def test_compare_unknown_when_the_table_was_not_read(self):
+        result = ME.compare_chips("B", 100000, {"ok": False})
+        self.assertEqual(result["status"], "unknown")
+
+    def test_compare_rejects_an_amount_the_tray_cannot_make(self):
+        result = ME.compare_chips("B", 10000, self.live(banker=0, denominations=[20, 50, 100]))
+        self.assertEqual(result["status"], "ungroupable")
+
+    def test_custom_unit_keeps_chip_numbers_aligned(self):
+        # 1 đơn vị = 10.000 đ thì chip "20" là 200.000 đ.
+        split = TB.decompose(200000, 10000)
+        self.assertEqual(split["chips"], [20])
 
 
 if __name__ == "__main__":

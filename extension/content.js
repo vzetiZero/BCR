@@ -29,7 +29,14 @@
     if (document.hidden && trigger === "auto") return;
     const payload = window.__BCR_SCAN();
     const kind = payload.diag.kind;
-    if (!payload.tables.length) { setStatus("Không thấy bảng cầu nào trên frame này (" + kind + ")"); return; }
+    if (!payload.tables.length) {
+      // Sảnh chỉ là danh sách bàn, không có bảng cầu: không báo lỗi ở đây.
+      if (tableId)
+        setStatus("Không thấy bảng cầu nào trên frame này (" + kind + ")");
+      else
+        setStatus("Đang ở sảnh, chưa mở bàn — mở một bàn để đọc cầu.");
+      return;
+    }
     payload.page.table_id = payload.page.table_id || tableId;
     payload.page.url = TOP.slice(0, 200);
     payload.diag.trigger = trigger;

@@ -12,6 +12,7 @@ __pycache__/
 bcr_state.json
 bcr-session-*.json
 live_reports.jsonl
+bcr_trace.jsonl
 
 # Bang chung live / anh man hinh
 live-road-evidence.json

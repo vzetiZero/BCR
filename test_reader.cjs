@@ -172,33 +172,47 @@ test('skips bead containers without readable items', () => {
 const entrySource = /EVO_ENTRY_JS = """([\s\S]*?)"""/.exec(
   fs.readFileSync(__dirname + '/lobby_stream.py', 'utf8'))[1];
 
-function evoItem({subprovider = 'EVO', alt = 'Evolution', disabled = false,
-                  rect = {x: 200, y: 400, width: 120, height: 40}, afterScroll = null} = {}) {
+function evoItem({attrs = {'data-subprovider': 'EVO'}, alt = 'Evolution', disabled = false,
+                  buttonClass = 'nrc-button btn-main', buttonText = 'Chơi game',
+                  rect = {x: 200, y: 400, width: 120, height: 40}, afterScroll = null,
+                  card = {x: 180, y: 360, width: 240, height: 150}, cardAfterScroll = null} = {}) {
+  const box = (r) => ({...r, bottom: r.y + r.height, right: r.x + r.width});
   const button = {
-    disabled,
-    innerText: 'Chơi game',
+    disabled, className: buttonClass,
+    innerText: buttonText,
     getAttribute: (key) => (key === 'title' ? '' : null),
     scrollIntoView: () => { if (afterScroll) Object.assign(button.current, afterScroll); },
-    getBoundingClientRect: () => ({...button.current,
-      bottom: button.current.y + button.current.height,
-      right: button.current.x + button.current.width}),
+    getBoundingClientRect: () => box(button.current),
     current: {...rect},
   };
   const node = {
+    getAttribute: (name) => (name in attrs ? attrs[name] : null),
+    scrollIntoView: () => { if (cardAfterScroll) Object.assign(node.current, cardAfterScroll); },
+    getBoundingClientRect: () => box(node.current),
+    contains: (element) => !!element && !element.__outside,
     querySelector: (selector) => {
-      if (selector === 'img') return {alt};
-      return (selector === 'button.btn-main' || selector === 'button') ? button : null;
+      if (selector === 'img') return alt === null ? null : {alt};
+      if (selector === 'button.btn-main') return /\bbtn-main\b/.test(buttonClass) ? button : null;
+      return selector === 'button' ? button : null;
     },
+    current: {...card},
   };
-  return {subprovider, node};
+  return {attrs, node};
 }
 
-function portalScan(items, {inIframe = false, innerHeight = 800, innerWidth = 600} = {}) {
+function portalScan(items, {inIframe = false, innerHeight = 800, innerWidth = 600, hit = 'card'} = {}) {
+  // elementFromPoint mô phỏng đúng ô thật nằm dưới điểm bấm: ngôi sao yêu thích che góc phải thẻ.
+  const hits = {card: {closest: () => null}, fav: {closest: () => ({})},
+                outside: {closest: () => null, __outside: true}, none: null};
   const ctx = {innerHeight, innerWidth,
     document: {querySelectorAll: (selector) => {
-      assert.equal(selector, '.game-item[data-subprovider="EVO"]');
-      return items.filter((item) => item.subprovider === 'EVO').map((item) => item.node);
-    }}};
+      const wanted = selector.split(',').map((part) => part.trim());
+      assert.equal(wanted.length, 3);
+      return items.filter((item) => wanted.some((part) => {
+        const rule = /^\.game-item\[data-([a-z-]+)="([^"]+)"\]/.exec(part);
+        return rule && item.attrs['data-' + rule[1]] === rule[2];
+      })).map((item) => item.node);
+    }, elementFromPoint: () => hits[hit]}};
   const win = {};
   win.top = inIframe ? {frameElement: true} : win;
   ctx.window = win;
@@ -207,24 +221,81 @@ function portalScan(items, {inIframe = false, innerHeight = 800, innerWidth = 60
 }
 
 test('takes the pointer position of the Evolution play button on the entry page', () => {
-  const box = portalScan([evoItem({subprovider: 'SA'}), evoItem()]);
+  const box = portalScan([evoItem({attrs: {'data-subprovider': 'SA'}}), evoItem()]);
   assert.equal(box.x, 260);
   assert.equal(box.y, 420);
   assert.equal(box.label, 'Chơi game');
+  assert.equal(box.via, 'button');
+});
+
+test('finds the current entry markup: data-gp evo tile with a plain "Bắt đầu" button', () => {
+  const box = portalScan([evoItem({attrs: {'data-id': 'LIVE-EVO', 'data-gp': 'evo'}, alt: null,
+                                    buttonClass: '', buttonText: 'Bắt đầu'})]);
+  assert.equal(box.x, 260);
+  assert.equal(box.y, 420);
+  assert.equal(box.label, 'Bắt đầu');
+  assert.equal(box.via, 'button');
+});
+
+test('clicks the tile itself when the start button stays display:none', () => {
+  // Markup thật 11/2026: thẻ 239x154 có onclick, nút "Bắt đầu" ẩn (rect 0x0) dù hover.
+  const box = portalScan([evoItem({attrs: {'data-id': 'LIVE-EVO', 'data-gp': 'evo'}, alt: null,
+                                    buttonClass: '', buttonText: 'Bắt đầu',
+                                    rect: {x: 0, y: 0, width: 0, height: 0}})]);
+  assert.equal(box.via, 'card');
+  assert.equal(box.x, 276);   // 40% chiều rộng thẻ, tránh ngôi sao yêu thích góc phải
+  assert.equal(box.y, 453);   // 62% chiều cao thẻ
+  assert.equal(box.label, 'LIVE-EVO');
 });
 
 test('scrolls a below-the-fold play button into view before measuring it', () => {
   const box = portalScan([evoItem({rect: {x: 200, y: 900, width: 120, height: 40},
                                     afterScroll: {x: 200, y: 400, width: 120, height: 40}})]);
   assert.equal(box.y, 420);
+  assert.equal(box.via, 'button');
+});
+
+test('scrolls a below-the-fold tile into view before clicking it', () => {
+  const box = portalScan([evoItem({rect: {x: 0, y: 0, width: 0, height: 0},
+                                   card: {x: 180, y: 900, width: 240, height: 150},
+                                   cardAfterScroll: {x: 180, y: 360, width: 240, height: 150}})]);
+  assert.equal(box.via, 'card');
+  assert.equal(box.y, 453);
+});
+
+test('clicks the visible band when the window clips the tile', () => {
+  // Cửa sổ thấp hơn thẻ (lỗi thật 11/2026): điểm bấm phải nằm trong phần còn nhìn thấy.
+  const box = portalScan([evoItem({rect: {x: 0, y: 0, width: 0, height: 0},
+                                   card: {x: 180, y: 360, width: 240, height: 150}})],
+                         {innerHeight: 420, innerWidth: 600});
+  assert.equal(box.via, 'card');
+  assert.equal(box.x, 276);
+  assert.equal(box.y, 397);   // 62% của dải 360..420 còn thấy, không phải 453 ngoài màn hình
 });
 
 test('refuses to click an iframe, a missing tile or a disabled button', () => {
   assert.deepEqual(portalScan([evoItem()], {inIframe: true}), {reason: 'not_top_frame'});
-  assert.deepEqual(portalScan([evoItem({subprovider: 'SA'})]), {reason: 'evo_item_not_found'});
+  assert.deepEqual(portalScan([evoItem({attrs: {'data-subprovider': 'SA'}})]), {reason: 'evo_item_not_found'});
   assert.deepEqual(portalScan([evoItem({disabled: true})]), {reason: 'evo_button_not_found'});
-  assert.deepEqual(portalScan([evoItem({rect: {x: 200, y: 900, width: 120, height: 40}})]),
-                   {reason: 'evo_button_offscreen'});
+  assert.deepEqual(portalScan([evoItem({rect: {x: 0, y: 0, width: 0, height: 0},
+                                          card: {x: 180, y: 900, width: 240, height: 150}})]),
+                   {reason: 'evo_button_pending'});
+});
+
+test('refuses the tile point when the favourite star or nothing else is under it', () => {
+  const hiddenButton = [evoItem({attrs: {'data-id': 'LIVE-EVO', 'data-gp': 'evo'}, alt: null,
+                                 buttonClass: '', rect: {x: 0, y: 0, width: 0, height: 0}})];
+  for (const hit of ('fav outside none'.split(' '))) {
+    assert.deepEqual(portalScan(hiddenButton, {hit}), {reason: 'evo_card_blocked'});
+  }
+});
+
+test('reports a pending button when the tile is found but nothing is measurable yet', () => {
+  assert.deepEqual(portalScan([evoItem({attrs: {'data-gp': 'evo'}, alt: null,
+                                        buttonClass: '', buttonText: 'Bắt đầu',
+                                        rect: {x: 0, y: 0, width: 0, height: 0},
+                                        card: {x: 180, y: 360, width: 4, height: 150}})]),
+                   {reason: 'evo_button_pending'});
 });
 
 test('prefers the Evolution tile and stops when two tiles look identical', () => {
