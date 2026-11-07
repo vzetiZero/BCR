@@ -3,7 +3,7 @@
 
 Quy tắc của người dùng:
 1. Chọn bàn: đã đi trong khoảng tay người dùng đặt (mặc định 10-50),
-   cầu ngắn (không có bệt từ 6 tay trở lên), chưa từng có cầu 3-3.
+   cầu ngắn (không có bệt từ 4 tay trở lên; tay hoà không ngắt bệt), chưa từng có cầu 3-3.
 2. Cầu đang mạnh bên nào -> đánh mấy tay đầu khối bên đó, rồi đổi sang bên kia mấy tay còn lại.
    Khối 3-3 đi 6 tay, khối 3-2 đi 5 tay.
 3. Thắng thì quay về bậc 1. Thua thì sang bậc kế tiếp trong danh sách mức cược người dùng nhập.
@@ -31,7 +31,7 @@ DEFAULT_LADDER = {
 # Cấu trúc gốc 1-3-7-15-32-64; khối 3-2 chỉ cần 5 bậc đầu.
 MULTIPLIER_LADDER = (1, 3, 7, 15, 32, 64)
 PROFILE_LABEL = {"3-3": "3-3 · 6 tay (3 mạnh + 3 đổi)", "3-2": "3-2 · 5 tay (3 mạnh + 2 đổi)"}
-MAX_STREAK_ALLOWED = 6  # bệt tối đa 6 tay còn nhận; từ 7 tay liền loại bàn
+MAX_STREAK_ALLOWED = 3  # bệt tối đa 3 tay còn nhận; từ 4 tay liền loại bàn
 MIN_HANDS = 10
 MAX_HANDS = 50
 # Người dùng chỉnh khoảng tay đã đi trong Cài đặt; hai mốc dưới là biên hợp lệ.
@@ -92,7 +92,9 @@ def parse_road(text):
 def has_long_streak(results, limit=MAX_STREAK_ALLOWED + 1):
     """Tìm vệt dài vượt mức cho phép: vệt dài hơn ``limit - 1`` bị coi là bệt.
 
-    Mặc định loại bàn khi có 7 tay liền trở lên (tức chỉ nhận tối đa 6 tay).
+    Mặc định loại bàn khi có 4 tay liền trở lên (tức chỉ nhận tối đa 3 tay). Tay hoà
+    không đếm và cũng không ngắt bệt: B-B-T-B-B là một bệt Banker 4 tay, vì
+    ``E.run_lengths`` chỉ chạy trên các tay phân thắng bại.
     """
     for side, length in E.run_lengths(results):
         if length >= limit:

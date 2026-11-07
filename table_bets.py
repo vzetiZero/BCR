@@ -71,7 +71,13 @@ READ_JS = r"""(() => {
     const st = getComputedStyle(el);
     return r.width > 4 && r.height > 4 && st.display !== 'none' && st.visibility !== 'hidden';
   };
-  const hasTable = !!document.querySelector('[data-role="Bead-road"]');
+  const tray = document.querySelector('[data-role="chip-stack"]');
+  // Nhận diện bàn bằng KHU VỰC CƯỢC, không chỉ bằng cầu: khay chip + ô cược đã hiện
+  // nhưng Bead-road chưa render/đang ẩn vẫn là bàn đặt được. Đòi mỗi Bead-road thì app
+  // báo "no_table_view" mãi dù người dùng đã thấy khay chip, nên không bao giờ bấm.
+  // Ô cược + khay chỉ có trong màn hình bàn, ô bàn ở sảnh không có nên không nhận nhầm.
+  const hasTable = !!(document.querySelector('[data-role="Bead-road"]')
+    || (tray && document.querySelector('[data-role="bet-spot-Banker"]')));
   const totalEl = document.querySelector('[data-role="total-bet-label"]');
 
   const spots = {};
@@ -86,7 +92,6 @@ READ_JS = r"""(() => {
   }
 
   // Mệnh giá thực có trên khay chip của bàn này.
-  const tray = document.querySelector('[data-role="chip-stack"]');
   const denominations = tray
     ? [...new Set([...tray.querySelectorAll('[data-role="chip"]')]
         .filter(visible)
@@ -385,9 +390,11 @@ def frame_offset_via_cdp(command, frame_id):
     """Đo khoảng lệch khung bàn khi JS không với tới iframe cha (khác origin).
 
     Đi từ khung đang đọc lên khung gốc: mỗi bước hỏi phần tử iframe sở hữu khung con
-    (``DOM.getFrameOwner``) rồi lấy hộp của nó (``DOM.getBoxModel``). Cộng dồn content +
-    padding/border vì viewport của khung con bắt đầu ở mép trong của iframe. Không đo
-    được bước nào thì trả None — thà báo lỗi còn hơn bấm lệch rồi tưởng đã đặt.
+    (``DOM.getFrameOwner``) rồi lấy hộp của nó (``DOM.getBoxModel``). Viewport khung con
+    bắt đầu ở ô CONTENT của iframe (đã nằm trong border + padding), nên chỉ cộng đúng
+    content — giống đường JS lấy border-box rồi cộng border + padding. Cộng thêm
+    padding − border ở đây là đội thêm đúng bề dày viền, bấm lệch khi iframe có viền.
+    Không đo được bước nào thì trả None — thà báo lỗi còn hơn bấm lệch rồi tưởng đã đặt.
     """
     try:
         command("DOM.getDocument", {"depth": 0})
@@ -417,15 +424,10 @@ def frame_offset_via_cdp(command, frame_id):
         except Exception:
             return None
         content = model.get("content") or []
-        border = model.get("border") or []
-        padding = model.get("padding") or []
         if len(content) < 2 or not owner:
             return None
         x += float(content[0])
         y += float(content[1])
-        if len(padding) >= 2 and len(border) >= 2:
-            x += float(padding[0]) - float(border[0])
-            y += float(padding[1]) - float(border[1])
         node = parents[node]
         depth += 1
         if depth > 8:
@@ -486,7 +488,7 @@ SELECTED_CHIP_JS = r"""(() => {
 
 
 def place_bet(session, side, chips, unit=DEFAULT_CHIP_UNIT, human_mouse=True,
-              click_delay=0.28):
+              click_delay=0.28, amount=None):
     """Dùng chuột đặt các chip (kết quả của ``decompose``) vào ô cược ``side``.
 
     Evolution Baccarat: bấm một chip mệnh giá trên khay để chọn mệnh giá đó, rồi mỗi
@@ -495,6 +497,9 @@ def place_bet(session, side, chips, unit=DEFAULT_CHIP_UNIT, human_mouse=True,
 
     side: 'B' (Banker), 'P' (Player) hoặc 'T' (Tie).
     chips: danh sách mệnh giá hiển thị (đơn vị) cần bấm, từ ``decompose``.
+    amount: số tiền cần đặt. Có ``amount`` thì mệnh giá được CHỐT LẠI theo khay đọc tươi
+    ngay trong vòng chờ, ``chips`` chỉ còn là gợi ý: khay thường render sau lúc app chốt
+    kế hoạch, quyết định theo bản đọc cũ thì lượt bấm bị bỏ trước khi bàn kịp mở khay.
 
     Trả (ok, note, placed) trong đó placed là dict mệnh giá -> số chip đã bấm được.
     Không ném lỗi ra UI; mọi lỗi gói vào note.
@@ -504,7 +509,7 @@ def place_bet(session, side, chips, unit=DEFAULT_CHIP_UNIT, human_mouse=True,
     if role is None:
         return False, "Cửa không hợp lệ: %r." % (side,), placed
     chips = [int(c) for c in (chips or []) if int(c) > 0]
-    if not chips:
+    if not chips and not amount:
         return False, "Không có chip nào để bấm.", placed
     ws = None
     try:
@@ -578,11 +583,23 @@ def place_bet(session, side, chips, unit=DEFAULT_CHIP_UNIT, human_mouse=True,
                         tray_keys.add(int(key))
                     except (TypeError, ValueError):
                         continue
-                if targets_partial is None:
-                    targets_partial, context_partial = value, context_id
+                # Giữ bản đọc GẦN NHẤT có ô cược: khay re-render liên tục trong lúc chờ,
+                # bản đầu tiên có thể chỉ mới lộ một phần mệnh giá.
+                targets_partial, context_partial = value, context_id
+                # Có amount: chốt mệnh giá theo đúng khay THẬT vừa đọc, đủ và đúng số
+                # tiền thì dừng chờ ngay. Đây là chỗ sửa lỗi "khay đã mở mà vẫn không
+                # chọn được chip": bản gợi ý của app chụp lúc khay chưa render xong.
+                if amount:
+                    # Khay TRỐNG thì chưa kết luận gì: decompose nhận list rỗng sẽ tự rơi
+                    # về mệnh giá mặc định và báo "ghép được" trên một khay không có chip.
+                    live_split = decompose(amount, unit, sorted(tray_keys)) if tray_keys else None
+                    if live_split and live_split["exact"] and live_split["chips"]:
+                        chips = live_split["chips"]
+                        targets, matched_context = value, context_id
+                        break
                 # Đủ cả ô cược lẫn mọi mệnh giá cần dùng: dừng chờ ngay, không cần
                 # đợi hết TARGETS_WAIT_TIMEOUT.
-                if needed_denoms <= tray_keys:
+                elif needed_denoms <= tray_keys:
                     targets, matched_context = value, context_id
                     break
             if targets is not None:
@@ -600,6 +617,19 @@ def place_bet(session, side, chips, unit=DEFAULT_CHIP_UNIT, human_mouse=True,
                         time.sleep(0.2)
             time.sleep(TARGETS_WAIT_POLL)
         if targets is None:
+            if amount:
+                # Hết cửa sổ chờ mà khay thật vẫn không ghép đủ số tiền: KHÔNG bấm tạm
+                # phần thiếu (đặt thiếu tiền vẫn là đặt sai). Báo đúng mệnh giá khay đang
+                # có để phân biệt "bàn chỉ có chip từ 100" với "khay chưa render xong".
+                seen = sorted({int(k) for k in ((targets_partial or {}).get("chips") or {})
+                               if str(k).isdigit()})
+                if not seen:
+                    return False, ("Không tìm thấy ô cược %s hoặc khay chip sau %ds chờ."
+                                   % (role, int(TARGETS_WAIT_TIMEOUT))), placed
+                return False, ("Khay chip của bàn chỉ có mệnh giá %s — không ghép được %g "
+                               "đơn vị cược nên chưa bấm chip. Kiểm tra mức cược tối thiểu "
+                               "của bàn này."
+                               % (", ".join(str(d) for d in seen), amount)), placed
             # Dealer vẫn đang mở bài/gom chip: khay chưa render đủ mọi mệnh giá
             # cần dùng dù ô cược đã có. Dùng tạm bản đọc gần nhất (có thể thiếu
             # vài mệnh giá) để vẫn bấm được những gì khay đang có, thay vì bỏ

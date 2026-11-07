@@ -470,3 +470,91 @@ test('keeps the largest visible chip element per denomination', () => {
   assert.deepEqual(out.chips['20'], {x: 124, y: 24, area: 48 * 48});
   assert.equal(out.chips['500'], undefined, 'chip 2×2 là chip ẩn, không phải nút để bấm');
 });
+
+// READ_JS trong table_bets.py: nhận diện màn hình bàn và đọc mệnh giá thật của khay.
+const readSource = /READ_JS = r"""([\s\S]*?)"""/.exec(
+  fs.readFileSync(__dirname + '/table_bets.py', 'utf8'))[1];
+
+function readChip(value, {selected = false} = {}) {
+  return {
+    getAttribute: (k) => (k === 'data-value' ? String(value)
+      : k === 'data-selected' ? (selected ? 'true' : null) : null),
+    getBoundingClientRect: () => ({x: 0, y: 0, width: 40, height: 40}),
+    innerText: String(value),
+    textContent: String(value),
+  };
+}
+
+function readTable({bead = false, tray = false, trayChips = [], spots = {},
+                    marked = [], label = null, total = null} = {}) {
+  const markedSelector = '[data-role="chip"][data-selected="true"]';
+  const trayEl = tray ? {querySelectorAll: (selector) => {
+    if (selector === '[data-role="chip"]') return trayChips.map((v) => readChip(v));
+    assert.equal(selector, markedSelector);
+    return marked.map((v) => readChip(v, {selected: true}));
+  }} : null;
+  const spotEls = {};
+  for (const [role, values] of Object.entries(spots)) {
+    spotEls['[data-role="bet-spot-' + role + '"]'] = {querySelectorAll: (selector) => {
+      assert.equal(selector, '[data-role="chip"]');
+      return values.map((v) => readChip(v));
+    }};
+  }
+  const document = {
+    querySelectorAll: (selector) => {
+      assert.equal(selector, markedSelector);
+      return marked.map((v) => readChip(v, {selected: true}));
+    },
+    querySelector: (selector) => {
+      if (selector === '[data-role="Bead-road"]') return bead ? {} : null;
+      if (selector === '[data-role="chip-stack"]') return trayEl;
+      if (selector === '[data-role="total-bet-label"]') {
+        return total === null ? null : {innerText: String(total), textContent: String(total)};
+      }
+      if (selector === '[data-role="selected-chip"]') {
+        return label === null ? null : {querySelector: () => readChip(label),
+                                        innerText: String(label), textContent: String(label)};
+      }
+      return spotEls[selector] || null;
+    },
+  };
+  const ctx = {document, getComputedStyle: () => ({display: 'block', visibility: 'visible'})};
+  vm.createContext(ctx);
+  return JSON.parse(JSON.stringify(vm.runInContext(readSource, ctx)));
+}
+
+test('a rendered betting area counts as a table even before the bead road appears', () => {
+  // Khay chip + ô cược đã mở mà Bead-road chưa render: đòi mỗi Bead-road thì app báo
+  // "no_table_view" mãi và không bao giờ đặt chip dù người dùng đã thấy khay.
+  const out = readTable({tray: true, trayChips: [20, 100], spots: {Banker: [], Player: []}});
+  assert.equal(out.has_table, true);
+  assert.deepEqual(out.denominations, [20, 100]);
+});
+
+test('the bead road alone still identifies the table', () => {
+  assert.equal(readTable({bead: true}).has_table, true);
+});
+
+test('a tray without bet spots is not a table view', () => {
+  assert.equal(readTable({tray: true, trayChips: [20]}).has_table, false);
+});
+
+test('bet spots without a tray are not a table view yet', () => {
+  assert.equal(readTable({spots: {Banker: []}}).has_table, false);
+});
+
+test('an empty document is not a table view', () => {
+  assert.equal(readTable({}).has_table, false);
+});
+
+test('reads the denominations actually shown on the tray, deduplicated', () => {
+  const out = readTable({bead: true, tray: true, trayChips: [100, 20, 100, 500]});
+  assert.deepEqual(out.denominations, [20, 100, 500]);
+});
+
+test('counts only the chips lying on a bet spot', () => {
+  const out = readTable({bead: true, tray: true, trayChips: [20], spots: {Banker: [100, 20]}});
+  assert.equal(out.spots.B.amount, 120);
+  assert.deepEqual(out.spots.B.chips, [100, 20]);
+  assert.equal(out.total_units, 120);
+});

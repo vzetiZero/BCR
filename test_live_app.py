@@ -355,7 +355,7 @@ class LiveSimulationTests(unittest.TestCase):
         self.assertEqual(sim.pending["baseline"], changed["letters"])
 
     def test_start_rejects_ineligible_history_even_when_verified(self):
-        # Loại bàn khi: dưới 10 tay, trên 50 tay, hoặc đã có bệt 7 tay trở lên.
+        # Loại bàn khi: dưới 10 tay, trên 50 tay, hoặc đã có bệt 4 tay trở lên.
         for letters in (BASELINE[:9], BASELINE * 4, "BBBBBBBPPBPPBPB"):
             with self.subTest(letters=letters):
                 self.assertFalse(ME.check_table(list(letters))["eligible"])
@@ -1576,6 +1576,60 @@ class TableCycleTests(unittest.TestCase):
         self.assertFalse(host.cycle_waiting)
 
 
+class TableStreakFilterTests(unittest.TestCase):
+    """Bộ lọc cầu ngắn: bệt từ 4 tay trở lên bị loại, tay hoà không đếm và không ngắt bệt."""
+
+    def streak_check(self, results):
+        checks = ME.check_table(list(results))["checks"]
+        return next(c for c in checks if c["name"].startswith("Cầu ngắn"))
+
+    def test_default_limit_is_four_hands(self):
+        self.assertEqual(ME.MAX_STREAK_ALLOWED, 3)
+        self.assertEqual(ME.has_long_streak(list("BBB")), (None, 0))
+        self.assertEqual(ME.has_long_streak(list("BBBB")), ("B", 4))
+        self.assertEqual(ME.has_long_streak(list("PPPP")), ("P", 4))
+
+    def test_three_hand_run_is_still_accepted(self):
+        for letters in ("BBBPBPBPBPB", "PPPBPBPBPPP"):
+            with self.subTest(letters=letters):
+                info = ME.check_table(list(letters))
+                self.assertTrue(info["eligible"], info["checks"])
+                self.assertTrue(self.streak_check(letters)["ok"])
+
+    def test_four_hand_run_is_rejected_for_both_sides(self):
+        for letters, side in (("BBBBPBPPBPB", "Banker"), ("PPPPBPBPBPB", "Player")):
+            with self.subTest(letters=letters):
+                info = ME.check_table(list(letters))
+                self.assertFalse(info["eligible"])
+                check = self.streak_check(letters)
+                self.assertFalse(check["ok"])
+                self.assertEqual(check["detail"], "có bệt %s 4 tay" % side)
+
+    def test_tie_bridges_the_same_colour_into_one_streak(self):
+        letters = "BBTBBPBPPBPB"          # B-B-(hoà)-B-B = bệt Banker 4 tay
+        info = ME.check_table(list(letters))
+        self.assertFalse(info["eligible"])
+        self.assertEqual(self.streak_check(letters)["detail"], "có bệt Banker 4 tay")
+        self.assertEqual(ME.has_long_streak(list("BBTBB")), ("B", 4))
+
+    def test_tie_is_not_counted_as_a_hand_of_the_streak(self):
+        letters = "BBTBPBPBPBPB"          # chỉ 3 tay Banker phân thắng bại -> còn nhận
+        info = ME.check_table(list(letters))
+        self.assertTrue(info["eligible"], info["checks"])
+        self.assertEqual(ME.has_long_streak(list(letters)), (None, 0))
+
+    def test_check_label_states_the_three_hand_cap(self):
+        check = self.streak_check(BASELINE)
+        self.assertEqual(check["name"], "Cầu ngắn, bệt tối đa 3 tay")
+        self.assertEqual(check["detail"], "chưa có vệt nào quá 3 tay")
+
+    def test_streak_appearing_midblock_only_warns_not_blocks(self):
+        plan = ME.plan(list("BBBPBPBPBPBBBB"), ME.DEFAULT_LADDER["3-3"],
+                       hands_in_block=1, started=True, strong="B")
+        self.assertEqual(plan["action"], "bet")
+        self.assertIn("bệt 4 tay", plan["reason"])
+
+
 class MethodBlockRegressionTests(unittest.TestCase):
     LADDER = ME.DEFAULT_LADDER["3-3"]
 
@@ -2605,6 +2659,223 @@ class ChipMatchingTests(unittest.TestCase):
         self.assertEqual(split["chips"], [20])
 
 
+class FrameOffsetAndSpotConfirmTests(unittest.TestCase):
+    """Đo lệch khung và đối chiếu chip đã lên ô cược — hàm thuần, không cần bàn thật."""
+
+    def quad(self, x, y):
+        return [x, y, x + 100, y, x + 100, y + 40, x, y + 40]
+
+    def command(self, boxes, fail=None):
+        tree = {"frame": {"id": "top"}, "childFrames": [
+            {"frame": {"id": "mid"}, "childFrames": [{"frame": {"id": "table"}}]}]}
+        owners = {"table": 11, "mid": 22}
+
+        def command(method, params=None):
+            if method == fail:
+                raise RuntimeError("cdp_command_failed")
+            if method == "DOM.getDocument":
+                return {}
+            if method == "Page.getFrameTree":
+                return {"frameTree": tree}
+            if method == "DOM.getFrameOwner":
+                return {"backendNodeId": owners[params["frameId"]]}
+            if method == "DOM.getBoxModel":
+                return {"model": boxes[params["backendNodeId"]]}
+            raise AssertionError("CDP giả không biết lệnh " + method)
+        return command
+
+    def test_page_point_adds_the_frame_offset(self):
+        self.assertEqual(TB.page_point({"x": 400, "y": 300}, {"x": 8, "y": 64}),
+                         {"x": 408.0, "y": 364.0})
+        self.assertEqual(TB.page_point({"x": 400, "y": 300}, None), {"x": 400.0, "y": 300.0})
+        self.assertIsNone(TB.page_point(None, {"x": 0, "y": 0}))
+        self.assertIsNone(TB.page_point({"x": 1}, {"x": 0, "y": 0}))
+
+    def test_a_top_level_frame_needs_no_offset(self):
+        for frame in ("top", None, "không có trong cây"):
+            with self.subTest(frame=frame):
+                self.assertEqual(TB.frame_offset_via_cdp(self.command({}), frame),
+                                 {"x": 0.0, "y": 0.0, "depth": 0})
+
+    def test_nested_frames_sum_the_content_box_of_each_iframe(self):
+        boxes = {
+            11: {"content": self.quad(13, 23), "padding": self.quad(10, 20), "border": self.quad(8, 18)},
+            22: {"content": self.quad(0, 64), "padding": self.quad(0, 64), "border": self.quad(0, 64)},
+        }
+        # (13,23) là ô content của iframe trong khung mid, đã nằm trong viền 2 + padding 3.
+        # Cộng thêm padding − border sẽ đội thành (15,25): bấm lệch đúng bề dày viền.
+        self.assertEqual(TB.frame_offset_via_cdp(self.command(boxes), "table"),
+                         {"x": 13.0, "y": 87.0, "depth": 2})
+
+    def test_an_unmeasurable_frame_returns_none_instead_of_guessing(self):
+        for boxes, fail in (({11: {"content": self.quad(13, 23)}}, "DOM.getBoxModel"),
+                            ({}, "Page.getFrameTree"),
+                            ({11: {}}, None)):
+            with self.subTest(fail=fail, boxes=boxes):
+                self.assertIsNone(TB.frame_offset_via_cdp(self.command(boxes, fail=fail), "table"))
+
+    def test_spot_amount_confirms_as_soon_as_the_chips_land(self):
+        reads, clock = iter([0, 0, 20]), iter([0, 0.1, 0.2, 0.3])
+        ok, value = TB.confirm_spot_amount(0, 20, lambda: next(reads), wait=2, poll=0,
+                                           clock=lambda: next(clock), nap=lambda _: None)
+        self.assertTrue(ok)
+        self.assertEqual(value, 20)
+
+    def test_spot_amount_reports_what_really_landed_when_the_window_expires(self):
+        clock = iter([0, 0.1, 5.0])
+        ok, value = TB.confirm_spot_amount(100, 20, lambda: 100, wait=2, poll=0,
+                                           clock=lambda: next(clock), nap=lambda _: None)
+        self.assertFalse(ok)
+        self.assertEqual(value, 100)
+
+    def test_an_unreadable_spot_is_not_a_confirmation(self):
+        clock = iter([0, 3.0])
+        ok, value = TB.confirm_spot_amount(0, 20, lambda: None, wait=2, poll=0,
+                                           clock=lambda: next(clock), nap=lambda _: None)
+        self.assertFalse(ok)
+        self.assertEqual(value, 0)
+
+
+class FakeTableCdp:
+    """CDP giả của màn hình bàn: khay render dần theo kịch bản, mọi cú bấm được ghi lại.
+
+    Chỉ mô phỏng đọc DOM và ghi nhận sự kiện chuột, không chạm tới bàn cược thật. Bấm
+    trúng khay thì đổi mệnh giá đang chọn, bấm trúng ô cược thì cộng chip đang chọn vào
+    ô — nên nếu toạ độ lệch khung (thiếu frame_offset) thì không chip nào lên bàn và
+    place_bet phải báo thất bại, giống hệt lỗi trên bàn thật.
+    """
+
+    def __init__(self, tray_snapshots, offset=None):
+        self.tray_snapshots = tray_snapshots
+        self.offset = {"x": 0, "y": 64, "depth": 1} if offset is None else offset
+        self.spot = {"x": 400, "y": 300}
+        self.tray_reads = 0
+        self.clicks = []
+        self.selected = None
+        self.on_spot = 0.0
+        self.outbox = []
+
+    def settimeout(self, value):
+        pass
+
+    def close(self):
+        pass
+
+    def send(self, payload):
+        request = json.loads(payload)
+        method, params = request.get("method"), request.get("params") or {}
+        if method == "Runtime.enable":
+            self.outbox.append({"method": "Runtime.executionContextCreated", "params": {"context": {
+                "id": 7, "auxData": {"isDefault": True, "frameId": "frame-table"}}}})
+            result = {}
+        elif method == "Runtime.evaluate":
+            result = {"result": {"value": self._evaluate(params.get("expression") or "")}}
+        elif method == "Input.dispatchMouseEvent":
+            self._mouse(params)
+            result = {}
+        else:
+            result = {}
+        self.outbox.append({"id": request.get("id"), "result": result})
+
+    def recv(self):
+        if not self.outbox:
+            raise AssertionError("CDP giả hết dữ liệu: place_bet hỏi nhiều hơn kịch bản")
+        return json.dumps(self.outbox.pop(0))
+
+    def _tray(self):
+        return self.tray_snapshots[min(self.tray_reads, len(self.tray_snapshots) - 1)]
+
+    def _evaluate(self, expression):
+        if "frameOffset" in expression:
+            tray = {str(k): dict(v) for k, v in self._tray().items()}
+            self.tray_reads += 1
+            return {"spot": dict(self.spot), "chips": tray,
+                    "frame_offset": dict(self.offset) if self.offset is not None else None,
+                    "is_top": False}
+        if "amount += v" in expression:
+            return {"amount": self.on_spot, "chips": []}
+        return self.selected
+
+    def _mouse(self, params):
+        self.clicks.append(dict(params))
+        if params.get("type") != "mouseReleased":
+            return
+        offset = self.offset or {}
+        local = (params.get("x") - (offset.get("x") or 0),
+                 params.get("y") - (offset.get("y") or 0))
+        for denom, chip in self._tray().items():
+            if (chip["x"], chip["y"]) == local:
+                self.selected = int(denom)
+                return
+        if (self.spot["x"], self.spot["y"]) == local:
+            self.on_spot += float(self.selected or 0)
+
+
+class PlaceBetLiveTrayTests(unittest.TestCase):
+    """Mệnh giá phải chốt theo khay THẬT lúc bấm, không theo bản đọc lúc chốt kế hoạch."""
+
+    def setUp(self):
+        for target, name, value in ((TB.time, "sleep", lambda *_: None),
+                                    (TB, "TARGETS_WAIT_POLL", 0.0)):
+            patcher = patch.object(target, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def place(self, fake, chips, amount=None):
+        session = SimpleNamespace(_cdp_page=Mock(return_value={
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/1"}))
+        with patch("websocket.create_connection", return_value=fake):
+            return TB.place_bet(session, "B", chips, unit=1, human_mouse=False,
+                                click_delay=0, amount=amount)
+
+    def tray(self, *denoms):
+        return {d: {"x": 420 + 40 * i, "y": 700, "area": 400} for i, d in enumerate(denoms)}
+
+    def test_a_tray_that_renders_after_the_plan_is_still_used(self):
+        fake = FakeTableCdp([{}, self.tray(100), self.tray(20, 100)])
+        ok, note, placed = self.place(fake, [], amount=20)
+        self.assertTrue(ok, note)
+        self.assertEqual(placed, {20: 1})
+        self.assertEqual(fake.on_spot, 20)
+        self.assertGreaterEqual(fake.tray_reads, 3)
+        released = [(c["x"], c["y"]) for c in fake.clicks if c["type"] == "mouseReleased"]
+        # Khay 20 ở (420,700) trong khung bàn, ô cược ở (400,300): cả hai phải cộng lệch 64.
+        self.assertEqual(released, [(420, 764), (400, 364)])
+
+    def test_a_tray_that_cannot_form_the_stake_reports_its_real_denominations(self):
+        fake = FakeTableCdp([self.tray(100, 500)])
+        with patch.object(TB, "TARGETS_WAIT_TIMEOUT", 0.05):
+            ok, note, placed = self.place(fake, [], amount=20)
+        self.assertFalse(ok)
+        self.assertIn("100, 500", note)
+        self.assertIn("không ghép được 20", note)
+        self.assertEqual(placed, {})
+        self.assertEqual(fake.clicks, [])
+
+    def test_the_live_tray_overrides_a_stale_chip_suggestion(self):
+        fake = FakeTableCdp([self.tray(100)])
+        ok, note, placed = self.place(fake, [20], amount=100)
+        self.assertTrue(ok, note)
+        self.assertEqual(placed, {100: 1})
+        self.assertEqual(fake.selected, 100)
+
+    def test_without_an_amount_the_given_chips_are_used_as_before(self):
+        fake = FakeTableCdp([self.tray(20)])
+        ok, note, placed = self.place(fake, [20, 20])
+        self.assertTrue(ok, note)
+        self.assertEqual(placed, {20: 2})
+        self.assertEqual(fake.on_spot, 40)
+
+    def test_a_missing_frame_offset_still_refuses_to_click(self):
+        fake = FakeTableCdp([self.tray(20)])
+        fake.offset = None
+        with patch.object(TB, "frame_offset_via_cdp", return_value=None):
+            ok, note, placed = self.place(fake, [20], amount=20)
+        self.assertFalse(ok)
+        self.assertIn("không đo được", note.lower())
+        self.assertEqual(fake.clicks, [])
+
+
 class BetGateTests(unittest.TestCase):
     """Gate "chờ ván mới": chỉ tự đặt chip khi cả 3 cửa đang trống (ván trước đã gom chip)."""
 
@@ -2880,13 +3151,71 @@ class AutoPlaceReportingTests(unittest.TestCase):
         self.assertIn("chưa xong", plan["place_note"])
         self.assertTrue(host.place_busy)
 
-    def test_stake_that_no_chip_can_form_reports_instead_of_staying_silent(self):
+    def test_stake_below_one_chip_unit_reports_a_setup_error(self):
         host = self.host(self.simulation(), _chip_unit=Mock(return_value=UNIT * 1000))
         plan = host.sim.pending
         threads = self.run_placement(host, threads=False)
         threads.assert_not_called()
         self.assertEqual(plan["placed"], "failed")
+        self.assertIn("nhỏ hơn 1 đơn vị chip", plan["place_note"])
+
+    def test_a_stale_tray_does_not_cancel_the_hand_before_the_table_opens(self):
+        """Khay chưa render xong lúc chốt kế hoạch: vẫn phải xuống tận bàn đọc lại.
+
+        Đây là lỗi "bàn đã mở cửa sổ chọn chip lên nhưng lại không chọn được": app kết
+        luận "không ghép được" từ bản đọc chip lưu tạm rồi bỏ tay, trước cả khi place_bet
+        kịp chờ khay hiện ra.
+        """
+        host = self.host(self.simulation(), chip_live={"denominations": [100, 500]})
+        plan = host.sim.pending
+        place_bet = Mock(return_value=(True, "Đã đặt 1 đơn vị chip", {1: 1}))
+        self.run_placement(host, place_bet=place_bet)
+        self.assertEqual(plan["placed"], "ok")
+        args, kwargs = place_bet.call_args
+        self.assertEqual(args[2], [])
+        self.assertEqual(kwargs["amount"], plan["stake"])
+
+    def test_the_live_tray_failure_is_reported_as_not_placed(self):
+        host = self.host(self.simulation(), chip_live={"denominations": [100, 500]})
+        plan = host.sim.pending
+        note = "Khay chip của bàn chỉ có mệnh giá 100, 500 — không ghép được 100,000."
+        self.run_placement(host, place_bet=Mock(return_value=(False, note, {})))
+        self.assertEqual(plan["placed"], "failed")
         self.assertIn("không ghép được", plan["place_note"])
+
+    def extension_host(self, sim, live, result=None):
+        return self.host(
+            sim,
+            collector_httpd=Mock(), collector_store=Mock(extension_alive=Mock(return_value=True)),
+            _read_chip_state=Mock(return_value=live),
+            _ext_command=Mock(return_value=result if result is not None else {"ok": True, "total": 1}),
+        )
+
+    def test_extension_path_uses_the_tray_read_at_click_time(self):
+        host = self.extension_host(self.simulation(), {"ok": True, "denominations": [1, 2, 5]})
+        plan = host.sim.pending
+        self.run_placement(host)
+        self.assertEqual(plan["placed"], "ok")
+        host._ext_command.assert_called_once()
+        name, args = host._ext_command.call_args[0]
+        self.assertEqual(name, "place_chips")
+        self.assertEqual(args["chips"], [1])
+
+    def test_extension_path_reports_an_unreadable_tray(self):
+        host = self.extension_host(self.simulation(), {"ok": False, "error": "no_chips"})
+        plan = host.sim.pending
+        self.run_placement(host)
+        self.assertEqual(plan["placed"], "failed")
+        self.assertIn("Chưa đọc được khay chip", plan["place_note"])
+        host._ext_command.assert_not_called()
+
+    def test_extension_path_reports_a_tray_that_cannot_form_the_stake(self):
+        host = self.extension_host(self.simulation(), {"ok": True, "denominations": [100, 500]})
+        plan = host.sim.pending
+        self.run_placement(host)
+        self.assertEqual(plan["placed"], "failed")
+        self.assertIn("không ghép được", plan["place_note"])
+        host._ext_command.assert_not_called()
 
     def test_closing_the_app_reports_the_cancellation(self):
         host = self.host(self.simulation(), exit_requested=True)

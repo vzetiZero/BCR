@@ -1704,7 +1704,7 @@ class BCRApp:
         self.chip_detail.config(text="\n".join(lines))
 
     def place_armed_bet(self, plan):
-        """Dùng DP (decompose) ra số chip tối thiểu rồi bấm đặt vào ô cược bằng chuột.
+        """Đặt số tiền của kế hoạch vào ô cược bằng chuột; mệnh giá chip do nơi bấm chốt.
 
         Gọi từ hook ``self.sim.on_arm`` mỗi khi kế hoạch được chốt. Chỉ chạy khi bật
         “Tự đặt chip” và kế hoạch có cửa + số tiền; chạy ở thread nền, không chặn UI.
@@ -1726,16 +1726,21 @@ class BCRApp:
             self._finish_place(plan, False, "Lượt bấm chip trước chưa xong nên tay này chưa được bấm.")
             return
         unit = self._chip_unit()
-        denominations = (self.chip_live or {}).get("denominations") or None
-        split = TB.decompose(stake, unit, denominations)
-        if not split.get("chips"):
-            self._finish_place(plan, False, "Không tự đặt: %s VN2 không ghép được bằng chip có sẵn."
-                                        % M.fmt_money(stake))
+        if int(round(stake / unit)) <= 0:
+            # Lỗi cấu hình, không phải lỗi tải trang: không khay chip nào cứu được mức
+            # cược nhỏ hơn 1 đơn vị chip, nên báo ngay thay vì chờ rồi bỏ tay.
+            self._finish_place(plan, False,
+                               "Không tự đặt: %s VN2 nhỏ hơn 1 đơn vị chip (%s VN2) — "
+                               "kiểm tra ô Đơn vị chip và bậc cược."
+                               % (M.fmt_money(stake), M.fmt_money(unit)))
             return
+        # KHÔNG chốt mệnh giá ở đây. chip_live là bản đọc từ trước/trong lúc bàn render
+        # khay, quyết định theo nó là bỏ tay oan — đúng lỗi "bàn đã mở cửa sổ chọn chip
+        # lên nhưng lại không chọn được". place_bet đọc lại khay thật ngay chỗ bấm (chờ
+        # tới 20s) và chốt mệnh giá theo đúng những gì khay đang có.
         self.place_busy = True
         self.place_status.config(text="Đang tự đặt %s VN2 vào %s…" % (
             M.fmt_money(stake), E.SIDE_NAME[side]), fg=ACCENT)
-        chips = split["chips"]
 
         def work():
             try:
@@ -1744,8 +1749,21 @@ class BCRApp:
                     self.events.put(("placed", (False, gate_note, plan)))
                     return
                 if ext_ready(self):
-                    res = self._ext_command("place_chips", {"side": side, "chips": chips},
-                                            timeout=max(15.0, len(chips) * 2.0 + 10))
+                    live = self._read_chip_state(unit)
+                    if not live.get("ok") or not live.get("denominations"):
+                        self.events.put(("placed", (False, "Chưa đọc được khay chip của bàn (%s) "
+                                                           "nên chưa bấm."
+                                                    % (live.get("error") or "khay trống"), plan)))
+                        return
+                    ext_split = TB.decompose(stake, unit, live["denominations"])
+                    if not ext_split.get("chips"):
+                        self.events.put(("placed", (False, "Khay chip của bàn chỉ có mệnh giá %s — "
+                                                           "không ghép được %s VN2 nên chưa bấm."
+                                                    % (", ".join(str(d) for d in live["denominations"]),
+                                                       M.fmt_money(stake)), plan)))
+                        return
+                    res = self._ext_command("place_chips", {"side": side, "chips": ext_split["chips"]},
+                                            timeout=max(15.0, len(ext_split["chips"]) * 2.0 + 10))
                     if res.get("ok"):
                         total = res.get("total")
                         note = "Đã đặt %s đơn vị chip vào %s qua extension." % (
@@ -1755,8 +1773,9 @@ class BCRApp:
                         self.events.put(("placed", (False, "Extension không đặt được chip (%s)."
                                                     % res.get("reason", "?")), plan))
                     return
-                ok, note, _placed = TB.place_bet(self.browser, side, chips, unit=unit,
-                                                 human_mouse=self.human_mouse_var.get())
+                ok, note, _placed = TB.place_bet(self.browser, side, [], unit=unit,
+                                                 human_mouse=self.human_mouse_var.get(),
+                                                 amount=stake)
                 self.events.put(("placed", (ok, note, plan)))
             except Exception as exc:
                 # Thread chết giữa chừng mà không báo thì kế hoạch kẹt ở "pending" và
@@ -1795,13 +1814,20 @@ class BCRApp:
         ``place_armed_bet``, không chặn UI.
         """
         deadline = time.monotonic() + timeout
+        last_error = ""
         while time.monotonic() < deadline:
             if self.exit_requested:
                 return False, "Đang đóng app, huỷ tự đặt chip."
             live = self._read_chip_state(unit)
             if table_is_clear(live):
                 return True, ""
+            # Phân biệt "bàn còn chip ván trước" với "không đọc được bàn": báo nhầm hai
+            # cái này khiến người dùng tưởng bàn đang bận trong khi app chưa thấy khay.
+            last_error = "" if (live or {}).get("ok") else ((live or {}).get("error") or "no_read")
             time.sleep(poll)
+        if last_error:
+            return False, ("Không tự đặt: sau %ds vẫn không đọc được bàn (%s) nên chưa bấm chip."
+                           % (int(timeout), last_error))
         return False, ("Không tự đặt: sau %ds bàn vẫn còn chip ván trước, chưa chắc "
                        "đang ở lượt đặt cược mới." % int(timeout))
 
