@@ -1367,6 +1367,35 @@ class LobbyListReturnTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("chưa thấy lại danh sách bàn", note)
 
+    def test_a_context_killed_by_the_navigation_is_not_a_failed_return(self):
+        # history.back() có thể phá chính context chạy lệnh: CDP trả lỗi ngay dù tab
+        # vẫn về sảnh. Coi lỗi đó là thất bại thì app đứng mãi ở màn hình bàn.
+        self.scripted = [[{"method": "Runtime.executionContextCreated",
+                           "params": {"context": {"id": 9, "auxData": {"isDefault": True}}}},
+                          {"id": 1, "result": {}},
+                          {"id": 2, "error": {"code": -32000, "message": "Cannot find context"}},
+                          {"id": 3, "result": {"result": {"value": self.TILES}}}]]
+        self.session._cdp_page.side_effect = [self.TABLE, self.LIST]
+        ok, note = self.stream.back_to_lobby()
+        self.assertTrue(ok, note)
+        self.assertIn("danh sách bàn Baccarat", note)
+
+    def test_contexts_cleared_by_the_return_are_probed_again(self):
+        self.scripted = [[{"method": "Runtime.executionContextCreated",
+                           "params": {"context": {"id": 9, "auxData": {"isDefault": True}}}},
+                          {"id": 1, "result": {}},
+                          {"id": 2, "error": {"code": -32000, "message": "Cannot find context"}},
+                          {"method": "Runtime.executionContextsCleared"},
+                          {"id": 3, "result": {}},
+                          {"method": "Runtime.executionContextCreated",
+                           "params": {"context": {"id": 10, "auxData": {"isDefault": True}}}},
+                          {"id": 4, "result": {}},
+                          {"id": 5, "result": {"result": {"value": self.TILES}}}]]
+        self.session._cdp_page.side_effect = [self.TABLE, self.LIST, self.LIST]
+        ok, note = self.stream.back_to_lobby()
+        self.assertTrue(ok, note)
+        self.assertEqual(self.stream.contexts, [10])
+
     def test_reports_ev7_if_the_returned_page_lost_the_session(self):
         self.scripted = [[{"method": "Runtime.executionContextCreated",
                            "params": {"context": {"id": 9, "auxData": {"isDefault": True}}}},
@@ -2821,12 +2850,12 @@ class PlaceBetLiveTrayTests(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def place(self, fake, chips, amount=None):
+    def place(self, fake, chips, amount=None, human=False):
         session = SimpleNamespace(_cdp_page=Mock(return_value={
             "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/1"}))
         with patch("websocket.create_connection", return_value=fake):
-            return TB.place_bet(session, "B", chips, unit=1, human_mouse=False,
-                                click_delay=0, amount=amount)
+            return TB.place_bet(session, "B", chips, unit=1, human_mouse=human,
+                                click_delay=0 if not human else 0.10, amount=amount)
 
     def tray(self, *denoms):
         return {d: {"x": 420 + 40 * i, "y": 700, "area": 400} for i, d in enumerate(denoms)}
@@ -2851,6 +2880,26 @@ class PlaceBetLiveTrayTests(unittest.TestCase):
         self.assertEqual(fake.on_spot, 20)
         released = [(c["x"], c["y"]) for c in fake.clicks if c["type"] == "mouseReleased"]
         self.assertEqual(released, [(420, 764), (400, 364)])
+
+    def test_placement_keeps_the_fast_pacing_so_the_bet_window_is_not_missed(self):
+        """Cửa sổ đặt cược chỉ vài giây: nhịp lướt chuột và nghỉ giữa các bấm phải nhanh."""
+        fake = FakeTableCdp([self.tray(20, 40, 50)])
+        seen = {}
+        naps = []
+        real_mouse = TB.HM.HumanMouse
+
+        def spy(command, **kwargs):
+            seen.update(kwargs)
+            return real_mouse(command, **kwargs)
+
+        with patch.object(TB.HM, "HumanMouse", side_effect=spy), \
+             patch.object(TB.HM.time, "sleep", lambda *_: None), \
+             patch.object(TB.time, "sleep", side_effect=lambda s: naps.append(s)):
+            ok, note, placed = self.place(fake, [], amount=20, human=True)
+        self.assertTrue(ok, note)
+        self.assertEqual(placed, {20: 1})
+        self.assertEqual(seen["glide_seconds"], 0.25)
+        self.assertIn(0.10, naps)
 
     def test_a_tray_that_cannot_form_the_stake_reports_its_real_denominations(self):
         fake = FakeTableCdp([self.tray(100, 500)])

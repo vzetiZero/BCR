@@ -34,7 +34,7 @@ BALANCE_STALE = 90
 # dọn hết chip (cả 3 cửa về 0) rồi mới tự bấm — tránh bấm chồng lên ván cũ còn
 # đang hiển thị/gom chip. BET_GATE_POLL là nhịp đọc lại trong lúc chờ.
 BET_GATE_TIMEOUT = 20.0
-BET_GATE_POLL = 0.6
+BET_GATE_POLL = 0.3
 # Vào bàn từ sảnh mất vài giây tải trang, khay chip/ô cược chưa kịp hiện nên lượt bấm
 # đầu thường hỏng. Tay chưa đặt được chip thật thì không được tính (xem
 # LiveSimulation.mark_placed), nhưng bỏ quá nhiều tay liên tiếp nghĩa là bàn đang đặt

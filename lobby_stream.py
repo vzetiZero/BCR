@@ -756,15 +756,25 @@ class LobbyStream:
                 return True, "Đã ở danh sách bàn · không cần rời bàn."
             # EVO xử lý hash nội bộ; history.back() đi theo lịch sử thật của site và
             # không buộc /entry tải lại (nguyên nhân làm mất phiên launch).
-            self._evaluate(ws, "history.back()", self.contexts[0])
+            try:
+                self._evaluate(ws, "history.back()", self.contexts[0])
+            except Exception:
+                # Điều hướng có thể phá chính context đang chạy lệnh: CDP trả lỗi ngay
+                # dù tab vẫn quay lại bình thường. Coi lỗi đó là thất bại thì app đứng
+                # mãi ở màn hình bàn sau khi đủ tay khối (đúng lỗi "chưa out ra sảnh").
+                pass
             deadline = time.monotonic() + wait_seconds
             while time.monotonic() < deadline:
                 time.sleep(1.5)
                 page = self.session._cdp_page() or {}
-                fragment = urlsplit(page.get("url", "")).fragment
-                if "table_id" not in fragment and self._lobby_context(ws)[0]:
-                    self.note = "Đã về danh sách bàn Baccarat."
-                    return True, "Đã rời bàn · danh sách bàn Baccarat hiển thị trở lại."
+                now_url = page.get("url", "")
+                fragment = urlsplit(now_url).fragment
+                if "table_id" not in fragment and "table_id=" not in now_url:
+                    if not self.contexts:
+                        self._wait_context(ws)
+                    if self._lobby_context(ws)[0]:
+                        self.note = "Đã về danh sách bàn Baccarat."
+                        return True, "Đã rời bàn · danh sách bàn Baccarat hiển thị trở lại."
             state = self._health(ws)
             if state.get("status") == "auth":
                 self.session_lost = True

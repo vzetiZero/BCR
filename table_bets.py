@@ -30,13 +30,13 @@ DEFAULT_DENOMINATIONS = (20, 50, 100, 500, 2000, 10000)
 # lần rồi bỏ cuộc — nếu không, place_bet trả lỗi "Không bấm được chip nào" ngay cả khi
 # khay vừa render lại ngay sau đó, và không một sự kiện chuột nào từng được gửi.
 TARGETS_WAIT_TIMEOUT = 20.0
-TARGETS_WAIT_POLL = 0.5
+TARGETS_WAIT_POLL = 0.25
 # Nhãn "chip đang chọn" chỉ đổi sau cú bấm một nhịp, và nhịp đó dài ra khi dealer đang
 # mở bài/gom chip. Một lần đọc ngay sau click_delay vì thế hay còn nguyên mệnh giá của
 # chip trước và báo nhầm "Bấm chọn chip 100 nhưng khay đang chọn 20" — nên xác nhận bằng
 # nhiều lần đọc trong một cửa sổ ngắn.
 CHIP_CONFIRM_TIMEOUT = 2.0
-CHIP_CONFIRM_POLL = 0.2
+CHIP_CONFIRM_POLL = 0.08
 
 
 def confirm_selected_chip(denom, read, wait=CHIP_CONFIRM_TIMEOUT, poll=CHIP_CONFIRM_POLL,
@@ -488,7 +488,7 @@ SELECTED_CHIP_JS = r"""(() => {
 
 
 def place_bet(session, side, chips, unit=DEFAULT_CHIP_UNIT, human_mouse=True,
-              click_delay=0.28, amount=None):
+              click_delay=0.10, amount=None, glide_seconds=0.25):
     """Dùng chuột đặt các chip (kết quả của ``decompose``) vào ô cược ``side``.
 
     Evolution Baccarat: bấm một chip mệnh giá trên khay để chọn mệnh giá đó, rồi mỗi
@@ -503,6 +503,9 @@ def place_bet(session, side, chips, unit=DEFAULT_CHIP_UNIT, human_mouse=True,
 
     Trả (ok, note, placed) trong đó placed là dict mệnh giá -> số chip đã bấm được.
     Không ném lỗi ra UI; mọi lỗi gói vào note.
+
+    Nhịp bấm nhanh (click_delay 0.10, glide 0.25) vì cửa sổ đặt cược của bàn chỉ vài
+    giây: chậm hơn là chip chưa lên ô thì bàn đã khoá cược (tay bị bỏ, không được tính).
     """
     role = {"B": "Banker", "P": "Player", "T": "Tie"}.get(side)
     placed = {}
@@ -715,7 +718,7 @@ def place_bet(session, side, chips, unit=DEFAULT_CHIP_UNIT, human_mouse=True,
                 pass
 
         mouse = HM.HumanMouse(lambda method, params: command(method, params),
-                              enabled=bool(human_mouse))
+                              enabled=bool(human_mouse), glide_seconds=glide_seconds)
 
         # Gộp chip cùng mệnh giá để bấm ô cược đúng số lần.
         counts = {}
