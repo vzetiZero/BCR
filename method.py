@@ -22,6 +22,8 @@ PROFILES = {          # (số tay bên mạnh, số tay bên đổi) của một
     "3-2": (3, 2),
 }
 DEFAULT_PROFILE = "3-3"
+BLOCK_MODE_RECALCULATE = "recalculate"
+BLOCK_MODE_ALTERNATE = "alternate"
 # Mức cược mặc định chỉ để điền sẵn vào ô nhập; người dùng tự đổi từng bậc, không nhân cứng.
 # Đơn vị theo đúng số hiển thị trên sàn (VN2): bậc 1 = 100, không phải 100.000.
 DEFAULT_LADDER = {
@@ -189,7 +191,7 @@ def check_table(results, min_hands=MIN_HANDS, max_hands=MAX_HANDS,
 
 def plan(results, stakes, ladder_step=0, hands_in_block=0, started=False,
          strong=None, profile=DEFAULT_PROFILE, min_hands=MIN_HANDS, max_hands=MAX_HANDS,
-         max_streak=MAX_STREAK_ALLOWED):
+         max_streak=MAX_STREAK_ALLOWED, block_mode=BLOCK_MODE_RECALCULATE):
     """Bàn tay tiếp theo nên làm gì. Trả về cửa, số tiền, vị trí trong khối theo phương pháp đã chọn."""
     stakes = ladder_stakes(profile, stakes)
     cycle = strong_hands(profile)
@@ -211,8 +213,11 @@ def plan(results, stakes, ladder_step=0, hands_in_block=0, started=False,
     weak = E.PLAYER if strong == E.BANKER else E.BANKER
 
     if hands_in_block >= block or (started and hands_in_block == 0):
-        hands_in_block = 0          # sang khối mới, tính lại bên mạnh
-        strong = info["strong"] or strong
+        hands_in_block = 0
+        if block_mode == BLOCK_MODE_ALTERNATE and started and strong in (E.BANKER, E.PLAYER):
+            strong = E.PLAYER if strong == E.BANKER else E.BANKER
+        else:
+            strong = info["strong"] or strong
         weak = E.PLAYER if strong == E.BANKER else E.BANKER
 
     pos = hands_in_block

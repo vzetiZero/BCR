@@ -140,12 +140,16 @@ def row_problem(row, now=None, check_fresh=True):
 class LiveSimulation:
     def __init__(self, book=None, profile=ME.DEFAULT_PROFILE, ladder=None,
                  min_hands=ME.MIN_HANDS, max_hands=ME.MAX_HANDS,
-                 max_streak=ME.MAX_STREAK_ALLOWED):
+                 max_streak=ME.MAX_STREAK_ALLOWED,
+                 block_mode=ME.BLOCK_MODE_RECALCULATE):
         self.money = book or M.MoneyBook()
         self.profile = profile
         self.ladder = ME.ladder_stakes(profile, ladder)
         self.min_hands, self.max_hands = ME.normalize_hand_range(min_hands, max_hands)
         self.max_streak = ME.normalize_streak(max_streak)
+        self.block_mode = (block_mode if block_mode in
+                           (ME.BLOCK_MODE_RECALCULATE, ME.BLOCK_MODE_ALTERNATE)
+                           else ME.BLOCK_MODE_RECALCULATE)
         self.results = []
         self.log = []
         self.method_state = fresh_method()
@@ -177,7 +181,7 @@ class LiveSimulation:
         s = self.method_state
         return ME.plan(self.results, self.ladder, s["ladder_step"], s["hands_in_block"],
                        s["started"], s["strong"], self.profile,
-                       self.min_hands, self.max_hands, self.max_streak)
+                       self.min_hands, self.max_hands, self.max_streak, self.block_mode)
 
     def set_road_filter(self, min_hands, max_hands, max_streak):
         """Đổi bộ lọc cầu (khoảng tay đã đi + số tay bệt tối đa); kẹp trong biên của method."""
@@ -484,6 +488,7 @@ class BCRApp:
         self.hands_min_var = tk.StringVar(value=str(ME.MIN_HANDS))
         self.hands_max_var = tk.StringVar(value=str(ME.MAX_HANDS))
         self.streak_var = tk.StringVar(value=str(ME.MAX_STREAK_ALLOWED))
+        self.block_mode_var = tk.StringVar(value=ME.BLOCK_MODE_RECALCULATE)
         self._last_sweep_favorites = False
         self.chrome_fullscreen_var = tk.BooleanVar(value=BR.WIN_FULLSCREEN)
         self.chrome_w_var = tk.StringVar(value=str(BR.WIN_W))
@@ -784,6 +789,13 @@ class BCRApp:
             tk.Radiobutton(method, text=ME.PROFILE_LABEL[name], variable=self.profile_var, value=name,
                            command=self._rebuild_ladder_inputs, bg=PANEL, fg=TEXT, selectcolor=PALE,
                            activebackground=PANEL, font=("Segoe UI", 10)).pack(anchor="w")
+        self._label(method, "Hướng khối 3–3 tại cùng bàn", 10, MUTED, True).pack(anchor="w", pady=(8, 0))
+        for value, title in (
+                (ME.BLOCK_MODE_RECALCULATE, "Tính lại bên mạnh sau mỗi khối 6 tay (hiện tại)"),
+                (ME.BLOCK_MODE_ALTERNATE, "Đảo hướng sau mỗi khối 6 tay (P→B→P hoặc B→P→B)")):
+            tk.Radiobutton(method, text=title, variable=self.block_mode_var, value=value,
+                           command=self.apply_block_mode, bg=PANEL, fg=TEXT, selectcolor=PALE,
+                           activebackground=PANEL, font=("Segoe UI", 10)).pack(anchor="w")
         self.ladder_mode_frame = tk.Frame(method, bg=PANEL)
         self.ladder_mode_frame.pack(fill="x", pady=(10, 0))
         self._label(self.ladder_mode_frame, "Cơ chế điền mức cược", 10, MUTED, True).pack(anchor="w")
@@ -1030,11 +1042,13 @@ class BCRApp:
         if hasattr(self, "cycle_check"):
             self.cycle_check.config(text="Lặp khối %s tại bàn tới khi lãi đủ %.0f%% vốn" % (
                 profile, target))
+            direction_rule = ("t\u00ednh l\u1ea1i b\u00ean m\u1ea1nh m\u1ed7i kh\u1ed1i" if self.sim.block_mode == ME.BLOCK_MODE_RECALCULATE
+                              else "\u0111\u1ea3o h\u01b0\u1edbng m\u1edf \u0111\u1ea7u m\u1ed7i kh\u1ed1i")
             self.cycle_rule.config(
-                text="Khối %s = %d tay bên mạnh + %d tay bên đổi, lặp lại tại bàn và tự tính lại bên mạnh. "
-                     "Đủ %.0f%% vốn thì rời bàn, tự quét vào bàn kế tiếp tới khi xong %d bàn; "
-                     "vốn ban đầu tự đồng bộ theo số dư sau mỗi bàn." % (
-                         profile, strong, hands - strong, target, self._tables_target()))
+                text="Kh\u1ed1i %s = %d tay b\u00ean m\u1ea1nh + %d tay b\u00ean \u0111\u1ed5i; %s. "
+                     "\u0110\u1ee7 %.0f%% v\u1ed1n th\u00ec r\u1eddi b\u00e0n, t\u1ef1 qu\u00e9t v\u00e0o b\u00e0n k\u1ebf ti\u1ebfp t\u1edbi khi xong %d b\u00e0n; "
+                     "v\u1ed1n ban \u0111\u1ea7u t\u1ef1 \u0111\u1ed3ng b\u1ed9 theo s\u1ed1 d\u01b0 sau m\u1ed7i b\u00e0n." % (
+                         profile, strong, hands - strong, direction_rule, target, self._tables_target()))
         if hasattr(self, "step_label"):
             self.step_label.config(text="Vào bàn là tự đánh · khối %s lặp tới khi lãi đủ %.0f%% vốn · tự đóng bàn"
                                    % (profile, target))
@@ -2310,6 +2324,16 @@ class BCRApp:
         messagebox.showinfo("Đã lưu tỉ lệ", "Mở lại ứng dụng để áp dụng tỉ lệ %d%%." % scale,
                             parent=self.root)
 
+    def apply_block_mode(self):
+        mode = self.block_mode_var.get()
+        if mode not in (ME.BLOCK_MODE_RECALCULATE, ME.BLOCK_MODE_ALTERNATE):
+            mode = ME.BLOCK_MODE_RECALCULATE
+            self.block_mode_var.set(mode)
+        self.sim.block_mode = mode
+        self._sync_method_texts()
+        self._save_state()
+        self.refresh()
+
     def apply_settings(self):
         try:
             values = {k: (M.parse_money(v.get()) if k == "capital" else float(v.get().strip()))
@@ -2343,7 +2367,8 @@ class BCRApp:
             return
         self.sim = LiveSimulation(book, profile=profile, ladder=stakes,
                                   min_hands=self.sim.min_hands, max_hands=self.sim.max_hands,
-                                  max_streak=self.sim.max_streak)
+                                  max_streak=self.sim.max_streak,
+                                  block_mode=self.block_mode_var.get())
         self.sim.on_arm = self.place_armed_bet
         self.tables_done = 0
         self._sync_cycle_strip()
@@ -2401,6 +2426,11 @@ class BCRApp:
                 except ValueError:
                     self.sim.set_method(profile, None)
                 self.ladder_store[profile] = [M.fmt_input_money(s) for s in self.sim.ladder]
+            block_mode = settings.get("block_mode", ME.BLOCK_MODE_RECALCULATE)
+            if block_mode not in (ME.BLOCK_MODE_RECALCULATE, ME.BLOCK_MODE_ALTERNATE):
+                block_mode = ME.BLOCK_MODE_RECALCULATE
+            self.block_mode_var.set(block_mode)
+            self.sim.block_mode = block_mode
             self.chrome_startup_var.set(bool(settings.get("chrome_startup", False)))
             self.cdp_var.set(bool(settings.get("chrome_cdp", True)))
             saved_url = settings.get("start_url")
@@ -2463,6 +2493,7 @@ class BCRApp:
                     settings=dict(capital=book.start_capital, unit=book.unit,
                                   take_profit_pct=book.take_profit_pct,
                                   profile=self.sim.profile, ladder=self.sim.ladder,
+                                  block_mode=self.sim.block_mode,
                                   chrome_startup=self.chrome_startup_var.get(), chrome_cdp=self.cdp_var.get(),
                                   start_url=self.start_url_var.get(),
                                   auto_cycle=self.auto_cycle_var.get(),

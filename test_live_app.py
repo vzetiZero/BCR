@@ -208,6 +208,21 @@ class LiveSimulationTests(unittest.TestCase):
             self.assertTrue(sim.start(self.row(baseline), verified=True, now=self.now))
         return sim
 
+    def test_alternate_block_mode_reverses_opening_side_each_six_hands(self):
+        sim = self.simulation()
+        sim.block_mode = ME.BLOCK_MODE_ALTERNATE
+        # Initial strong side is Banker for this baseline. Ties advance the block
+        # without changing the eligible road or ladder step.
+        for _ in range(6):
+            self.settle_next(sim, E.TIE)
+        self.assertEqual(sim.pending["side"], E.PLAYER)
+        self.assertEqual(sim.pending["block_pos"], 0)
+        for _ in range(6):
+            self.settle_next(sim, E.TIE)
+        self.assertEqual(sim.pending["side"], E.BANKER)
+        self.assertEqual(sim.pending["block_pos"], 0)
+
+
     def snapshot(self, sim):
         return deepcopy(dict(money=vars(sim.money), results=sim.results,
                              letters=sim.letters, method=sim.method_state, log=sim.log))
