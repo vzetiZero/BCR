@@ -471,7 +471,6 @@ class BCRApp:
         self.chrome_scale_var = tk.StringVar(value=str(int(BR.WIN_SCALE * 100)))
         self.verified = tk.BooleanVar(value=False)
         self.only_eligible = tk.BooleanVar(value=False)
-        self.chip_unit_var = tk.StringVar(value=str(TB.DEFAULT_CHIP_UNIT))
         self.search = tk.StringVar()
         self.connection_text = "Chưa kết nối Chrome."
         self._load_state()
@@ -1023,16 +1022,9 @@ class BCRApp:
         chips.pack(fill="x", padx=20, pady=(8, 0))
         self._label(chips, "Chip trên bàn", 13, bold=True).pack(anchor="w")
         self._label(chips, "Số in trên chip chính là số tiền theo đơn vị VN2 của sàn: chip “100” = 100, "
-                           "chip “20” = 20. App đọc mệnh giá thật của khay để gợi ý cần bấm chip nào.",
+                           "chip “20” = 20. App đọc mệnh giá thật của khay để gợi ý cần bấm chip nào; "
+                           "không có hệ số nhân nào giữa số trên chip và số tiền cược.",
                    9, MUTED, justify="left").pack(anchor="w")
-        unit_row = tk.Frame(chips, bg=PANEL)
-        unit_row.pack(anchor="w", pady=(8, 0))
-        self._label(unit_row, "1 đơn vị chip = (VN2)", 10, MUTED).pack(side="left", padx=(0, 8))
-        tk.Entry(unit_row, textvariable=self.chip_unit_var, width=9,
-                 font=("Segoe UI", 11), relief="solid", bd=1).pack(side="left", ipady=4)
-        self._button(unit_row, "Lưu đơn vị chip", self.apply_chip_unit).pack(side="left", padx=8)
-        self.chip_unit_note = self._label(chips, "", 9, MUTED, justify="left")
-        self.chip_unit_note.pack(anchor="w", pady=(6, 0))
 
     def _bind_money_input(self, entry, var):
         """Ô nhập tiền chỉ nhận chữ số và tự chèn dấu phân cách hàng nghìn khi gõ."""
@@ -1225,26 +1217,6 @@ class BCRApp:
                 self.events.put(("window_applied", (False, "Không đổi được cửa sổ (%s)." % type(exc).__name__)))
         threading.Thread(target=work, daemon=True).start()
         self.refresh()
-
-    def apply_chip_unit(self):
-        """Lưu quy đổi đơn vị chip (số trên chip -> VNĐ) để gợi ý mệnh giá đúng."""
-        raw = self.chip_unit_var.get().strip()
-        try:
-            unit = int(M.parse_money(raw))
-        except (ValueError, TypeError):
-            unit = 0
-        if unit <= 0:
-            messagebox.showerror("Đơn vị chip chưa hợp lệ",
-                                 "Nhập số tiền cho 1 đơn vị chip, ví dụ 1,000.", parent=self.root)
-            return
-        self.chip_unit_var.set(M.fmt_input_money(unit))
-        self._save_state()
-        self.chip_live = None
-        self.chip_read_at = 0.0
-        self._update_chip_status()
-        messagebox.showinfo("Đã lưu đơn vị chip",
-                            "1 đơn vị chip = %s VN2. Chip “20” tương ứng %s VN2." % (
-                                M.fmt_money(unit), M.fmt_money(unit * 20)), parent=self.root)
 
     def apply_hand_range(self):
         """Lưu khoảng tay đã đi dùng để lọc bàn (10–50 tay)."""
@@ -1631,7 +1603,7 @@ class BCRApp:
             return
         self.chip_busy = True
         self.chip_read_at = now
-        unit = self._chip_unit()
+        unit = TB.DEFAULT_CHIP_UNIT
         def work():
             live = self._read_chip_state(unit)
             self.events.put(("chips", live))
@@ -1659,14 +1631,6 @@ class BCRApp:
             return TB.read(self.browser, unit=unit)
         except Exception as exc:
             return {"ok": False, "error": type(exc).__name__}
-
-    def _chip_unit(self):
-        """Số tiền cho 1 đơn vị chip; giá trị sai thì về mức mặc định để không chia nhầm."""
-        try:
-            unit = int(M.parse_money(self.chip_unit_var.get().strip()))
-        except (ValueError, TypeError):
-            return TB.DEFAULT_CHIP_UNIT
-        return unit if unit > 0 else TB.DEFAULT_CHIP_UNIT
 
     def _update_chip_status(self):
         """So chip thật với kế hoạch đang chốt và vẽ trạng thái khớp/lệch."""
@@ -1725,15 +1689,9 @@ class BCRApp:
         if self.place_busy:
             self._finish_place(plan, False, "Lượt bấm chip trước chưa xong nên tay này chưa được bấm.")
             return
-        unit = self._chip_unit()
-        if int(round(stake / unit)) <= 0:
-            # Lỗi cấu hình, không phải lỗi tải trang: không khay chip nào cứu được mức
-            # cược nhỏ hơn 1 đơn vị chip, nên báo ngay thay vì chờ rồi bỏ tay.
-            self._finish_place(plan, False,
-                               "Không tự đặt: %s VN2 nhỏ hơn 1 đơn vị chip (%s VN2) — "
-                               "kiểm tra ô Đơn vị chip và bậc cược."
-                               % (M.fmt_money(stake), M.fmt_money(unit)))
-            return
+        # Số in trên chip chính là số tiền VN2 của sàn (chip 20 = 20), nên không nhân
+        # hệ số nào: khay 20/40/50 ghép thẳng mức cược 20. Nhân thêm là bỏ tay oan.
+        unit = TB.DEFAULT_CHIP_UNIT
         # KHÔNG chốt mệnh giá ở đây. chip_live là bản đọc từ trước/trong lúc bàn render
         # khay, quyết định theo nó là bỏ tay oan — đúng lỗi "bàn đã mở cửa sổ chọn chip
         # lên nhưng lại không chọn được". place_bet đọc lại khay thật ngay chỗ bấm (chờ
@@ -2514,9 +2472,6 @@ class BCRApp:
             if isinstance(ladder, list):
                 settings["ladder"] = [s / divisor for s in ladder
                                       if isinstance(s, (int, float)) and not isinstance(s, bool)]
-            if isinstance(settings.get("chip_unit"), (int, float)):
-                unit = settings["chip_unit"] / divisor
-                settings["chip_unit"] = unit if unit >= 1 else 1
             base = settings.get("ladder_base")
             if isinstance(base, str):
                 digits = base.replace(".", "").replace(",", "").strip()
@@ -2564,9 +2519,6 @@ class BCRApp:
                                                 settings.get("hands_max", ME.MAX_HANDS))
             self.hands_min_var.set(str(low))
             self.hands_max_var.set(str(high))
-            saved_unit = settings.get("chip_unit", TB.DEFAULT_CHIP_UNIT)
-            if isinstance(saved_unit, (int, float)) and not isinstance(saved_unit, bool) and saved_unit > 0:
-                self.chip_unit_var.set(M.fmt_input_money(int(saved_unit)))
             saved_window = settings.get("chrome_window")
             if isinstance(saved_window, dict):
                 loaded = BR.normalize_window((saved_window.get("width"), saved_window.get("height")),
@@ -2617,7 +2569,6 @@ class BCRApp:
                                    ladder_base=self.ladder_base_var.get(),
                                    hands_min=self.sim.min_hands,
                                    hands_max=self.sim.max_hands,
-                                   chip_unit=self._chip_unit(),
                                   chrome_window=dict(width=window["width"], height=window["height"],
                                                      percent=window["percent"],
                                                      fullscreen=window["fullscreen"]),

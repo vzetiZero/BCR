@@ -191,8 +191,8 @@ def decompose(amount, unit=DEFAULT_CHIP_UNIT, denominations=None):
 def read(session, timeout=None, unit=DEFAULT_CHIP_UNIT):
     """Đọc chip đang đặt trên bàn đang mở và quy đổi về VNĐ.
 
-    Số trên chip là đơn vị hiển thị (20 = 20.000 đ khi unit=1000), nên mọi giá trị trả ra
-    ngoài ``raw_*`` đều đã nhân ``unit``. Trả dict:
+    Số in trên chip chính là số tiền VN2 hiển thị trên sàn (chip 20 = 20), nên ``unit``
+    mặc định 1 và mọi giá trị trả ra ngoài ``raw_*`` đều đã nhân ``unit``. Trả dict:
         {ok, error, total, total_units, selected_chip, selected_chip_vnd,
          spots:{B:{amount,amount_vnd,chips,chips_vnd}}, denominations, unit, ts}
     ok=False khi chưa ở trong bàn hoặc CDP không đọc được; không ném lỗi ra UI.

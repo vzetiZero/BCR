@@ -2842,6 +2842,16 @@ class PlaceBetLiveTrayTests(unittest.TestCase):
         # Khay 20 ở (420,700) trong khung bàn, ô cược ở (400,300): cả hai phải cộng lệch 64.
         self.assertEqual(released, [(420, 764), (400, 364)])
 
+    def test_the_sites_20_40_50_tray_places_a_20_stake_with_one_chip(self):
+        """Đúng khay của bàn người dùng báo: 20/40/50 và mức cược 20 VN2 = một chip 20."""
+        fake = FakeTableCdp([self.tray(20, 40, 50)])
+        ok, note, placed = self.place(fake, [], amount=20)
+        self.assertTrue(ok, note)
+        self.assertEqual(placed, {20: 1})
+        self.assertEqual(fake.on_spot, 20)
+        released = [(c["x"], c["y"]) for c in fake.clicks if c["type"] == "mouseReleased"]
+        self.assertEqual(released, [(420, 764), (400, 364)])
+
     def test_a_tray_that_cannot_form_the_stake_reports_its_real_denominations(self):
         fake = FakeTableCdp([self.tray(100, 500)])
         with patch.object(TB, "TARGETS_WAIT_TIMEOUT", 0.05):
@@ -3086,8 +3096,7 @@ class AutoPlaceReportingTests(unittest.TestCase):
             auto_place_var=Mock(get=Mock(return_value=True)),
             human_mouse_var=Mock(get=Mock(return_value=False)),
             place_busy=False, exit_requested=False,
-            _chip_unit=Mock(return_value=UNIT),
-            chip_live={"denominations": [1, 2, 5]},
+            chip_live={"denominations": [20, 40, 50]},
             place_status=Mock(),
             events=queue.Queue(), browser=Mock(),
             _wait_for_next_hand=Mock(return_value=(True, "")),
@@ -3103,7 +3112,7 @@ class AutoPlaceReportingTests(unittest.TestCase):
         book = M.MoneyBook(capital=CAPITAL, unit=UNIT, take_profit_pct=100)
         row = dict(key="baccarat01", label="Baccarat 01", letters=BASELINE,
                    ts=self.now, stable=2, conflict=False)
-        sim = app.LiveSimulation(book, ladder=[UNIT * m for m in (1, 3, 7, 15, 32, 64)])
+        sim = app.LiveSimulation(book, ladder=[20, 60, 140, 300, 640, 1280])
         sim.bind(row)
         self.assertTrue(sim.start(row, verified=True, now=self.now))
         return sim
@@ -3151,13 +3160,23 @@ class AutoPlaceReportingTests(unittest.TestCase):
         self.assertIn("chưa xong", plan["place_note"])
         self.assertTrue(host.place_busy)
 
-    def test_stake_below_one_chip_unit_reports_a_setup_error(self):
-        host = self.host(self.simulation(), _chip_unit=Mock(return_value=UNIT * 1000))
+    def test_chip_print_is_the_money_so_no_multiplier_rejects_a_small_stake(self):
+        """Khay 20/40/50 và mức cược 20 VN2: phải bấm đúng một chip 20, không nhân hệ số.
+
+        Đây là lỗi "20 VN2 nhỏ hơn 1 đơn vị chip (1.000 VN2)": một hệ số nhân cũ giữa số
+        in trên chip và số tiền đã chặn oan mọi mức cược nhỏ hơn hệ số đó.
+        """
+        host = self.host(self.simulation())
         plan = host.sim.pending
-        threads = self.run_placement(host, threads=False)
-        threads.assert_not_called()
-        self.assertEqual(plan["placed"], "failed")
-        self.assertIn("nhỏ hơn 1 đơn vị chip", plan["place_note"])
+        self.assertEqual(plan["stake"], 20)
+        place_bet = Mock(return_value=(True, "Đã đặt 1 chip 20", {20: 1}))
+        self.run_placement(host, place_bet=place_bet)
+        self.assertEqual(plan["placed"], "ok")
+        args, kwargs = place_bet.call_args
+        self.assertEqual(args[2], [])
+        self.assertEqual(kwargs["amount"], 20)
+        self.assertEqual(kwargs["unit"], TB.DEFAULT_CHIP_UNIT)
+        self.assertNotIn("nhỏ hơn 1 đơn vị chip", plan.get("place_note", ""))
 
     def test_a_stale_tray_does_not_cancel_the_hand_before_the_table_opens(self):
         """Khay chưa render xong lúc chốt kế hoạch: vẫn phải xuống tận bàn đọc lại.
@@ -3178,7 +3197,7 @@ class AutoPlaceReportingTests(unittest.TestCase):
     def test_the_live_tray_failure_is_reported_as_not_placed(self):
         host = self.host(self.simulation(), chip_live={"denominations": [100, 500]})
         plan = host.sim.pending
-        note = "Khay chip của bàn chỉ có mệnh giá 100, 500 — không ghép được 100,000."
+        note = "Khay chip của bàn chỉ có mệnh giá 100, 500 — không ghép được 20."
         self.run_placement(host, place_bet=Mock(return_value=(False, note, {})))
         self.assertEqual(plan["placed"], "failed")
         self.assertIn("không ghép được", plan["place_note"])
@@ -3192,14 +3211,14 @@ class AutoPlaceReportingTests(unittest.TestCase):
         )
 
     def test_extension_path_uses_the_tray_read_at_click_time(self):
-        host = self.extension_host(self.simulation(), {"ok": True, "denominations": [1, 2, 5]})
+        host = self.extension_host(self.simulation(), {"ok": True, "denominations": [20, 40, 50]})
         plan = host.sim.pending
         self.run_placement(host)
         self.assertEqual(plan["placed"], "ok")
         host._ext_command.assert_called_once()
         name, args = host._ext_command.call_args[0]
         self.assertEqual(name, "place_chips")
-        self.assertEqual(args["chips"], [1])
+        self.assertEqual(args["chips"], [20])
 
     def test_extension_path_reports_an_unreadable_tray(self):
         host = self.extension_host(self.simulation(), {"ok": False, "error": "no_chips"})
