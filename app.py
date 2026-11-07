@@ -549,6 +549,7 @@ class BCRApp:
         self.search = tk.StringVar()
         self.connection_text = "Chưa kết nối Chrome."
         self.wallet_balance_text = "Số dư ví trên web: chưa đọc được"
+        self._wallet_startup_sync_pending = True
         self._load_state()
         self.stream.human_mouse = self.human_mouse_var.get()
         self.base_tk_scaling = float(root.tk.call("tk", "scaling"))
@@ -2055,7 +2056,28 @@ class BCRApp:
 
         self.wallet_balance_text = "Số dư ví trên web: %s VN2" % M.fmt_amount(value)
         book = self.sim.money
-        if not self.sim.running and not book.hands_played and not getattr(self, "state_read_error", False):
+        startup_reset = (getattr(self, "_wallet_startup_sync_pending", False)
+                         and not getattr(self, "state_read_error", False))
+        if startup_reset:
+            # A reopened app starts a fresh ledger from the live wallet. Archive
+            # the previous session first, then clear its P/L and hand counters.
+            try:
+                self._archive_state()
+            except OSError:
+                pass
+            self.sim.money = M.MoneyBook(
+                capital=value, unit=book.unit, mode=book.mode, percent=book.percent,
+                take_profit_pct=book.take_profit_pct, mtg_cap=book.mtg_cap)
+            self.sim.log = []
+            self.history_size = -1
+            self.tables_done = 0
+            self._wallet_startup_sync_pending = False
+            self.wallet_balance_text += " · vốn phiên mới lấy từ số dư ví; lãi/lỗ đã đặt lại"
+            if hasattr(self, "entries") and "capital" in self.entries:
+                self.entries["capital"].set(M.fmt_input_money(value))
+            if hasattr(self, "_save_state"):
+                self._save_state()
+        elif not self.sim.running and not book.hands_played and not getattr(self, "state_read_error", False):
             changed = abs(book.start_capital - value) >= 0.005
             ok, _note = book.sync_capital(value)
             if ok:
@@ -2118,6 +2140,9 @@ class BCRApp:
     def _auto_start_verified_table(self):
         key = self.auto_start_table_key
         if not key:
+            return
+        if getattr(self, "_wallet_startup_sync_pending", False):
+            self.sweep_note_text = "Đang chờ đồng bộ vốn theo số dư ví trước khi theo dõi bàn."
             return
         row = self.tables.get(key)
         if not row or row.get("source") != "evo-bead" or row.get("screen_stable", 0) < 2:
@@ -2196,6 +2221,10 @@ class BCRApp:
         Bàn không đạt bộ lọc thì ``sim.start`` tự trả lời lý do (qua ``plan``) và không
         chốt cược nào; đang theo dõi đúng bàn đó thì giữ nguyên khối đang đi.
         """
+        if getattr(self, "_wallet_startup_sync_pending", False):
+            self.sim.note = "Đang chờ đọc số dư ví để đặt lại vốn phiên trước khi theo dõi bàn."
+            self.refresh()
+            return
         selected = self.live_tree.selection()
         row = self.tables.get(selected[0]) if selected else None
         if not row:

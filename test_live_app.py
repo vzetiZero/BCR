@@ -744,6 +744,13 @@ class LiveSimulationTests(unittest.TestCase):
         row = self.row(BASELINE)
         sim.bind(row)
         self.assertTrue(sim.start(row, verified=True, now=self.now))
+        armed_after_entry = []
+        def arm_and_confirm(plan):
+            armed_after_entry.append(plan)
+            sim.mark_placing(plan)
+            sim.mark_placed(True, "placed", plan)
+        sim.on_arm = arm_and_confirm
+        arm_and_confirm(sim.pending)
         winning_side = sim.pending["side"]
         self.settle_next(sim, winning_side)
         self.assertEqual(sim.money.blocked[0], "TAKE_PROFIT")
@@ -751,6 +758,7 @@ class LiveSimulationTests(unittest.TestCase):
         self.assertTrue(sim.cycle_done, "phải báo cho app đóng bàn")
         self.assertFalse(sim.running, "chốt lời xong là dừng, không lặp khối mới")
         self.assertIsNone(sim.pending)
+        self.assertEqual(len(armed_after_entry), 1, "hitting the target must not arm an extra hand")
         self.assertIn("mục tiêu lãi", sim.note)
 
     def test_ties_alone_never_reach_take_profit(self):
@@ -2031,6 +2039,36 @@ class TableCountCycleTests(unittest.TestCase):
         self.assertEqual(app.BCRApp._tables_target(host), 1)
         host.tables_var = Mock(get=lambda: "5")
         self.assertEqual(app.BCRApp._tables_target(host), 5)
+
+
+class WalletStartupSyncTests(unittest.TestCase):
+    def test_first_wallet_read_after_reopen_rebases_and_clears_previous_session(self):
+        book = M.MoneyBook(capital=1000, unit=40, take_profit_pct=15)
+        book.settle(E.BANKER, E.PLAYER, 40, E.PAYOUT)
+        sim = app.LiveSimulation(book)
+        sim.log = [dict(table="Old table", outcome="loss", delta=-40)]
+        host = SimpleNamespace(
+            sim=sim, _wallet_startup_sync_pending=True, state_read_error=False,
+            entries={"capital": Mock()}, history_size=1, tables_done=2,
+            wallet_balance_text="", _archive_state=Mock(), _save_state=Mock())
+
+        app.BCRApp._sync_wallet_from_reports(
+            host, [{"page": {"wallet_balance": "2.500,50 VN2"}}])
+
+        self.assertEqual(host.sim.money.balance, 2500.5)
+        self.assertEqual(host.sim.money.start_capital, 2500.5)
+        self.assertEqual(host.sim.money.profit, 0)
+        self.assertEqual(host.sim.money.unit, 40)
+        self.assertEqual(host.sim.money.take_profit_pct, 15)
+        self.assertEqual(host.sim.money.hands_played, 0)
+        self.assertEqual(host.sim.money.losses, 0)
+        self.assertEqual(host.sim.log, [])
+        self.assertEqual(host.history_size, -1)
+        self.assertEqual(host.tables_done, 0)
+        self.assertFalse(host._wallet_startup_sync_pending)
+        host._archive_state.assert_called_once_with()
+        host._save_state.assert_called_once_with()
+        host.entries["capital"].set.assert_called_once_with(M.fmt_input_money(2500.5))
 
 
 class CapitalRebaseTests(unittest.TestCase):
