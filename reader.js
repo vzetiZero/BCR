@@ -319,6 +319,11 @@ window.__BCR_SCAN = (function () {
   }
 
   return function scan() {
+    // Chỉ đọc ví ở sảnh danh sách Baccarat; hash-route độc lập với domain/mirror.
+    const isBaccaratLobby = /(?:^|[&#])category=baccarat(?:&|$)/.test(location.hash || "");
+    const walletBalance = isBaccaratLobby
+      ? ((document.querySelector('[data-role="footer-balance"]') || {}).textContent || "").replace(/\s+/g, " ").trim()
+      : "";
     const tid = (() => {
       const m = /table_id=([^&]+)/.exec(location.href);
       return m ? decodeURIComponent(m[1]) : "";
@@ -354,7 +359,7 @@ window.__BCR_SCAN = (function () {
       }
     }
     return {
-      page: { url: location.origin + location.pathname, table_id: tid, title: (document.title || "").slice(0, 80) },
+      page: { url: location.origin + location.pathname, table_id: tid, title: (document.title || "").slice(0, 80), wallet_balance: walletBalance },
       tables: out.roads.map((r) => ({
         label: r.label || (out.roads.length === 1 && tid ? tid : "ban " + r.box.w),
         letters: r.letters, source: r.source, x: r.box.x, y: r.box.y,

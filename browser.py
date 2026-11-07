@@ -191,7 +191,8 @@ def _clean_report(report):
     frame_url = _safe_url(page.get("url", ""))
     return {
         "page": {"url": frame_url, "table_id": table_id,
-                 "title": str(page.get("title") or "")[:80]},
+                 "title": str(page.get("title") or "")[:80],
+                 "wallet_balance": str(page.get("wallet_balance") or "")[:80]},
         "tables": report["tables"],
         "diag": {"kind": diag.get("kind", ""), "scanned": diag.get("scanned", 0),
                  "roads": diag.get("roads", 0), "frame": frame_url,

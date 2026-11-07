@@ -436,7 +436,7 @@ class BCRApp:
         self.tables_var = tk.StringVar(value="1")
         self.favorites_only = tk.BooleanVar(value=True)
         self.human_mouse_var = tk.BooleanVar(value=True)
-        self.auto_place_var = tk.BooleanVar(value=False)
+        self.auto_place_var = tk.BooleanVar(value=True)
         self.auto_recover_var = tk.BooleanVar(value=True)
         self.ladder_mode_var = tk.StringVar(value="manual")
         self.ladder_base_var = tk.StringVar(value=M.fmt_input_money(ME.DEFAULT_LADDER[ME.DEFAULT_PROFILE][0]))
@@ -1472,9 +1472,17 @@ class BCRApp:
         đó để tay chưa đặt bị đếm như đã đặt (đúng lỗi vào bàn chậm ở tay đầu tiên).
         """
         if not self.auto_place_var.get():
+            # The live cycle may only advance after the browser confirms a real bet.
+            # Previously this returned with no placement state, so process() treated
+            # the next result like a simulated successful wager.
+            self.sim.mark_placing(plan)
+            self.sim.mark_placed(False, "Chưa đặt: hãy bật ‘Tự đặt chip’ để chỉ tính tay đã được web xác nhận.", plan)
+            self._set_place_status(False, plan.get("place_note", "Chưa đặt được chip."))
             return
         side, stake = plan.get("side"), plan.get("stake") or 0
         if not side or stake <= 0:
+            self.sim.mark_placing(plan)
+            self.sim.mark_placed(False, "Chưa đặt: kế hoạch cược không hợp lệ.", plan)
             return
         self.sim.mark_placing(plan)
         if self.exit_requested:
@@ -2313,7 +2321,7 @@ class BCRApp:
                 self.tables_var.set(str(int(saved_tables)))
             self.favorites_only.set(bool(settings.get("favorites_only", True)))
             self.human_mouse_var.set(bool(settings.get("human_mouse", True)))
-            self.auto_place_var.set(bool(settings.get("auto_place", False)))
+            self.auto_place_var.set(bool(settings.get("auto_place", True)))
             self.auto_recover_var.set(bool(settings.get("auto_recover", True)))
             saved_mode = settings.get("ladder_mode", "manual")
             self.ladder_mode_var.set(saved_mode if saved_mode in ("manual", "multiply") else "manual")
