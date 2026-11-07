@@ -25,6 +25,16 @@ MAX_TABLES_PER_REPORT = 60
 MIN_LETTERS = 4
 MAX_ENTRIES = 120
 LOG_BYTES = 1_000_000
+# Chỉ những lệnh này được phép đi qua cầu nối tới extension. Không có lệnh đặt tiền
+# tự động ngoài phạm vi người dùng đã bật trong app.
+ALLOWED_COMMANDS = {
+    "click_table",      # mở một bàn trong sảnh theo table_id/tên
+    "back_to_lobby",    # đưa về danh sách bàn
+    "open_lobby",       # bấm thẻ Evolution ở trang gốc
+    "read_chips",       # đọc mệnh giá chip + mệnh giá đang chọn
+    "place_chips",      # bấm chip mệnh giá và ô cược đúng số lần
+    "ping",             # kiểm tra extension còn sống
+}
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(HERE, "live_reports.jsonl")
 
@@ -88,6 +98,106 @@ class TableStore:
         self.port = None
         self.received = 0
         self.dropped = 0
+        # Số dư thật đọc từ API profile qua extension (người dùng tự đăng nhập).
+        self.balance = None
+        self.balance_at = None
+        self.balance_source = ""
+        # Cầu nối lệnh app -> extension (chỉ lệnh trong ALLOWED_COMMANDS).
+        self._lock_cmd = threading.Lock()
+        self._pending = []          # lệnh đang chờ extension nhận
+        self._results = {}          # id -> kết quả extension trả
+        self._cmd_seq = 0
+        self._ext_seen_at = 0.0
+
+    # ---------- cầu nối lệnh app -> extension ----------
+    def push_command(self, name, args=None, ttl=25.0):
+        """Xếp một lệnh cho extension. Trả id hoặc None nếu tên lệnh không được phép."""
+        if name not in ALLOWED_COMMANDS:
+            return None
+        now = time.time()
+        with self._lock_cmd:
+            self._cmd_seq += 1
+            cmd_id = "c%d" % self._cmd_seq
+            self._pending.append({"id": cmd_id, "name": name, "args": args or {},
+                                  "expires": now + ttl})
+            del self._pending[:-8]
+            return cmd_id
+
+    def poll_command(self, now=None):
+        """Extension gọi định kỳ để nhận lệnh kế tiếp; dọn lệnh hết hạn."""
+        now = now if now is not None else time.time()
+        with self._lock_cmd:
+            self._ext_seen_at = now
+            self._pending = [c for c in self._pending if c["expires"] > now]
+            return self._pending.pop(0) if self._pending else None
+
+    def post_result(self, cmd_id, result, now=None):
+        """Extension trả kết quả một lệnh."""
+        now = now if now is not None else time.time()
+        with self._lock_cmd:
+            self._ext_seen_at = now
+            if cmd_id:
+                self._results[cmd_id] = {"result": result, "ts": now}
+                if len(self._results) > 40:
+                    for stale in sorted(self._results, key=lambda k: self._results[k]["ts"])[:-20]:
+                        self._results.pop(stale, None)
+
+    def get_result(self, cmd_id):
+        with self._lock_cmd:
+            entry = self._results.pop(cmd_id, None)
+        return entry["result"] if entry else None
+
+    def extension_alive(self, now=None, window=20.0):
+        now = now if now is not None else time.time()
+        with self._lock_cmd:
+            return bool(self._ext_seen_at) and (now - self._ext_seen_at) <= window
+
+    def extension_age(self, now=None):
+        now = now if now is not None else time.time()
+        with self._lock_cmd:
+            return None if not self._ext_seen_at else max(0.0, now - self._ext_seen_at)
+
+    def set_balance(self, payload, now=None):
+        """Lưu số dư thật do extension gửi. Trả về bản ghi đã chuẩn hoá hoặc None.
+
+        Extension gửi ``{"balance": 3010.73, "currency": "VND2", "player": "****2093",
+        "name": "nguyễn mạnh hưng", "vip": "VIP4"}`` (số dư thô của ví + tên hiển thị).
+        App tự nhân đơn vị hiển thị khi cần, không nhân ở đây.
+        """
+        now = now if now is not None else time.time()
+        if not isinstance(payload, dict):
+            self.dropped += 1
+            return None
+        try:
+            raw = float(payload.get("balance"))
+        except (TypeError, ValueError):
+            self.dropped += 1
+            return None
+        if raw < 0 or raw != raw or raw in (float("inf"), float("-inf")):
+            self.dropped += 1
+            return None
+        record = {
+            "balance": raw,
+            "currency": clean_label(payload.get("currency"), 12),
+            "player": clean_label(payload.get("player"), 32),
+            "name": clean_label(payload.get("name"), 48),
+            "vip": clean_label(payload.get("vip"), 12),
+            "source": clean_label(payload.get("source"), 16) or "profile-api",
+            "ts": now,
+        }
+        with self.lock:
+            self.balance = record
+            self.balance_at = now
+            self.balance_source = record["source"]
+        return record
+
+    def balance_snapshot(self, now=None):
+        now = now if now is not None else time.time()
+        with self.lock:
+            record = dict(self.balance) if self.balance else None
+        if record is not None:
+            record["age"] = max(0.0, now - record["ts"])
+        return record
 
     def _log(self, payload):
         try:
@@ -201,7 +311,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept")
+        # Chrome chặn trang HTTPS công khai gọi xuống 127.0.0.1 (Private Network Access)
+        # trừ khi máy chủ nội bộ đồng ý rõ ràng. Thiếu header này thì request từ
+        # extension trên trang thật luôn thất bại với "Không gửi được app".
+        self.send_header("Access-Control-Allow-Private-Network", "true")
+        self.send_header("Access-Control-Max-Age", "86400")
         self.end_headers()
         self.wfile.write(data)
 
@@ -214,15 +329,31 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/tables"):
             self._send(200, self.store.snapshot())
+        elif self.path.startswith("/balance"):
+            self._send(200, {"ok": True, "balance": self.store.balance_snapshot()})
+        elif self.path.startswith("/command"):
+            command = self.store.poll_command()
+            self._send(200, {"ok": True, "command": command,
+                             "alive": self.store.extension_alive()})
         elif self.path.startswith("/ping"):
-            self._send(200, {"ok": True, "app": "BCR-3-3", "port": self.store.port})
+            self._send(200, {"ok": True, "app": "BCR-3-3", "port": self.store.port,
+                             "extension": self.store.extension_alive()})
         else:
             self._send(404, {"error": "unknown path"})
 
     def do_POST(self):
+        if self.path.startswith("/result"):
+            self._read_json(self._handle_result)
+            return
+        if self.path.startswith("/balance"):
+            self._read_json(self._handle_balance)
+            return
         if not self.path.startswith("/report"):
             self._send(404, {"error": "unknown path"})
             return
+        self._read_json(self._handle_report)
+
+    def _read_json(self, handler):
         try:
             length = min(int(self.headers.get("Content-Length") or 0), MAX_BODY)
         except ValueError:
@@ -234,6 +365,23 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeDecodeError):
             self._send(400, {"error": "json parse failed"})
             return
+        handler(payload)
+
+    def _handle_balance(self, payload):
+        record = self.store.set_balance(payload)
+        if record is None:
+            self._send(400, {"error": "bad balance"})
+            return
+        self._send(200, {"ok": True, "balance": record["balance"]})
+
+    def _handle_result(self, payload):
+        if not isinstance(payload, dict):
+            self._send(400, {"error": "bad result"})
+            return
+        self.store.post_result(payload.get("id"), payload.get("result"))
+        self._send(200, {"ok": True})
+
+    def _handle_report(self, payload):
         touched = self.store.merge(payload)
         self._send(200, {"ok": True, "updated": touched, "known": len(self.store.tables)})
 

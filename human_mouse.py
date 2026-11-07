@@ -1,25 +1,85 @@
 # -*- coding: utf-8 -*-
-"""Chuột "người thật" cho tab Chrome của profile BCR qua CDP.
+"""Chuột "người thật" cho tab Chrome của profile BCR qua CDP / ChromeDriver.
 
-Vì sao không dùng ghost-cursor / invisible_playwright / HumanCursor:
-- ghost-cursor và invisible_playwright gắn với Playwright/Node, còn app này mở Chrome
-  bằng Selenium + CDP nên không cần và không nên thêm cả một runtime khác.
-- HumanCursor điều khiển chuột ở cấp hệ điều hành (pyautogui), có thể bấm lạc sang cửa sổ
-  khác. Ở đây chỉ gửi Input.dispatchMouseEvent vào đúng tab sảnh nên an toàn hơn.
+Ba kiểu quỹ đạo:
+- ``ghost``: dùng đúng toán học của thư viện ``python-ghost-cursor`` (Bezier ba
+  điểm neo + Fitts's law + overshoot) rồi gửi qua CDP. Đây là kiểu mặc định khi
+  gói đã cài.
+- ``windmouse``: WindMouse (Ben Land) tự cài, không cần gói ngoài.
+- ``bezier``: cung Bezier đơn giản tự cài.
+- ``hybrid``: trộn ngẫu nhiên bezier/windmouse.
 
-Module này giữ đúng tinh thần của windmouse/ghost-cursor:
-- đường đi có gia tốc, gió ngẫu nhiên và vòng cung (không phải đường thẳng tắp);
-- điểm cuối luôn trùng đúng tâm ô cần bấm (không lố);
-- giữ chuột một nhịp ngắn rồi nhả, mô phỏng thao tác tay;
-- chỉ dùng thư viện chuẩn, không thêm gói pip nào.
+Vì sao không dùng thẳng ``GhostCursor.click``: lớp đó gắn với ``Page`` của
+Puppeteer. Ở đây app mở Chrome bằng Selenium (ChromeDriver) và gửi sự kiện qua
+``Input.dispatchMouseEvent``, nên module này tái dùng phần sinh quỹ đạo và tự
+bấm — không cần thêm runtime Puppeteer.
+
+Mọi kiểu đều đảm bảo: điểm cuối trùng đúng tâm đích, chỉ gửi sự kiện vào đúng
+tab đang điều khiển (không bấm lạc sang cửa sổ khác như pyautogui).
 """
 
 import math
 import random
 import time
 
-STYLES = ("windmouse", "bezier", "hybrid")
+import ghost_mouse as GM
+
+STYLES = ("ghost", "windmouse", "bezier", "hybrid")
 MAX_POINTS = 64
+
+
+CURSOR_OVERLAY_JS = r"""
+(() => {
+  if (window.__bcrCursorInstalled) return;
+  window.__bcrCursorInstalled = true;
+  const install = () => {
+    const cursor = document.createElement('div');
+    cursor.id = '__bcr_ghost_cursor__';
+    cursor.setAttribute('aria-hidden', 'true');
+    cursor.style.cssText = 'position:fixed!important;left:0!important;top:0!important;'
+      + 'width:26px!important;height:34px!important;pointer-events:none!important;'
+      + 'z-index:2147483647!important;display:none;'
+      + 'filter:drop-shadow(0 2px 3px rgba(0,0,0,.3))!important;';
+    const shadow = cursor.attachShadow({mode: 'open'});
+    shadow.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="26" height="34" viewBox="0 0 26 34">'
+      + '<path d="M2 2 L2 26 L8 20 L13 31 L18 29 L13 18 L23 18 Z" '
+      + 'fill="#19b98e" stroke="white" stroke-width="2" stroke-linejoin="round"/></svg>';
+    document.documentElement.appendChild(cursor);
+    document.addEventListener('mousemove', event => {
+      cursor.style.display = 'block';
+      cursor.style.transform = `translate(${event.clientX - 2}px, ${event.clientY - 2}px)`;
+    }, {capture: true, passive: true});
+  };
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', install, {once: true});
+  } else {
+    install();
+  }
+})();
+"""
+# Lớp hiển thị con trỏ xanh trên trang — nguyên văn kịch bản trong mouse_demo.py
+# (C:\Users\Administrator\Desktop\mousse demo). Chỉ vẽ một lớp overlay theo
+# mousemove thật; không chiếm quyền chuột hệ điều hành, không đổi dữ liệu gửi đi.
+# Gọi install_cursor_overlay(command) một lần sau khi trang đã có DOM.
+
+
+def install_cursor_overlay(command):
+    """Cài con trỏ hiển thị vào tab hiện tại và mọi lần tải lại sau đó.
+
+    ``command`` là hàm gửi lệnh CDP (giống tham số của ``HumanMouse``).
+    Dùng ``Page.addScriptToEvaluateOnNewDocument`` để con trỏ còn hiển thị sau khi
+    trang điều hướng/tải lại, giống ``install_cursor()`` trong mouse_demo.py.
+    """
+    try:
+        command("Page.addScriptToEvaluateOnNewDocument", {"source": CURSOR_OVERLAY_JS})
+    except Exception:
+        pass
+    try:
+        command("Runtime.evaluate", {"expression": CURSOR_OVERLAY_JS})
+    except Exception:
+        pass
+
+
 
 
 def _finite(value):
@@ -113,9 +173,12 @@ def bezier_points(start, end, steps=28, rng=None):
 class HumanMouse:
     """Gửi chuỗi mouseMoved + mousePressed/mouseReleased qua một hàm command CDP."""
 
-    def __init__(self, command, style="windmouse", glide_seconds=0.55,
+    def __init__(self, command, style="ghost", glide_seconds=0.55,
                  enabled=True, rng=None):
         if style not in STYLES:
+            style = "ghost"
+        # Tự hạ cấp nếu gói ghost-cursor chưa cài.
+        if style == "ghost" and not GM.available():
             style = "windmouse"
         self._command = command
         self.style = style
@@ -124,6 +187,7 @@ class HumanMouse:
         self.rng = rng or random.Random()
         self.last = None
 
+
     def _begin(self, x, y):
         """Điểm xuất phát: lần bấm đầu lấy một vị trí hợp lý lệch lên trên/trái đích."""
         if self.last is not None:
@@ -131,7 +195,7 @@ class HumanMouse:
         return (max(2.0, x - self.rng.uniform(120.0, 520.0)),
                 max(2.0, y - self.rng.uniform(80.0, 320.0)))
 
-    def path(self, x, y):
+    def path(self, x, y, width=100.0):
         """Trả về danh sách điểm đã làm tròn 2 chữ số, luôn kết thúc đúng (x, y)."""
         if not (_finite(x) and _finite(y)):
             raise ValueError("toa_do_chuot_khong_hop_le")
@@ -139,7 +203,11 @@ class HumanMouse:
         style = self.style
         if style == "hybrid":
             style = "bezier" if self.rng.random() < 0.35 else "windmouse"
-        if style == "bezier":
+        if style == "ghost":
+            points = self._ghost_path(start, (x, y), width)
+            if points is None:                     # gói hỏng giữa phiên
+                points = windmouse_points(start, (x, y), rng=self.rng)
+        elif style == "bezier":
             points = bezier_points(start, (x, y), rng=self.rng)
         else:
             points = windmouse_points(start, (x, y), rng=self.rng)
@@ -150,13 +218,38 @@ class HumanMouse:
         cleaned[-1] = (round(float(x), 2), round(float(y), 2))
         return cleaned
 
+    def _ghost_path(self, start, end, width):
+        """Quỹ đạo ghost-cursor; chặng dài thì đi lố rồi hiệu chỉnh như tay người."""
+        goal = end
+        if GM.should_overshoot(start, end):
+            goal = GM.overshoot_point(end, rng=self.rng)
+        points = GM.ghost_path(start, goal, width=width, max_points=MAX_POINTS)
+        if points is None:
+            return None
+        if goal is not end:
+            # Hiệu chỉnh: từ điểm lố về đúng đích, đúng tinh thần ghost-cursor.
+            correction = GM.ghost_path(goal, end, width=max(20.0, width / 4),
+                                       max_points=MAX_POINTS)
+            if correction:
+                points = points + correction
+        return points
+
+
     def move_to(self, x, y):
-        """Lướt chuột tới đích theo đường cong, không bấm."""
-        points = self.path(x, y)
-        delay = max(0.004, min(0.025, self.glide_seconds / max(1, len(points))))
+        """Lướt chuột tới đích theo easing cosine, đúng nhịp move_mouse() trong demo.
+
+        Đường cong ghost-cursor cho vị trí; ``resample`` chia theo THỜI GIAN thực
+        (60 khung/giây, easing vào-chậm/ra-chậm) thay vì chia đều theo số điểm của
+        đường cong — chuyển động mượt bất kể đường cong có bao nhiêu điểm.
+        """
+        raw_points = self.path(x, y)
+        frames = max(2, round(self.glide_seconds * 60))
+        points = GM.resample(raw_points, frames)
+        delay = self.glide_seconds / max(1, len(points))
         for px, py in points:
-            self._command("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": px, "y": py})
-            time.sleep(delay * self.rng.uniform(0.7, 1.3))
+            self._command("Input.dispatchMouseEvent", {
+                "type": "mouseMoved", "x": round(px, 2), "y": round(py, 2)})
+            time.sleep(delay * self.rng.uniform(0.85, 1.15))
         self.last = (float(x), float(y))
         return points
 

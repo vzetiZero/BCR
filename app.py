@@ -12,6 +12,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import browser as BR
+import collector as CO
 import engine as E
 import lobby_stream as LS
 import method as ME
@@ -27,6 +28,22 @@ ENTRY_WAIT = 75
 # Vòng tự tìm bàn không có trần số lần: nghỉ CYCLE_RETRY_SECONDS giữa hai lượt quét.
 CYCLE_RETRY_SECONDS = 15
 CHIP_REFRESH = 3
+# Số dư đọc trực tiếp từ giao diện sàn (data-role="header-balance"), đúng đơn vị VN2.
+BALANCE_STALE = 90
+# Gate "chờ ván mới": sau khi chốt kế hoạch, chờ tối đa BET_GATE_TIMEOUT giây để bàn
+# dọn hết chip (cả 3 cửa về 0) rồi mới tự bấm — tránh bấm chồng lên ván cũ còn
+# đang hiển thị/gom chip. BET_GATE_POLL là nhịp đọc lại trong lúc chờ.
+BET_GATE_TIMEOUT = 20.0
+BET_GATE_POLL = 0.6
+# Vào bàn từ sảnh mất vài giây tải trang, khay chip/ô cược chưa kịp hiện nên lượt bấm
+# đầu thường hỏng. Tay chưa đặt được chip thật thì không được tính (xem
+# LiveSimulation.mark_placed), nhưng bỏ quá nhiều tay liên tiếp nghĩa là bàn đang đặt
+# không được chút nào — dừng để người dùng nhìn thấy thay vì bỏ tay mãi.
+PLACE_SKIP_LIMIT = 3
+# Trần thời gian một lượt bấm chip còn được coi là "đang chạy" (gate chờ ván mới 20s +
+# vài giây bấm/đọc chip). Quá hạn mà chưa có xác nhận thì coi như không đặt được — nhờ
+# vậy thread chết giữa chừng không khiến việc tính tay bị treo vĩnh viễn.
+PLACE_CONFIRM_TIMEOUT = 60.0
 BG, PANEL, NAV = "#f3f6fa", "#ffffff", "#111e32"
 TEXT, MUTED, LINE = "#172b45", "#718198", "#e5ebf2"
 ACCENT, PALE = "#087f78", "#e8f5f2"
@@ -101,10 +118,12 @@ def row_problem(row, now=None, check_fresh=True):
 
 
 class LiveSimulation:
-    def __init__(self, book=None, profile=ME.DEFAULT_PROFILE, ladder=None):
+    def __init__(self, book=None, profile=ME.DEFAULT_PROFILE, ladder=None,
+                 min_hands=ME.MIN_HANDS, max_hands=ME.MAX_HANDS):
         self.money = book or M.MoneyBook()
         self.profile = profile
         self.ladder = ME.ladder_stakes(profile, ladder)
+        self.min_hands, self.max_hands = ME.normalize_hand_range(min_hands, max_hands)
         self.results = []
         self.log = []
         self.method_state = fresh_method()
@@ -115,6 +134,7 @@ class LiveSimulation:
         self.pending = None
         self.note = "Chọn bàn để theo dõi."
         self.block_hands = 0
+        self.place_skips = 0
         self.cycle_done = False
         self.on_arm = None
 
@@ -130,7 +150,13 @@ class LiveSimulation:
     def plan(self):
         s = self.method_state
         return ME.plan(self.results, self.ladder, s["ladder_step"], s["hands_in_block"],
-                       s["started"], s["strong"], self.profile)
+                       s["started"], s["strong"], self.profile,
+                       self.min_hands, self.max_hands)
+
+    def set_hand_range(self, min_hands, max_hands):
+        """Đổi khoảng tay đã đi dùng để lọc bàn; kẹp trong biên hợp lệ của method."""
+        self.min_hands, self.max_hands = ME.normalize_hand_range(min_hands, max_hands)
+        return self.min_hands, self.max_hands
 
     def bind(self, row):
         self.pause()
@@ -139,6 +165,7 @@ class LiveSimulation:
         self.results = list(self.letters)
         self.method_state = fresh_method()
         self.block_hands = 0
+        self.place_skips = 0
         self.note = "Đã chọn bàn."
 
     def start(self, row, verified=False, now=None):
@@ -192,10 +219,62 @@ class LiveSimulation:
             self.pause("Vốn không đủ cho bậc tiếp theo. Không tự giảm tiền cược.")
             return
         self.pending = dict(plan, armed_at=time.time(), baseline=self.letters)
-        self.note = "Chờ %s · %s đ · ván kế tiếp." % (
+        self.note = "Chờ %s · %s VN2 · ván kế tiếp." % (
             E.SIDE_NAME[plan["side"]], M.fmt_money(plan["stake"]))
         if self.on_arm is not None:
-            self.on_arm(plan)
+            # Truyền đúng object đang nằm ở self.pending để lượt bấm chip sau đó ghi kết
+            # quả vào chính kế hoạch này; kết quả về muộn không gán nhầm cho tay mới.
+            self.on_arm(self.pending)
+
+    def mark_placing(self, plan=None):
+        """App báo: kế hoạch đang được bấm chip THẬT trên bàn. Từ lúc này, tay mới chỉ
+        được tính khi có xác nhận đặt thành công qua ``mark_placed``."""
+        plan = self.pending if plan is None else plan
+        if plan is not None:
+            plan["placed"] = "pending"
+            plan["placing_at"] = time.time()
+
+    def mark_placed(self, ok, note="", plan=None):
+        """Ghi kết quả một lượt bấm chip vào kế hoạch đã sinh ra lượt đó.
+
+        ``plan`` là chính dict mà ``_arm`` đưa cho hook; chỉ nhận khi nó vẫn là kế hoạch
+        đang chờ (``self.pending``) và còn ở "pending". Thread đặt chip chạy song song
+        với vòng đọc cầu nên kết quả của lượt cũ có thể về sau khi đã chốt kế hoạch mới;
+        gán nhầm là một tay chưa bấm sẽ mang tiếng đã bấm.
+        """
+        target = self.pending if plan is None else plan
+        if target is None or target is not self.pending or target.get("placed") != "pending":
+            return False
+        target["placed"] = "ok" if ok else "failed"
+        target["place_note"] = note
+        target["confirmed_at"] = time.time()
+        return True
+
+    def _skip_unplaced_hand(self, letters, plan):
+        """Tay có chữ mới nhưng chưa đặt được chip: chỉ ăn chữ vào cầu đang theo dõi.
+
+        Không đụng vốn, không đổi bậc cược, không tăng ``block_hands`` — phương pháp chỉ
+        tiến khi có cược thật. Kế hoạch cho tay kế tiếp được chốt lại trên cùng bậc.
+        """
+        reason = plan.get("place_note") or "không xác nhận được lượt đặt chip."
+        self.letters = letters
+        self.results = list(letters)
+        self.place_skips += 1
+        self.log.append(dict(time=time.time(), armed_at=plan.get("armed_at"), table=self.table_name,
+                             hand=len(letters), result=letters[-1], bet=plan["side"], stake=0,
+                             delta=0.0, outcome="not_placed", balance_after=self.money.balance,
+                             block_pos=plan.get("block_pos"), ladder=plan.get("ladder_step"),
+                             source="chip-not-placed"))
+        if self.place_skips >= PLACE_SKIP_LIMIT:
+            self.pause("Đã bỏ %d tay liên tiếp vì không đặt được chip thật (%s). Dừng lại để "
+                       "kiểm tra khay chip và ô cược trên bàn." % (self.place_skips, reason))
+            return False
+        self._arm()
+        # _arm() đã ghi note của kế hoạch mới; ghi tiếp lý do bỏ tay để người dùng nhìn
+        # thấy ngay tay này đã bị trượt và bàn đang chờ lượt bấm chip kế tiếp.
+        self.note = "Tay %d không được tính vì chưa đặt được chip (%s). %s" % (
+            len(letters), reason, self.note)
+        return False
 
     def process(self, row, now=None):
         if not self.running:
@@ -230,6 +309,30 @@ class LiveSimulation:
         if not plan or plan["baseline"] != self.letters:
             self.pause("Không có kế hoạch được chốt trước kết quả. Hãy xác nhận lại bàn.")
             return False
+        # Vào bàn từ sảnh phải chờ trang tải, khay chip chưa kịp hiện nên lượt bấm đầu
+        # hay trượt. Chưa có xác nhận đặt chip thật thì chưa được tính tay.
+        if plan.get("placed") == "pending":
+            if current_time - (plan.get("placing_at") or current_time) > PLACE_CONFIRM_TIMEOUT:
+                plan["placed"] = "failed"
+                plan["place_note"] = ("không có xác nhận đặt chip sau %d giây (lượt bấm có thể "
+                                      "đã chết giữa chừng)." % int(PLACE_CONFIRM_TIMEOUT))
+            else:
+                # Chữ mới đã về mà chip chưa được xác nhận: giữ tay này lại, chờ nhịp poll
+                # kế tiếp (xác nhận về, hoặc hết hạn ở nhánh trên).
+                plan["result_before_confirm"] = True
+                self.note = "Chờ xác nhận đã đặt chip thật xong rồi mới tính tay này."
+                return False
+        if plan.get("placed") == "failed":
+            return self._skip_unplaced_hand(letters, plan)
+        if plan.get("result_before_confirm"):
+            # Kết quả về TRƯỚC khi lượt bấm được xác nhận nên không thể biết chip vừa bấm
+            # là của tay này hay tay kế tiếp. Không tính, và dừng lại vì bàn đang có chip
+            # thật mà sổ giả lập không theo dõi.
+            self.pause("Kết quả tay này về trước khi app xác nhận đặt chip xong nên không được "
+                       "tính. Chip vừa bấm có thể nằm ở tay kế tiếp — hãy đối chiếu chip trên "
+                       "bàn rồi bấm Bắt đầu lại.")
+            return False
+        self.place_skips = 0
         result = letters[-1]
         settled = self.money.settle(plan["side"], result, plan["stake"], E.PAYOUT)
         self.method_state, _ = ME.advance(self.method_state, result, plan["side"], plan["stake"],
@@ -252,6 +355,53 @@ class LiveSimulation:
         else:
             self._arm()
         return True
+
+
+def ext_ready(host):
+    """True nếu đang ở chế độ extension VÀ extension còn sống trên cổng 8777.
+
+    Người dùng chọn chế độ qua checkbox ``ext_mode_var`` ("Dùng extension trên
+    Chrome thật"). Thiếu kiểm tra này thì chỉ cần MỘT Chrome bất kỳ (còn mở từ
+    trước, máy khác, cửa sổ nền...) có cài extension BCR và còn ping được cổng
+    8777 là mọi luồng (quét sảnh, mở bàn, đặt chip) lặng lẽ rẽ sang nhánh đọc
+    ``collector_store`` — rỗng khi người dùng thực ra đang dùng nút "Mở Chrome"
+    (driver-mode/CDP) — khiến HumanMouse không được gọi và sweep luôn trả về
+    bàn rỗng dù sảnh đã mở đúng qua chromedriver.
+    An toàn với host rút gọn trong test: thiếu ``ext_mode_var`` thì chỉ xét store.
+    """
+    httpd = getattr(host, "collector_httpd", None)
+    store = getattr(host, "collector_store", None)
+    if httpd is None or store is None:
+        return False
+    ext_mode_var = getattr(host, "ext_mode_var", None)
+    if ext_mode_var is not None:
+        try:
+            if not ext_mode_var.get():
+                return False
+        except Exception:
+            pass
+    try:
+        return bool(store.extension_alive())
+    except Exception:
+        return False
+
+
+def table_is_clear(live):
+    """True nếu đọc chip cho biết cả 3 cửa (B/P/T) đang trống — suy luận "ván mới".
+
+    Không có timer đặt cược thật để đọc (DOM Evolution chưa khảo sát phần này), nên
+    dùng tín hiệu gián tiếp: ván trước kết thúc thì bàn gom hết chip về 0 trước khi
+    mở cửa đặt cược ván kế tiếp. ``live`` chưa đọc được (``ok`` False/thiếu) thì
+    không coi là "trống" — phải chờ đọc được rồi mới tự bấm.
+    """
+    if not isinstance(live, dict) or not live.get("ok"):
+        return False
+    spots = live.get("spots") or {}
+    for side in ("B", "P", "T"):
+        entry = spots.get(side) or {}
+        if float(entry.get("amount") or entry.get("amount_vnd") or 0) > 0:
+            return False
+    return True
 
 
 class BCRApp:
@@ -283,6 +433,13 @@ class BCRApp:
         self.chip_busy = False
         self.place_busy = False
         self.stream = LS.LobbyStream(self.browser)
+        # Server nhận cầu từ extension trên profile Chrome thật (127.0.0.1:8777).
+        # Đây là đường đọc không cần driver, đúng hướng dùng profile thật của người dùng.
+        self.collector_store = CO.TableStore()
+        self.collector_httpd = None
+        self.collector_note = "Chưa mở cổng 8777."
+        self.collector_seen = 0
+        self._start_collector()
         self.sweep_note_text = "Quét sảnh để tìm bàn đạt 3 điều kiện."
         self.next_scan = 0
         self.poll_id = None
@@ -293,6 +450,10 @@ class BCRApp:
         # đường đọc (WebSocket sảnh, bấm ô bàn) chạy được mà người dùng không phải
         # giữ hay gắn cửa sổ Chrome nào khác.
         self.cdp_var = tk.BooleanVar(value=True)
+        # Chế độ extension: KHÔNG mở Chrome bằng chromedriver nữa, đọc/điều khiển qua
+        # extension trên chính Chrome/profile thật đang đăng nhập.
+        self.ext_mode_var = tk.BooleanVar(value=False)
+        self.start_url_var = tk.StringVar(value=BR.START_URL)
         self.auto_cycle_var = tk.BooleanVar(value=True)
         self.auto_hunt_var = tk.BooleanVar(value=True)
         self.favorites_only = tk.BooleanVar(value=True)
@@ -301,6 +462,8 @@ class BCRApp:
         self.auto_recover_var = tk.BooleanVar(value=True)
         self.ladder_mode_var = tk.StringVar(value="manual")
         self.ladder_base_var = tk.StringVar(value=M.fmt_input_money(ME.DEFAULT_LADDER[ME.DEFAULT_PROFILE][0]))
+        self.hands_min_var = tk.StringVar(value=str(ME.MIN_HANDS))
+        self.hands_max_var = tk.StringVar(value=str(ME.MAX_HANDS))
         self._last_sweep_favorites = False
         self.chrome_fullscreen_var = tk.BooleanVar(value=BR.WIN_FULLSCREEN)
         self.chrome_w_var = tk.StringVar(value=str(BR.WIN_W))
@@ -325,6 +488,126 @@ class BCRApp:
         self.poll_id = root.after(500, self.poll)
         if auto_connect and self.chrome_startup_var.get():
             root.after(700, self.start_browser)
+
+    def _start_collector(self):
+        """Mở server nhận báo cáo cầu từ extension (127.0.0.1:8777).
+
+        Extension trên profile Chrome thật POST /report về đây; app đọc kho dữ liệu này
+        trong poll() và trộn vào bảng bàn. Nếu cổng bận (app khác đang chạy) thì báo rõ
+        chứ không làm hỏng khởi động.
+        """
+        try:
+            httpd, _thread = CO.start_server(self.collector_store)
+        except OSError as exc:
+            self.collector_note = ("Cổng 8777 đang bận (%s). Đóng bản BCR khác rồi mở lại "
+                                   "để extension gửi được cầu." % type(exc).__name__)
+            return False
+        self.collector_httpd = httpd
+        self.collector_note = "Đang nghe extension ở 127.0.0.1:8777."
+        return True
+
+    def _stop_collector(self):
+        if self.collector_httpd is not None:
+            try:
+                self.collector_httpd.shutdown()
+                self.collector_httpd.server_close()
+            except Exception:
+                pass
+            self.collector_httpd = None
+
+    def _pump_collector(self):
+        """Chuyển cầu mới nhận từ extension vào bảng bàn của app (gọi trong poll)."""
+        if self.collector_httpd is None:
+            return
+        snap = self.collector_store.snapshot()
+        if snap.get("received", 0) == self.collector_seen:
+            return
+        self.collector_seen = snap.get("received", 0)
+        reports = []
+        for row in snap.get("rows") or []:
+            if not row.get("letters"):
+                continue
+            reports.append({"tables": [{
+                "label": row.get("label") or row.get("code") or "ban",
+                "letters": row.get("letters", ""),
+                "table_id": row.get("page_table_id") or "",
+                "source": "extension",
+            }], "page": {}, "diag": {}})
+        if not reports:
+            return
+        self._ingest_reports(reports, time.time())
+        if self.collector_note != "Đang nghe extension ở 127.0.0.1:8777.":
+            self.collector_note = "Đang nghe extension ở 127.0.0.1:8777."
+        if hasattr(self, "connection_text") and not self.browser.connected:
+            self.connection_text = "Đang đọc cầu qua extension (%d báo cáo)." % self.collector_seen
+
+    def _live_balance_money(self):
+        """Số dư thật đọc từ giao diện sàn (đúng đơn vị VN2 hiển thị), hoặc None.
+
+        Extension gửi nguyên con số người dùng thấy trên web (vd 3014.74 VN2), nên app
+        dùng thẳng, không nhân quy đổi — UI và sàn luôn khớp nhau.
+        """
+        if self.collector_httpd is None:
+            return None
+        snap = self.collector_store.balance_snapshot()
+        if not snap:
+            return None
+        if snap.get("age", 0) > BALANCE_STALE:
+            return None
+        return round(float(snap["balance"]), 2)
+
+    def _balance_label_text(self):
+        if self.collector_httpd is None:
+            return self.collector_note
+        snap = self.collector_store.balance_snapshot()
+        if not snap:
+            return "Chưa nhận được số dư thật. Mở/đăng nhập trang cổng trong Chrome thật."
+        if snap.get("age", 0) > BALANCE_STALE:
+            return "Số dư thật cũ %ds. Mở lại tab trang gốc để cập nhật." % int(snap["age"])
+        value = float(snap["balance"])
+        who = (" của " + snap["name"]) if snap.get("name") else ""
+        return "Số dư thật%s: %s %s · cập nhật %ds trước." % (
+            who, M.fmt_money(value) if value == int(value) else "%.2f" % value,
+            snap.get("currency") or "", int(snap.get("age", 0)))
+
+    def _account_label_text(self):
+        """Chữ hiển thị tài khoản thật ở header: tên + VIP (nếu extension đã gửi)."""
+        if self.collector_httpd is None:
+            return ""
+        snap = self.collector_store.balance_snapshot()
+        if not snap:
+            return ""
+        name = (snap.get("name") or "").strip()
+        if not name:
+            return ""
+        parts = [name]
+        if snap.get("vip"):
+            parts.append(snap["vip"])
+        if snap.get("player"):
+            parts.append("ID " + snap["player"])
+        return "  ·  ".join(parts)
+
+    def sync_real_balance(self):
+        """Đồng bộ số dư thật từ web vào vốn của phiên (chỉ khi phiên chưa có tay nào)."""
+        if self.collector_httpd is None:
+            messagebox.showerror("Chưa nghe extension", self.collector_note, parent=self.root)
+            return
+        value = self._live_balance_money()
+        if value is None:
+            messagebox.showinfo(
+                "Chưa có số dư thật",
+                "Chưa nhận được số dư từ extension.\n\nHãy mở trang cổng trong Chrome thật (profile "
+                "bạn vẫn dùng để đăng nhập), đảm bảo extension BCR đã bật, rồi thử lại.",
+                parent=self.root)
+            return
+        ok, note = self.sim.money.sync_capital(value)
+        if not ok:
+            messagebox.showwarning("Không đồng bộ được", note, parent=self.root)
+            return
+        self.entries["capital"].set(M.fmt_input_money(value))
+        self._save_state()
+        self.refresh()
+        messagebox.showinfo("Đã đồng bộ vốn", note, parent=self.root)
 
     def _label(self, parent, text="", size=10, color=TEXT, bold=False, **kw):
         return tk.Label(parent, text=text, bg=parent.cget("bg"), fg=color,
@@ -373,6 +656,8 @@ class BCRApp:
         header.pack(fill="x", pady=(0, 12))
         self.page_title = self._label(header, "Tổng quan trực tiếp", 22, bold=True)
         self.page_title.pack(side="left")
+        self.account_label = self._label(header, "", 10, MUTED, True)
+        self.account_label.pack(side="left", padx=(14, 0))
         self._label(header, " DỮ LIỆU TRỰC TIẾP  /  VỐN ", 9, ACCENT, True).pack(side="right")
         self.hunt_banner = tk.Frame(main, bg=PALE, highlightbackground=ACCENT, highlightthickness=1)
         self.hunt_spinner = self._label(self.hunt_banner, "●", 13, ACCENT, True)
@@ -387,6 +672,15 @@ class BCRApp:
         self.hunt_banner.pack(fill="x", pady=(0, 12), before=connect)
         self.hunt_banner.pack_forget()
         self._hunt_anchor = connect
+        url_row = tk.Frame(connect, bg=PANEL)
+        url_row.pack(fill="x", padx=14, pady=(8, 0))
+        self._label(url_row, "Link mở đầu", 9, MUTED).pack(side="left", padx=(0, 8))
+        url_entry = tk.Entry(url_row, textvariable=self.start_url_var, font=("Segoe UI", 10),
+                             relief="solid", bd=1)
+        url_entry.pack(side="left", fill="x", expand=True, ipady=4)
+        url_entry.bind("<FocusOut>", lambda _e: self._save_state())
+        self._label(url_row, "· bất kỳ trang HTTPS nào; app tự tìm bảng cầu", 9, MUTED).pack(
+            side="left", padx=(8, 0))
         row = tk.Frame(connect, bg=PANEL)
         row.pack(fill="x", padx=14, pady=(10, 2))
         self.connection_label = self._label(
@@ -413,13 +707,12 @@ class BCRApp:
                        command=self._save_state, bg=PANEL, fg=TEXT, selectcolor=PALE,
                        activebackground=PANEL, activeforeground=ACCENT,
                        font=("Segoe UI", 9)).pack(side="left", padx=(6, 2))
-        self.sweep_note = self._label(sweep_row, "Bạn tự vào %s → EVO → Baccarat trong cửa sổ Chrome, rồi bấm "
-                                                 "“Nhận tab sảnh” để app ghép tab đó. Bấm “Quét toàn sảnh” để lấy "
+        self.sweep_note = self._label(sweep_row, "Bạn tự mở trang cổng → EVO → Baccarat trong cửa sổ Chrome, rồi "
+                                                 "bấm “Nhận tab sảnh” để app ghép tab đó. Bấm “Quét toàn sảnh” để lấy "
                                                  "lịch sử, đối chiếu hai nguồn, mở bàn đạt 3 điều kiện và theo dõi "
                                                  "từ ván kế tiếp. “Chỉ bàn Ưa thích” bật mặc định: app bấm ô Ưa "
                                                  "thích của sảnh và chỉ quét các bàn đã thích. App không đổi link "
-                                                 "phiên EVO. Đủ tay của khối là tự về sảnh tìm bàn mới." %
-                                                      BR.PORTAL_HOST,
+                                                 "phiên EVO. Đủ tay của khối là tự về sảnh tìm bàn mới.",
                                       9, MUTED, anchor="w", justify="left", wraplength=640)
         self.sweep_note.pack(side="left", fill="x", expand=True, padx=10)
         self.step_label = self._label(main, "", 9, MUTED, anchor="w")
@@ -586,7 +879,7 @@ class BCRApp:
         grid.pack(fill="x", padx=20, pady=18)
         self.entries = {}
         self.money_inputs = []
-        fields = (("capital", "Vốn ban đầu (đ)"),
+        fields = (("capital", "Vốn ban đầu (VN2)"),
                   ("take_profit_pct", "Chốt lời (% vốn)"))
         for i, (key, title) in enumerate(fields):
             r, c = divmod(i, 2)
@@ -603,6 +896,11 @@ class BCRApp:
             if is_money:
                 self._bind_money_input(entry, var)
             self.entries[key] = var
+        balance_row = tk.Frame(card, bg=PANEL)
+        balance_row.pack(fill="x", padx=20, pady=(0, 12))
+        self.balance_note = self._label(balance_row, "", 9, MUTED, justify="left")
+        self.balance_note.pack(side="left", anchor="w")
+        self._button(balance_row, "Đồng bộ vốn thật", self.sync_real_balance).pack(side="right")
         method = tk.Frame(card, bg=PANEL)
         method.pack(fill="x", padx=20, pady=(4, 0))
         self._label(method, "Phương pháp vào cầu", 13, bold=True).pack(anchor="w")
@@ -622,7 +920,7 @@ class BCRApp:
                            selectcolor=PALE, activebackground=PANEL, font=("Segoe UI", 10)).pack(anchor="w")
         self.ladder_base_row = tk.Frame(method, bg=PANEL)
         self.ladder_base_row.pack(fill="x", pady=(6, 0))
-        self._label(self.ladder_base_row, "Bậc 1 (đ)", 10, MUTED).pack(side="left", padx=(0, 8))
+        self._label(self.ladder_base_row, "Bậc 1 (VN2)", 10, MUTED).pack(side="left", padx=(0, 8))
         self.ladder_base_entry = tk.Entry(self.ladder_base_row, textvariable=self.ladder_base_var,
                                           width=14, font=("Segoe UI", 11), relief="solid", bd=1)
         self.ladder_base_entry.pack(side="left", ipady=4)
@@ -636,6 +934,21 @@ class BCRApp:
                             "Tự config: mỗi ô là một tay trong khối, điền số tiền tùy ý.\n"
                             "Tự nhân: chỉ điền bậc 1, app điền các bậc sau theo hệ số cố định.",
                     9, MUTED, justify="left").pack(anchor="w", pady=(6, 0))
+        hands_row = tk.Frame(method, bg=PANEL)
+        hands_row.pack(fill="x", pady=(12, 0))
+        self._label(hands_row, "Bộ lọc cầu · số tay đã đi", 13, bold=True).pack(anchor="w")
+        hand_inputs = tk.Frame(hands_row, bg=PANEL)
+        hand_inputs.pack(anchor="w", pady=(6, 0))
+        self._label(hand_inputs, "Từ", 10, MUTED).pack(side="left", padx=(0, 6))
+        tk.Entry(hand_inputs, textvariable=self.hands_min_var, width=5, font=("Segoe UI", 11),
+                 relief="solid", bd=1).pack(side="left", ipady=4)
+        self._label(hand_inputs, "đến", 10, MUTED).pack(side="left", padx=(10, 6))
+        tk.Entry(hand_inputs, textvariable=self.hands_max_var, width=5, font=("Segoe UI", 11),
+                 relief="solid", bd=1).pack(side="left", ipady=4)
+        self._label(hand_inputs, "tay (10–50)", 9, MUTED).pack(side="left", padx=(10, 0))
+        self._button(hand_inputs, "Lưu bộ lọc", self.apply_hand_range).pack(side="left", padx=(12, 0))
+        self.hands_note = self._label(hands_row, "", 9, MUTED, justify="left")
+        self.hands_note.pack(anchor="w", pady=(6, 0))
         self._button(card, "Lưu phiên cũ & áp dụng phương pháp mới", self.apply_settings, True).pack(anchor="w", padx=20, pady=(14, 0))
         cycle = tk.Frame(card, bg=PANEL)
         cycle.pack(fill="x", padx=20, pady=(18, 0))
@@ -665,6 +978,10 @@ class BCRApp:
         self._label(display, "Cửa sổ 1200 × 900 · mặc định 80% · áp dụng khi mở lại ứng dụng.",
                     9, MUTED).pack(anchor="w", pady=(6, 0))
         self._label(card, "Kết nối Chrome", 13, bold=True).pack(anchor="w", padx=20, pady=(24, 8))
+        tk.Checkbutton(card, text="Dùng extension trên Chrome thật để đọc/điều khiển (không mở chromedriver)",
+                       variable=self.ext_mode_var, command=self._on_ext_mode_change, bg=PANEL,
+                       fg=TEXT, selectcolor=PALE, activebackground=PANEL,
+                       font=("Segoe UI", 10)).pack(anchor="w", padx=16)
         for var, text in ((self.chrome_startup_var, "Tự mở Chrome khi khởi động ứng dụng"),
                           (self.cdp_var, "Chrome app mở có cổng 9222 (mặc định bật, để quét cả sảnh)")):
             tk.Checkbutton(card, text=text, variable=var, command=self._save_state, bg=PANEL,
@@ -705,12 +1022,12 @@ class BCRApp:
         chips = tk.Frame(card, bg=PANEL)
         chips.pack(fill="x", padx=20, pady=(8, 0))
         self._label(chips, "Chip trên bàn", 13, bold=True).pack(anchor="w")
-        self._label(chips, "Số in trên chip là đơn vị hiển thị. Chip “20” = %s đ khi đơn vị là 1.000. "
-                            "App đọc mệnh giá thật của khay để gợi ý cần bấm chip nào." %
-                   M.fmt_money(TB.DEFAULT_CHIP_UNIT), 9, MUTED, justify="left").pack(anchor="w")
+        self._label(chips, "Số in trên chip chính là số tiền theo đơn vị VN2 của sàn: chip “100” = 100, "
+                           "chip “20” = 20. App đọc mệnh giá thật của khay để gợi ý cần bấm chip nào.",
+                   9, MUTED, justify="left").pack(anchor="w")
         unit_row = tk.Frame(chips, bg=PANEL)
         unit_row.pack(anchor="w", pady=(8, 0))
-        self._label(unit_row, "1 đơn vị chip = (đ)", 10, MUTED).pack(side="left", padx=(0, 8))
+        self._label(unit_row, "1 đơn vị chip = (VN2)", 10, MUTED).pack(side="left", padx=(0, 8))
         tk.Entry(unit_row, textvariable=self.chip_unit_var, width=9,
                  font=("Segoe UI", 11), relief="solid", bd=1).pack(side="left", ipady=4)
         self._button(unit_row, "Lưu đơn vị chip", self.apply_chip_unit).pack(side="left", padx=8)
@@ -770,7 +1087,7 @@ class BCRApp:
         for i, text in enumerate(raw):
             field = tk.Frame(self.ladder_frame, bg=PANEL)
             field.grid(row=i // 3, column=i % 3, padx=(0, 12), pady=(0, 8))
-            self._label(field, "Tay %d · bậc %d (đ)" % (i + 1, i + 1), 9, MUTED).pack(anchor="w")
+            self._label(field, "Tay %d · bậc %d (VN2)" % (i + 1, i + 1), 9, MUTED).pack(anchor="w")
             var = tk.StringVar(value=text)
             entry = tk.Entry(field, textvariable=var, width=13, font=("Segoe UI", 11),
                              relief="solid", bd=1)
@@ -846,14 +1163,16 @@ class BCRApp:
             self.cycle_check.config(text="Đủ %d tay là tự rời bàn, quét sảnh tìm bàn mới" % hands)
             self.cycle_rule.config(
                 text="Mỗi bàn chỉ đi một khối %s: %d tay bên mạnh + %d tay bên đổi. Hết %d tay, app đưa tab về "
-                     "danh sách bàn Baccarat, quét lại sảnh và mở một bàn đạt 3 điều kiện khác. Chưa tìm được bàn "
-                     "thì app tự lặp lại toàn bộ quy trình sau %d giây, không giới hạn số lượt, chỉ dừng khi vào "
-                     "được bàn." % (profile, strong, hands - strong, hands, CYCLE_RETRY_SECONDS))
+                     "danh sách bàn Baccarat, quét lại sảnh và mở một bàn đạt 3 điều kiện khác (cầu đã đi "
+                     "%d–%d tay). Chưa tìm được bàn thì app tự lặp lại toàn bộ quy trình sau %d giây, không "
+                     "giới hạn số lượt, chỉ dừng khi vào được bàn." % (
+                         profile, strong, hands - strong, hands, self.sim.min_hands, self.sim.max_hands,
+                         CYCLE_RETRY_SECONDS))
         if hasattr(self, "step_label"):
             self.step_label.config(text=(
-                "01  Đăng nhập %s     /     02  Tự vào sảnh Baccarat rồi bấm “Nhận tab sảnh”     /     "
+                "01  Đăng nhập trang cổng     /     02  Tự vào sảnh Baccarat rồi bấm “Nhận tab sảnh”     /     "
                 "03  Quét sảnh     /     04  Đối chiếu kết quả     /     05  Đủ %d tay (%s) · tự đổi bàn" % (
-                    BR.PORTAL_HOST, hands, profile)))
+                    hands, profile)))
 
     def _scroll_page(self, event):
         canvas = self.page_scrolls.get(self.current_page)
@@ -924,8 +1243,38 @@ class BCRApp:
         self.chip_read_at = 0.0
         self._update_chip_status()
         messagebox.showinfo("Đã lưu đơn vị chip",
-                            "1 đơn vị chip = %s đ. Chip “20” tương ứng %s đ." % (
+                            "1 đơn vị chip = %s VN2. Chip “20” tương ứng %s VN2." % (
                                 M.fmt_money(unit), M.fmt_money(unit * 20)), parent=self.root)
+
+    def apply_hand_range(self):
+        """Lưu khoảng tay đã đi dùng để lọc bàn (10–50 tay)."""
+        try:
+            low = int(self.hands_min_var.get().strip())
+            high = int(self.hands_max_var.get().strip())
+        except (ValueError, TypeError):
+            messagebox.showerror("Bộ lọc cầu chưa hợp lệ",
+                                 "Nhập số tay đã đi tối thiểu và tối đa, ví dụ 10 và 50.",
+                                 parent=self.root)
+            return
+        low, high = ME.normalize_hand_range(low, high)
+        self.hands_min_var.set(str(low))
+        self.hands_max_var.set(str(high))
+        self.apply_settings()  # áp dụng lại để LiveSimulation nhận khoảng mới
+        self._save_state()
+        if hasattr(self, "hands_note"):
+            self.hands_note.config(
+                text="Đang lọc bàn đã đi %d–%d tay." % (low, high), fg=GREEN)
+        self.refresh()
+
+    def _on_ext_mode_change(self):
+        """Bật chế độ extension thì app đọc/điều khiển qua extension, không mở driver."""
+        if self.ext_mode_var.get():
+            self.connection_text = ("Chế độ extension: mở Chrome, đăng nhập cổng, bật extension BCR. "
+                                    "App không tự mở Chrome ở chế độ này.")
+        else:
+            self.connection_text = "Chế độ driver: bấm “Mở Chrome” để app mở Chrome và profile riêng."
+        self._save_state()
+        self.refresh()
 
     def apply_mouse_setting(self):
         """Bật/tắt chuột người thật ngay cho lượt bấm sảnh kế tiếp."""
@@ -935,6 +1284,16 @@ class BCRApp:
                                 if enabled else "Đã tắt chuột người thật; dùng cú bấm 3 sự kiện như cũ.")
         self._save_state()
         self.refresh()
+
+    def _start_url(self):
+        """URL mở đầu do người dùng nhập; sai/không hợp lệ thì về mặc định."""
+        try:
+            url = self.start_url_var.get().strip()
+        except AttributeError:
+            return BR.START_URL
+        if url and BR.valid_site_url(url):
+            return url
+        return BR.START_URL
 
     def start_browser(self):
         if self.chrome_busy or self.exit_requested:
@@ -954,7 +1313,7 @@ class BCRApp:
                     self.events.put(("open_error", self.browser.note))
                     return
                 if not attached and not self.browser.alive() and not self.browser.start(
-                        BR.START_URL, pos=pos, cdp=cdp, window=window):
+                        self._start_url(), pos=pos, cdp=cdp, window=window):
                     self.events.put(("open_error", self.browser.last_error))
                     return
                 size_note = self.browser.resize_window(window, pos=pos)[1]
@@ -1001,8 +1360,67 @@ class BCRApp:
         except Exception:
             return False
 
+    # ---------- chế độ extension trên Chrome thật ----------
+    def _ext_ready(self):
+        """Extension đã kết nối cổng 8777 và còn sống trong ~20 giây gần nhất."""
+        return ext_ready(self)
+
+    def _ext_command(self, name, args=None, timeout=25.0):
+        """Gửi lệnh cho extension qua 8777 rồi chờ kết quả. Chỉ dùng ở thread nền."""
+        if self.collector_httpd is None:
+            return {"ok": False, "reason": "collector_off"}
+        cmd_id = self.collector_store.push_command(name, args, ttl=timeout + 5)
+        if cmd_id is None:
+            return {"ok": False, "reason": "command_not_allowed"}
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.exit_requested:
+                return {"ok": False, "reason": "app_closing"}
+            result = self.collector_store.get_result(cmd_id)
+            if result is not None:
+                return result if isinstance(result, dict) else {"ok": False}
+            time.sleep(0.25)
+        return {"ok": False, "reason": "timeout"}
+
+    def _ext_tables_as_rows(self):
+        """Bảng bàn do extension gửi, đổi sang cùng dạng row mà app đang dùng."""
+        rows = []
+        snap = self.collector_store.snapshot()
+        for item in snap.get("rows") or []:
+            letters = item.get("letters") or ""
+            if not letters:
+                continue
+            rows.append({
+                "key": "ext:" + (item.get("label") or item.get("code") or ""),
+                "label": item.get("label") or item.get("code") or "ban",
+                "letters": letters,
+                "table_id": item.get("page_table_id") or "",
+                "ts": item.get("ts") or time.time(),
+                "stable": 2,
+                "conflict": bool(item.get("conflict")),
+                "source": "extension",
+            })
+        return rows
+
     def enter_lobby(self):
         if self.chrome_busy or self.sweep_busy or self.exit_requested:
+            return
+        # Chế độ extension: chỉ cần extension sống; cầu đã tự về qua cổng 8777.
+        if ext_ready(self):
+            self.sweep_busy = True
+            self.session_lost = False
+            self.recover_attempts = 0
+            self.sweep_note_text = "Đang nhận cầu từ extension trên Chrome thật…"
+            self.refresh()
+
+            def ext_work():
+                try:
+                    rows = self._ext_tables_as_rows()
+                    self.events.put(("sweep", (rows, "", {"source": "extension"}, time.time())))
+                except Exception as exc:
+                    self.events.put(("sweep", ([], type(exc).__name__, {}, time.time())))
+
+            threading.Thread(target=ext_work, daemon=True).start()
             return
         if not self._cdp_available():
             self.sweep_note_text = ("Chưa bật CDP: vào trang Baccarat trong cửa sổ Chrome rồi gắn Chrome "
@@ -1026,8 +1444,25 @@ class BCRApp:
     def sweep_lobby(self):
         if self.chrome_busy or self.sweep_busy or self.exit_requested:
             return
+        # Chế độ extension: cầu đã về sẵn qua 8777, không cần CDP.
+        if ext_ready(self):
+            self.sweep_busy = True
+            self.sweep_note_text = "Đọc cầu từ extension trên Chrome thật…"
+            self.refresh()
+
+            def ext_work():
+                try:
+                    rows = self._ext_tables_as_rows()
+                    self.events.put(("sweep", (rows, "", {"source": "extension"}, time.time())))
+                except Exception as exc:
+                    self.events.put(("sweep", ([], type(exc).__name__, {}, time.time())))
+
+            threading.Thread(target=ext_work, daemon=True).start()
+            return
         if not self._cdp_available():
-            self.sweep_note_text = "Gắn Chrome đang mở trước."
+            self.sweep_note_text = ("Extension chưa kết nối. Mở Chrome thật (profile bạn vẫn dùng), "
+                                    "bật extension BCR, rồi bấm Quét." if self.collector_httpd is not None
+                                    else "Gắn Chrome đang mở trước.")
             self.refresh()
             return
         self.sweep_busy = True
@@ -1047,8 +1482,9 @@ class BCRApp:
     def auto_open_table(self, allow_sweep=False, exclude_key=None):
         if self.chrome_busy or self.sweep_busy or self.open_table_busy or self.exit_requested:
             return
-        if not self._cdp_available():
-            self.sweep_note_text = "Gắn Chrome đang mở trước."
+        if not self._cdp_available() and not ext_ready(self):
+            self.sweep_note_text = ("Extension chưa kết nối. Mở Chrome thật, bật extension BCR rồi thử lại."
+                                    if self.collector_httpd is not None else "Gắn Chrome đang mở trước.")
             self.refresh()
             return
         if self.sim.running:
@@ -1061,7 +1497,7 @@ class BCRApp:
                 continue
             if not road_is_current(row):
                 continue
-            info = ME.check_table(list(row["letters"]))
+            info = ME.check_table(list(row["letters"]), self.sim.min_hands, self.sim.max_hands)
             if info["eligible"]:
                 candidates.append((info["hands"], row, info))
         if not candidates:
@@ -1077,7 +1513,8 @@ class BCRApp:
                 self.cycle_attempts)
             self.sweep_lobby()
             return
-        candidates.sort(key=lambda item: (abs(item[0] - ME.MIN_HANDS), item[1]["label"].casefold()))
+        ideal = (self.sim.min_hands + self.sim.max_hands) / 2.0
+        candidates.sort(key=lambda item: (abs(item[0] - ideal), item[1]["label"].casefold()))
         hands, row, info = candidates[0]
         self.open_table_busy = True
         self.auto_start_letters = row["letters"]
@@ -1086,7 +1523,14 @@ class BCRApp:
         table_id = row["table_id"]
         def work():
             try:
-                ok, note = self.stream.open_table(table_id)
+                if ext_ready(self):
+                    res = self._ext_command("click_table", {"table_id": table_id,
+                                                            "label": row["label"]})
+                    ok = bool(res.get("ok"))
+                    note = ("Đã bấm mở bàn qua extension." if ok else
+                            "Extension không bấm được bàn (%s)." % res.get("reason", "?"))
+                else:
+                    ok, note = self.stream.open_table(table_id)
                 self.events.put(("table_opened", (ok, note, row["key"])))
             except Exception as exc:
                 self.events.put(("table_opened", (False, "Không mở được bàn (%s)." % type(exc).__name__, "")))
@@ -1180,18 +1624,41 @@ class BCRApp:
             return
         if not force and now - self.chip_read_at < CHIP_REFRESH:
             return
-        if not self.browser.connected or not self.sim.table_key:
+        if not self.sim.table_key:
+            return
+        ext = ext_ready(self)
+        if not ext and not self.browser.connected:
             return
         self.chip_busy = True
         self.chip_read_at = now
         unit = self._chip_unit()
         def work():
-            try:
-                live = TB.read(self.browser, unit=unit)
-            except Exception as exc:
-                live = {"ok": False, "error": type(exc).__name__}
+            live = self._read_chip_state(unit)
             self.events.put(("chips", live))
         threading.Thread(target=work, daemon=True).start()
+
+    def _read_chip_state(self, unit):
+        """Đọc chip thật đang đặt trên bàn (đồng bộ); gọi từ thread nền.
+
+        Dùng chung cho cả việc hiển thị trạng thái chip và cho gate "chờ ván mới"
+        trước khi tự đặt cược.
+        """
+        ext = ext_ready(self)
+        try:
+            if ext:
+                res = self._ext_command("read_chips", timeout=8)
+                chips = res.get("chips") if isinstance(res, dict) else None
+                if isinstance(chips, dict) and chips:
+                    denoms = sorted(int(v) for v in chips)
+                    spots_raw = res.get("spots") if isinstance(res, dict) else None
+                    spots = {side: {"amount": int((spots_raw or {}).get(side) or 0)}
+                             for side in ("B", "P", "T")}
+                    return {"ok": True, "denominations": denoms,
+                            "unit": unit, "source": "extension", "spots": spots}
+                return {"ok": False, "error": "no_chips"}
+            return TB.read(self.browser, unit=unit)
+        except Exception as exc:
+            return {"ok": False, "error": type(exc).__name__}
 
     def _chip_unit(self):
         """Số tiền cho 1 đơn vị chip; giá trị sai thì về mức mặc định để không chia nhầm."""
@@ -1217,7 +1684,7 @@ class BCRApp:
         lines = []
         chips = check.get("suggested_chips") or []
         if chips and check["side"]:
-            lines.append("Cần bấm: %s (%d chip) = %s đ" % (
+            lines.append("Cần bấm: %s (%d chip) = %s VN2" % (
                 " + ".join(str(c) for c in chips), len(chips), M.fmt_money(check["expected"])))
         if live.get("ok"):
             parts = []
@@ -1229,7 +1696,7 @@ class BCRApp:
                                               (" [" + chips_txt + "]") if chips_txt else ""))
             lines.append("Trên bàn: %s" % (" · ".join(parts) if parts else "chưa có chip"))
             if live.get("total") is not None:
-                lines.append("Tổng đặt: %s đ" % M.fmt_money(live["total"]))
+                lines.append("Tổng đặt: %s VN2" % M.fmt_money(live["total"]))
         elif live.get("error"):
             lines.append("Chưa đọc được chip (%s)." % live["error"])
         else:
@@ -1240,33 +1707,103 @@ class BCRApp:
         """Dùng DP (decompose) ra số chip tối thiểu rồi bấm đặt vào ô cược bằng chuột.
 
         Gọi từ hook ``self.sim.on_arm`` mỗi khi kế hoạch được chốt. Chỉ chạy khi bật
-        “Tự đặt chip” và kế hoạch có cửa + số tiền; chạy ở thread nền, không chặn UI
-        và không ảnh hưởng việc chốt kế hoạch (plan vẫn được giữ để ghi kết quả).
+        “Tự đặt chip” và kế hoạch có cửa + số tiền; chạy ở thread nền, không chặn UI.
+
+        Khi tự đặt đang bật, MỌI nhánh thoát đều phải báo về ``sim.mark_placed``: có tay
+        chỉ được tính khi chip thật đã đặt thành công. Nhánh nào im lặng thoát là nhánh
+        đó để tay chưa đặt bị đếm như đã đặt (đúng lỗi vào bàn chậm ở tay đầu tiên).
         """
-        if not self.auto_place_var.get() or self.place_busy or self.exit_requested:
+        if not self.auto_place_var.get():
             return
         side, stake = plan.get("side"), plan.get("stake") or 0
         if not side or stake <= 0:
+            return
+        self.sim.mark_placing(plan)
+        if self.exit_requested:
+            self._finish_place(plan, False, "Đang đóng app, huỷ tự đặt chip.")
+            return
+        if self.place_busy:
+            self._finish_place(plan, False, "Lượt bấm chip trước chưa xong nên tay này chưa được bấm.")
             return
         unit = self._chip_unit()
         denominations = (self.chip_live or {}).get("denominations") or None
         split = TB.decompose(stake, unit, denominations)
         if not split.get("chips"):
-            self.place_status.config(
-                text="Không tự đặt: %s đ không ghép được bằng chip có sẵn." % M.fmt_money(stake),
-                fg=RED)
+            self._finish_place(plan, False, "Không tự đặt: %s VN2 không ghép được bằng chip có sẵn."
+                                        % M.fmt_money(stake))
             return
         self.place_busy = True
-        self.place_status.config(text="Đang tự đặt %s đ vào %s…" % (
+        self.place_status.config(text="Đang tự đặt %s VN2 vào %s…" % (
             M.fmt_money(stake), E.SIDE_NAME[side]), fg=ACCENT)
         chips = split["chips"]
 
         def work():
-            ok, note, _placed = TB.place_bet(self.browser, side, chips, unit=unit,
-                                             human_mouse=self.human_mouse_var.get())
-            self.events.put(("placed", (ok, note)))
+            try:
+                ok_gate, gate_note = self._wait_for_next_hand(unit)
+                if not ok_gate:
+                    self.events.put(("placed", (False, gate_note, plan)))
+                    return
+                if ext_ready(self):
+                    res = self._ext_command("place_chips", {"side": side, "chips": chips},
+                                            timeout=max(15.0, len(chips) * 2.0 + 10))
+                    if res.get("ok"):
+                        total = res.get("total")
+                        note = "Đã đặt %s đơn vị chip vào %s qua extension." % (
+                            M.fmt_money(total) if total else "?", E.SIDE_NAME[side])
+                        self.events.put(("placed", (True, note, plan)))
+                    else:
+                        self.events.put(("placed", (False, "Extension không đặt được chip (%s)."
+                                                    % res.get("reason", "?")), plan))
+                    return
+                ok, note, _placed = TB.place_bet(self.browser, side, chips, unit=unit,
+                                                 human_mouse=self.human_mouse_var.get())
+                self.events.put(("placed", (ok, note, plan)))
+            except Exception as exc:
+                # Thread chết giữa chừng mà không báo thì kế hoạch kẹt ở "pending" và
+                # việc tính tay dừng lại mãi — phải luôn trả về một kết quả.
+                self.events.put(("placed", (False, "Lỗi khi tự đặt chip (%s)."
+                                            % type(exc).__name__, plan)))
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _finish_place(self, plan, ok, note):
+        """Báo kết quả lượt đặt chip ngay trên luồng UI (nhánh không cần thread nền)."""
+        self.sim.mark_placed(ok, note, plan)
+        self._set_place_status(ok, note)
+
+    def _on_placed(self, ok, note, plan):
+        """Nhánh "placed" của luồng poll: kết quả chỉ có ý nghĩa với kế hoạch đang chờ.
+
+        Về muộn (plan đã bị thay/tạm dừng) thì ghi vào lịch sử cũng không sao nhưng sim
+        sẽ bỏ qua — tay mới chưa bấm chip và vẫn phải bị tính là chưa đặt.
+        """
+        self.place_busy = False
+        self.sim.mark_placed(ok, note, plan)
+        self._set_place_status(ok, note)
+
+    def _set_place_status(self, ok, note):
+        if hasattr(self, "place_status"):
+            self.place_status.config(text=note, fg=(GREEN if ok else RED))
+
+    def _wait_for_next_hand(self, unit, timeout=BET_GATE_TIMEOUT, poll=BET_GATE_POLL):
+        """Chờ bàn gom hết chip ván trước (cả 3 cửa về 0) rồi mới cho phép tự đặt.
+
+        Evolution chưa lộ rõ đồng hồ đếm giờ đặt cược qua DOM nên dùng tín hiệu gián
+        tiếp: chip trên bàn trống nghĩa là ván trước đã kết toán và bàn đang ở cửa
+        sổ đặt cược mới, an toàn để bấm. Hết ``timeout`` giây mà bàn còn chip của ván
+        trước thì bỏ, không bấm liều lên chip cũ. Chạy trong thread nền của
+        ``place_armed_bet``, không chặn UI.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.exit_requested:
+                return False, "Đang đóng app, huỷ tự đặt chip."
+            live = self._read_chip_state(unit)
+            if table_is_clear(live):
+                return True, ""
+            time.sleep(poll)
+        return False, ("Không tự đặt: sau %ds bàn vẫn còn chip ván trước, chưa chắc "
+                       "đang ở lượt đặt cược mới." % int(timeout))
 
     def poll(self):
         if self.closing:
@@ -1306,13 +1843,22 @@ class BCRApp:
                     self.sweep_note_text = "Quét sảnh không thành công: " + error
                     self._schedule_cycle_retry(self.sweep_note_text)
                 elif not rows:
+                    # Lượt quét không ra bàn nào (kể cả lần quét đầu tiên, trước khi từng
+                    # vào bàn): nếu "Tự quét tìm bàn" đang bật, tự bật vòng hunt ngay từ
+                    # đây để có banner đếm ngược + tự quét lại, không chỉ dòng chữ tĩnh
+                    # bắt người dùng tự bấm lại "Quét toàn sảnh".
+                    was_hunting = self.cycle_waiting
+                    if not was_hunting and self.auto_hunt_var.get() and not self.session_lost:
+                        self.cycle_waiting = True
+                        self.cycle_attempts = 0
+                        self.cycle_table_key = None
                     self.sweep_note_text = (
                         "Chưa có bàn nào trong mục Ưa thích đọc được lịch sử. Hãy thêm bàn vào Ưa thích "
                         "trên sảnh rồi quét lại."
                         if self._last_sweep_favorites else
                         ("Chưa đọc được lịch sử bàn ở sảnh. Mở tab sảnh Baccarat rồi bấm "
                          "“Nhận tab sảnh” để app tự quét tiếp."
-                         if self.cycle_waiting else
+                         if was_hunting else
                          "Chưa nhận được lịch sử. Mở sảnh Baccarat rồi quét lại."))
                     self._schedule_cycle_retry(self.sweep_note_text)
                 else:
@@ -1384,10 +1930,7 @@ class BCRApp:
                 self.chip_busy = False
                 self.chip_live = data
             elif kind == "placed":
-                self.place_busy = False
-                ok, note = data
-                if hasattr(self, "place_status"):
-                    self.place_status.config(text=note, fg=(GREEN if ok else RED))
+                self._on_placed(*data)
             elif kind == "recovered":
                 ok, note = data
                 self._on_recovered(ok, note)
@@ -1397,10 +1940,16 @@ class BCRApp:
         if self.sim.cycle_done:
             self.sim.cycle_done = False
             self.leave_table_for_lobby()
-        self.request_chip_read()
         now = time.time()
-        if (not self.exit_requested and now >= self.next_scan and not self.scan_busy
-                and not self.chrome_busy and not self.sweep_busy and self.browser.connected):
+        # Cầu từ extension trên profile thật: trộn vào bảng bàn trước khi đọc/đặt chip.
+        self._pump_collector()
+        # Mất phiên thì dừng hẳn việc đọc/đặt chip: quét tiếp chỉ bấm lên trang đã bị site
+        # đá (EV.7) và làm phiên bị đá lặp lại. Chờ người dùng/tự phục hồi mở lại sảnh.
+        if not self.session_lost:
+            self.request_chip_read()
+        if (not self.exit_requested and not self.session_lost and now >= self.next_scan
+                and not self.scan_busy and not self.chrome_busy and not self.sweep_busy
+                and self.browser.connected):
             self.next_scan = now + (FAST_SCAN if (self.auto_start_table_key or self.sim.running) else SCAN_SECONDS)
             self._scan()
         self._resume_cycle_hunt(now)
@@ -1486,6 +2035,14 @@ class BCRApp:
         def work():
             try:
                 ok, note = self.stream.open_lobby_from_portal()
+                if not ok:
+                    # Nút “Chơi game” không mở được thường vì trang vào cũng đã mất phiên;
+                    # tải lại trang vào (an toàn) để lấy launch token mới rồi bấm lại một lần.
+                    reloaded, reload_note = self.stream.reload_portal()
+                    if reloaded:
+                        ok, note = self.stream.open_lobby_from_portal()
+                    else:
+                        note = reload_note or note
             except Exception as exc:
                 ok, note = False, "Không mở lại được EVO (%s)." % type(exc).__name__
             self.events.put(("recovered", (ok, note)))
@@ -1505,19 +2062,26 @@ class BCRApp:
         else:
             self.sweep_note_text = "Tự phục hồi chưa xong: " + note
             self._trace("recover_failed", dict(note=note))
-            # Thử lại sau một nhịp nghỉ; nếu site vẫn đá thì sau 3 lần sẽ dừng và báo.
+            # Chờ đúng nhịp nghỉ như vòng quét thường rồi mới thử lại; gọi đệ quy ngay
+            # sẽ đốt hết 3 lượt trong vài giây khi site còn đang đá phiên.
             self.cycle_waiting = True
             self.cycle_retry_at = time.time() + CYCLE_RETRY_SECONDS
-            self._try_recover_session()
         self.refresh()
 
     def _resume_cycle_hunt(self, now):
-        """Hết thời gian nghỉ 15 giây: tự chạy lại quét - chọn - vào bàn, không có trần số lượt."""
+        """Hết thời gian nghỉ: phục hồi phiên nếu đang văng, ngược lại quét-chọn-vào bàn."""
         if not (self.cycle_waiting and self.auto_hunt_var.get() and self.cycle_retry_at
                 and now >= self.cycle_retry_at):
             return
         self.cycle_retry_at = 0.0
         if self.exit_requested or self.sim.running or self.auto_start_table_key:
+            return
+        # Vẫn đang mất phiên: thử mở lại EVO thay vì quét trên trang đã bị đá.
+        if self.session_lost:
+            self._try_recover_session()
+            if self.session_lost:
+                # Chưa phục hồi được (hoặc đang chạy nền): giữ nhịp chờ, không quét.
+                self.cycle_retry_at = now + CYCLE_RETRY_SECONDS
             return
         if self.chrome_busy or self.sweep_busy or self.open_table_busy or not self._cdp_available():
             self.cycle_retry_at = now + CYCLE_RETRY_SECONDS
@@ -1615,7 +2179,7 @@ class BCRApp:
         for row in self.tables.values():
             if time.time() - row["ts"] > LIVE_STALE:
                 continue
-            info = ME.check_table(list(row["letters"]))
+            info = ME.check_table(list(row["letters"]), self.sim.min_hands, self.sim.max_hands)
             ready = info["eligible"] and not row_problem(row) and road_is_current(row)
             if self.search.get().casefold() not in row["label"].casefold() or (self.only_eligible.get() and not ready):
                 continue
@@ -1704,16 +2268,38 @@ class BCRApp:
     def refresh(self):
         book = self.sim.money
         decisive = book.wins + book.losses
-        values = (M.fmt_money(book.balance), signed(book.profit), "%+.2f%%" % (book.profit / book.start_capital * 100)
+        live = self._live_balance_money()
+        shown_balance = live if live is not None else book.balance
+        values = (M.fmt_money(shown_balance), signed(book.profit), "%+.2f%%" % (book.profit / book.start_capital * 100)
                   if book.start_capital else "—", "%.0f%% / %.0f%%" % (book.wins / decisive * 100, book.losses / decisive * 100)
                   if decisive else "— / —")
-        notes = ("Vốn đầu: " + M.fmt_money(book.start_capital), "%d tay đã ghi · %d hòa" % (book.hands_played, book.pushes),
+        notes = (("Số dư thật trên web: " + M.fmt_money(shown_balance)) if live is not None
+                 else ("Vốn đầu: " + M.fmt_money(book.start_capital)),
+                 "%d tay đã ghi · %d hòa" % (book.hands_played, book.pushes),
                  "Lãi/lỗ ÷ vốn ban đầu", "Tỷ lệ tay, không tính hòa")
         for i, (value, note) in enumerate(zip(values, notes)):
             self.kpi_values[i].config(text=value, fg=(GREEN if book.profit >= 0 else RED) if i in (1, 2) else TEXT)
             self.kpi_notes[i].config(text=note)
+        if self.ext_mode_var.get():
+            if ext_ready(self):
+                self.connection_text = ("Extension đang kết nối · đọc/điều khiển trên Chrome thật "
+                                        "(không dùng driver).")
+            elif self.collector_httpd is None:
+                self.connection_text = self.collector_note
+            else:
+                self.connection_text = ("Chờ extension: mở Chrome, đăng nhập cổng, bật extension BCR.")
+        elif self.browser.connected:
+            self.connection_text = self.browser.note or "Đã nối Chrome (driver)."
+        elif not self.chrome_busy:
+            self.connection_text = ("Chế độ driver: bấm “Mở Chrome” để app mở Chrome và tự vào sảnh.")
         self.connection_note.config(text=self.connection_text)
+        if hasattr(self, "account_label"):
+            self.account_label.config(text=self._account_label_text())
+        if hasattr(self, "balance_note"):
+            self.balance_note.config(text=self._balance_label_text())
         self.connection_label.config(text=self._window_text(self._window_config()))
+        # Nút mở/gắn Chrome luôn dùng được khi không bận: chế độ driver mở Chrome,
+        # chế độ extension thì nhắc bạn tự mở Chrome thật.
         self.open_button.config(state="disabled" if self.chrome_busy else "normal")
         self.attach_button.config(state="disabled" if self.chrome_busy else "normal")
         self.disconnect_button.config(text="Ngắt kết nối" if self.browser.mode == "cdp" else "Đóng")
@@ -1731,7 +2317,7 @@ class BCRApp:
         plan = self.sim.pending or self.sim.plan()
         side = plan["side"]
         self.plan_side.config(text=E.SIDE_NAME.get(side, "CHỜ BÀN").upper(), fg=COLORS.get(side, MUTED))
-        self.plan_stake.config(text=("%s đ · bậc %d/%d · %s" % (
+        self.plan_stake.config(text=("%s VN2 · bậc %d/%d · %s" % (
             M.fmt_money(plan["stake"]), min(plan["ladder_step"] + 1, len(self.sim.ladder)),
             len(self.sim.ladder), "đã chốt" if self.sim.running else "dự kiến")) if side else "Chưa có kế hoạch")
         strong = plan["strong"]
@@ -1749,7 +2335,7 @@ class BCRApp:
         for key in self.canvases:
             self._draw_canvas(key)
         self._render_tables()
-        self.history_note.config(text="%d tay · %d thắng / %d thua / %d hòa · Lãi/lỗ %s đ\nSụt vốn lớn nhất: %s đ" % (
+        self.history_note.config(text="%d tay · %d thắng / %d thua / %d hòa · Lãi/lỗ %s VN2\nSụt vốn lớn nhất: %s đ" % (
             book.hands_played, book.wins, book.losses, book.pushes, signed(book.profit), M.fmt_money(book.max_drawdown)))
         if self.history_size != len(self.sim.log):
             for item in self.history_tree.get_children():
@@ -1777,7 +2363,7 @@ class BCRApp:
             for i, v in enumerate(values):
                 coords.extend((18 + i / (len(values) - 1) * (w - 36), h - 30 - (v - low) / span * (h - 52)))
             canvas.create_line(*coords, fill=ACCENT, width=3)
-            canvas.create_text(18, 12, anchor="w", text="Vốn · " + M.fmt_money(values[-1]) + " đ", fill=MUTED)
+            canvas.create_text(18, 12, anchor="w", text="Vốn · " + M.fmt_money(values[-1]) + " VN2", fill=MUTED)
             return
         cell = max(18, min(25, (h - 12) // 6))
         cols = max(1, (w - 12) // cell)
@@ -1869,7 +2455,8 @@ class BCRApp:
         except OSError as exc:
             messagebox.showerror("Không lưu được bản sao", str(exc), parent=self.root)
             return
-        self.sim = LiveSimulation(book, profile=profile, ladder=stakes)
+        self.sim = LiveSimulation(book, profile=profile, ladder=stakes,
+                                  min_hands=self.sim.min_hands, max_hands=self.sim.max_hands)
         self.sim.on_arm = self.place_armed_bet
         self._sync_cycle_strip()
         self._sync_method_texts()
@@ -1883,12 +2470,44 @@ class BCRApp:
             archive = self.state_file.with_name("bcr-session-%s-%d.json" % (time.strftime("%Y%m%d-%H%M%S"), time.time_ns()))
             archive.write_bytes(self.state_file.read_bytes())
 
+    def _migrate_scale(self, settings):
+        """Chuyển state cũ (thang VNĐ, nhân 1000) về thang số của sàn (VN2), đúng một lần.
+
+        File state cũ lưu vốn 20.000.000, bậc 100.000, đơn vị chip 1.000; sàn hiển thị
+        3.014,74 và mức 100. Nếu không đổi, UI sẽ tiếp tục sai thang so với web.
+        """
+        if settings.get("scale") == "vn2":
+            return
+        divisor = 1000.0
+        capital = settings.get("capital")
+        if isinstance(capital, (int, float)) and not isinstance(capital, bool) and capital >= divisor * 10:
+            settings["capital"] = capital / divisor
+            settings["unit"] = (settings.get("unit") or 0) / divisor
+            settings["take_profit_pct"] = settings.get("take_profit_pct", 25.0)
+            ladder = settings.get("ladder")
+            if isinstance(ladder, list):
+                settings["ladder"] = [s / divisor for s in ladder
+                                      if isinstance(s, (int, float)) and not isinstance(s, bool)]
+            if isinstance(settings.get("chip_unit"), (int, float)):
+                unit = settings["chip_unit"] / divisor
+                settings["chip_unit"] = unit if unit >= 1 else 1
+            base = settings.get("ladder_base")
+            if isinstance(base, str):
+                digits = base.replace(".", "").replace(",", "").strip()
+                if digits.isdigit() and int(digits) >= 1000:
+                    settings["ladder_base"] = M.fmt_input_money(int(digits) / divisor)
+            # Bộ lọc tay cũ mặc định 15-20; nay là 10-50.
+            if settings.get("hands_min") == 15 and settings.get("hands_max") == 20:
+                settings["hands_min"], settings["hands_max"] = ME.MIN_HANDS, ME.MAX_HANDS
+        settings["scale"] = "vn2"
+
     def _load_state(self):
         if not self.state_file.exists():
             return
         try:
             data = json.loads(self.state_file.read_text(encoding="utf-8"))
             settings = data.get("settings", {})
+            self._migrate_scale(settings)
             self.sim.money = M.MoneyBook(**{k: settings[k] for k in (
                 "capital", "unit", "take_profit_pct") if k in settings})
             profile = settings.get("profile", ME.DEFAULT_PROFILE)
@@ -1900,6 +2519,10 @@ class BCRApp:
                 self.ladder_store[profile] = [M.fmt_input_money(s) for s in self.sim.ladder]
             self.chrome_startup_var.set(bool(settings.get("chrome_startup", False)))
             self.cdp_var.set(bool(settings.get("chrome_cdp", True)))
+            self.ext_mode_var.set(bool(settings.get("ext_mode", False)))
+            saved_url = settings.get("start_url")
+            if isinstance(saved_url, str) and saved_url.strip() and BR.valid_site_url(saved_url.strip()):
+                self.start_url_var.set(saved_url.strip())
             self.auto_cycle_var.set(bool(settings.get("auto_cycle", True)))
             self.auto_hunt_var.set(bool(settings.get("auto_hunt", True)))
             self.favorites_only.set(bool(settings.get("favorites_only", True)))
@@ -1911,6 +2534,10 @@ class BCRApp:
             saved_base = settings.get("ladder_base")
             if isinstance(saved_base, str) and saved_base.strip():
                 self.ladder_base_var.set(saved_base)
+            low, high = self.sim.set_hand_range(settings.get("hands_min", ME.MIN_HANDS),
+                                                settings.get("hands_max", ME.MAX_HANDS))
+            self.hands_min_var.set(str(low))
+            self.hands_max_var.set(str(high))
             saved_unit = settings.get("chip_unit", TB.DEFAULT_CHIP_UNIT)
             if isinstance(saved_unit, (int, float)) and not isinstance(saved_unit, bool) and saved_unit > 0:
                 self.chip_unit_var.set(M.fmt_input_money(int(saved_unit)))
@@ -1947,11 +2574,13 @@ class BCRApp:
             return False
         book = self.sim.money
         window = self._window_config()
-        data = dict(format="live-v2", log=self.sim.log,
+        data = dict(format="live-v2", scale="vn2", log=self.sim.log,
                     settings=dict(capital=book.start_capital, unit=book.unit,
                                   take_profit_pct=book.take_profit_pct,
                                   profile=self.sim.profile, ladder=self.sim.ladder,
                                   chrome_startup=self.chrome_startup_var.get(), chrome_cdp=self.cdp_var.get(),
+                                  ext_mode=self.ext_mode_var.get(),
+                                  start_url=self.start_url_var.get(),
                                   auto_cycle=self.auto_cycle_var.get(),
                                   auto_hunt=self.auto_hunt_var.get(),
                                   favorites_only=self.favorites_only.get(),
@@ -1960,6 +2589,8 @@ class BCRApp:
                                    auto_recover=self.auto_recover_var.get(),
                                    ladder_mode=self.ladder_mode_var.get(),
                                    ladder_base=self.ladder_base_var.get(),
+                                   hands_min=self.sim.min_hands,
+                                   hands_max=self.sim.max_hands,
                                    chip_unit=self._chip_unit(),
                                   chrome_window=dict(width=window["width"], height=window["height"],
                                                      percent=window["percent"],
@@ -1985,6 +2616,7 @@ class BCRApp:
             self.root.after(100, self.close)
             return
         self._save_state()
+        self._stop_collector()
         self.closing = True
         if self.poll_id:
             self.root.after_cancel(self.poll_id)

@@ -262,24 +262,98 @@ window.__BCR_SCAN = (function () {
     return {roads, scanned: roads.length};
   }
 
+  /* Đọc lịch sử từ canvas bằng cách đi NGƯỢC lên từ chính fiber của canvas.
+   * evolutionRoads() phải duyệt cả cây React (tới 50000 node) để tìm đường đi; trên trang
+   * bàn đang phát video, duyệt cây lớn mỗi lượt là thứ làm nghẽn renderer. Đi ngược chỉ
+   * tốn O(độ sâu), đủ để gặp props.history và props.table của đúng bàn. */
+  function evolutionRoadsUp() {
+    const canvases = [...document.querySelectorAll('[data-role="history-roads"] canvas')];
+    const roads = [];
+    for (const canvas of canvases) {
+      const rect = canvas.getBoundingClientRect();
+      if (!rect.width || !rect.height) continue;
+      const key = Object.keys(canvas).find((name) => name.startsWith('__reactFiber$'));
+      let fiber = key ? canvas[key] : null;
+      let history = null, table = null, gameType = '';
+      for (let i = 0; fiber && i < 200; i++, fiber = fiber.return) {
+        const props = fiber.memoizedProps || {};
+        if (!history && props.type === 'BaccaratHistoryRoadTypeBig' && Array.isArray(props.history)) history = props.history;
+        if (!gameType && typeof props.gameType === 'string') gameType = props.gameType;
+        if (!table && props.table && typeof props.table.id === 'string') table = props.table;
+        if (history && table) break;
+      }
+      if (!table || !/^[A-Za-z0-9_-]{1,80}$/.test(table.id)) continue;
+      if (!['baccarat', 'luckybaccarat'].includes(gameType)) continue;
+      let letters = '', readError = '';
+      if (!history) readError = 'Chưa đọc được lịch sử Canvas của bàn.';
+      else {
+        for (const item of history) {
+          const side = item?.c === 'R' ? 'B' : item?.c === 'B' ? 'P' : null;
+          const ties = item?.ties ?? 0;
+          if (!side || !Number.isInteger(ties) || ties < 0 || ties > 50 ||
+              !Array.isArray(item.pos) || item.pos.length !== 2 ||
+              !item.pos.every((p) => Number.isInteger(p) && p >= 0)) {
+            readError = 'Dữ liệu Big Road không đúng định dạng; không suy đoán kết quả.';
+            letters = '';
+            break;
+          }
+          letters += side + 'T'.repeat(ties);
+          if (letters.length > 400) { letters = ''; readError = 'Lịch sử vượt giới hạn 400 tay.'; break; }
+        }
+        if (history.length && (history[0].pos?.[0] !== 0 || history[0].pos?.[1] !== 0)) {
+          readError = 'Big Road bị cắt đầu; không đủ lịch sử để chọn bàn.';
+        } else if (history[0]?.ties) {
+          readError = 'Ô đầu có hòa: Big Road không cho biết hòa trước hay sau tay đầu.';
+        }
+      }
+      if (table.gameDetails?.gameConfig?.lightning || [
+        'LightningBac0001', 'XXXtremeLB000001', 'NoCommBac0000001',
+        'gwbaccarat000001', 'Empgwbaccarat001', 'PTBaccarat000001', 'InsuranceBac0001'
+      ].includes(table.id)) {
+        readError = 'Bàn có luật trả thưởng đặc biệt; chỉ xem cầu, không giả lập theo bàn chuẩn.';
+      }
+      roads.push({letters, label: typeof table.title === 'string' ? table.title : table.id,
+                  table_id: table.id, game_type: gameType, read_error: readError,
+                  source: 'evo-canvas-big', box: {x: Math.round(rect.x), y: Math.round(rect.y), w: rect.width, h: rect.height}});
+    }
+    return {roads, scanned: canvases.length};
+  }
+
   return function scan() {
-    const evolution = !!document.querySelector('[data-role="table-tile"]');
-    let out = evolution ? evolutionRoads() : textRoads();
-    let kind = evolution ? "evo-canvas" : "text";
-    if (!evolution && !out.roads.length) {
-      const svg = svgRoads();
-      const scanned = Math.max(out.scanned, svg.scanned);
-      out = { roads: svg.roads, scanned };
-      kind = "svg";
-    }
-    if (!evolution && !out.roads.length) {
-      const bead = beadRoads();
-      if (bead.roads.length) { out = bead; kind = "evo-bead"; }
-    }
     const tid = (() => {
       const m = /table_id=([^&]+)/.exec(location.href);
       return m ? decodeURIComponent(m[1]) : "";
     })();
+    const evolution = !!document.querySelector('[data-role="table-tile"]');
+    let out = null, kind = "";
+    /* Đang ở TRONG bàn (URL có table_id, không phải sảnh danh sách): chỉ đọc nguồn hẹp —
+     * canvas lịch sử và Bead-road — tuyệt đối không quét toàn bộ DOM/SVG. Trang bàn đang
+     * phát video; quét nặng (querySelectorAll("*") + getComputedStyle từng phần tử) làm
+     * nghẽn renderer, nhịp tim WebSocket tắt và EVO đá phiên “Bạn đã đăng xuất” (EV.7)
+     * ngay giữa ván. */
+    if (!evolution && tid) {
+      const evo = evolutionRoadsUp();
+      if (evo.roads.length) { out = evo; kind = "evo-canvas"; }
+      else {
+        const bead = beadRoads();
+        if (bead.roads.length) { out = bead; kind = "evo-bead"; }
+        else { out = evo; kind = "evo-canvas"; }
+      }
+    }
+    if (out === null) {
+      out = evolution ? evolutionRoads() : textRoads();
+      kind = evolution ? "evo-canvas" : "text";
+      if (!evolution && !out.roads.length) {
+        const svg = svgRoads();
+        const scanned = Math.max(out.scanned, svg.scanned);
+        out = { roads: svg.roads, scanned };
+        kind = "svg";
+      }
+      if (!evolution && !out.roads.length) {
+        const bead = beadRoads();
+        if (bead.roads.length) { out = bead; kind = "evo-bead"; }
+      }
+    }
     return {
       page: { url: location.origin + location.pathname, table_id: tid, title: (document.title || "").slice(0, 80) },
       tables: out.roads.map((r) => ({

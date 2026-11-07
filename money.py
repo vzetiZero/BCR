@@ -15,8 +15,20 @@ BET_MODE_SHORT = {FLAT: "cược đều", PERCENT: "theo % vốn", MARTINGALE: "
 
 
 def fmt_money(value):
-    """Định dạng kiểu Việt Nam: 1.500.000"""
+    """Định dạng kiểu Việt Nam: 1.500.000 (bỏ phần thập phân nếu là số nguyên)."""
     return "{:,.0f}".format(value).replace(",", ".")
+
+
+def fmt_amount(value):
+    """Số tiền đúng như hiển thị trên sàn: 3.014,74 hoặc 100.
+
+    Giữ tối đa 2 chữ số thập phân và chỉ bỏ khi là số nguyên, để UI không làm tròn
+    lệch so với con số người dùng thấy trên web.
+    """
+    value = float(value or 0)
+    if value == int(value):
+        return "{:,.0f}".format(value).replace(",", ".")
+    return "{:,.2f}".format(value).replace(",", "\x00").replace(".", ",").replace("\x00", ".")
 
 
 def fmt_input_money(value):
@@ -33,7 +45,7 @@ def parse_money(text):
 
 
 class MoneyBook:
-    def __init__(self, capital=20000000, unit=100000, mode=FLAT, percent=5.0,
+    def __init__(self, capital=3000.0, unit=100.0, mode=FLAT, percent=5.0,
                  take_profit_pct=25.0, mtg_cap=5):
         self.capital = max(0, float(capital))
         self.start_capital = self.capital
@@ -109,6 +121,29 @@ class MoneyBook:
     @property
     def profit(self):
         return self.balance - self.start_capital
+
+    def sync_capital(self, balance):
+        """Đồng bộ vốn theo số dư THẬT của tài khoản (đã quy đổi ra VNĐ).
+
+        Chỉ đổi ``start_capital`` khi phiên chưa có tay nào, để không làm sai lịch sử
+        lãi/lỗ đã ghi. Trả ``(ok, note)``.
+        """
+        try:
+            value = float(balance)
+        except (TypeError, ValueError):
+            return False, "Số dư không hợp lệ."
+        if value <= 0 or value != value:
+            return False, "Số dư phải lớn hơn 0."
+        if self.hands_played:
+            return False, ("Phiên đã có %d tay; không đổi vốn giữa phiên để giữ đúng lãi/lỗ. "
+                           "Tạo phiên mới nếu muốn dùng số dư thật." % self.hands_played)
+        self.capital = value
+        self.start_capital = value
+        self.balance = value
+        self.peak = value
+        self.max_drawdown = 0.0
+        self.check_limits()
+        return True, "Đã đồng bộ vốn thật: %s đ." % fmt_money(value)
 
     def check_limits(self):
         won_pct = (self.balance - self.start_capital) / self.start_capital * 100 if self.start_capital else 0

@@ -1,8 +1,4 @@
-/* BCR 3-3 Road Reader — phần gác cổng URL + gửi cầu về app. Logic đọc cầu ở reader.js
- * (dùng chung với browser.scan()). Chỉ ĐỌC bảng cầu đang hiển thị trên trang và gửi về app trên
- * chính máy này (http://127.0.0.1:8777). Không bấm hộ, không đặt cược, không gửi đi đâu khác.
- * Script thoát ngay trên mọi trang không phải sòng bài, nên không can thiệp site khác.
- * Chrome 137+ chặn --load-extension; khi đó app đọc cầu thẳng qua driver, không cần extension này. */
+
 (() => {
   "use strict";
 
@@ -13,7 +9,9 @@
   })();
 
   function isTarget() {
-    return /\/frontend\/evo\/|table_id=|see=baccarat|baccarat|luckybaccarat/i.test(TOP) ||
+    // Chỉ đọc ở SẢNH EVO hoặc TRANG BÀN có table_id. Các trang khác của cổng (nạp tiền,
+    // khuyến mãi, tài khoản…) bị bỏ qua hoàn toàn: extension không đọc, không gửi gì.
+    return /\/frontend\/evo\/|table_id=/i.test(TOP) ||
       /\/frontend\/evo\/|table_id=/i.test(location.href);
   }
   if (!isTarget()) return;
@@ -41,12 +39,17 @@
     payload.page.url = TOP.slice(0, 200);
     payload.diag.trigger = trigger;
     try {
-      const res = await fetch(ENDPOINT, {
+      const send = window.__BCR_HTTP || ((url, init) => fetch(url, init));
+      const res = await send("/report", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload)
       });
-      const data = await res.json();
-      setStatus("Đã gửi " + (data.updated || 0) + " bàn (" + kind + ") · app biết " + (data.known || 0) + " bàn");
+      const data = res.json || {};
+      if (res.ok) {
+        setStatus("Đã gửi " + (data.updated || 0) + " bàn (" + kind + ") · app biết " + (data.known || 0) + " bàn");
+      } else {
+        setStatus("App chưa nhận được cầu (" + (data.error || res.status || res.error || "?") + ")");
+      }
     } catch (e) {
       setStatus("Không gọi được app trên 127.0.0.1:8777 — chạy Chay_BCR.bat trước");
     }

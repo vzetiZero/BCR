@@ -7,7 +7,9 @@ sys.dont_write_bytecode = True
 
 from copy import deepcopy
 import json
+import inspect
 import math
+import queue
 import random
 from types import MethodType, SimpleNamespace
 import unittest
@@ -193,7 +195,9 @@ class LiveSimulationTests(unittest.TestCase):
     def simulation(self, baseline=BASELINE, capital=CAPITAL, start=True):
         self.assertTrue(ME.check_table(list(baseline))["eligible"])
         book = M.MoneyBook(capital=capital, unit=UNIT, take_profit_pct=100)
-        sim = app.LiveSimulation(book)
+        # Thang bậc trong test bám theo UNIT của test, không phụ thuộc mức mặc định của app.
+        ladder = [UNIT * m for m in (1, 3, 7, 15, 32, 64)]
+        sim = app.LiveSimulation(book, ladder=ladder)
         self.assertIs(sim.money, book)
         sim.bind(self.row(baseline))
         if start:
@@ -351,8 +355,8 @@ class LiveSimulationTests(unittest.TestCase):
         self.assertEqual(sim.pending["baseline"], changed["letters"])
 
     def test_start_rejects_ineligible_history_even_when_verified(self):
-        for letters in (BASELINE[:-1], BASELINE + "BPBPBP", "BBBBBBBPPBPPBPB",
-                        "BBBPPPBPBPBPBPB"):
+        # Loại bàn khi: dưới 10 tay, trên 50 tay, hoặc đã có bệt 7 tay trở lên.
+        for letters in (BASELINE[:9], BASELINE * 4, "BBBBBBBPPBPPBPB"):
             with self.subTest(letters=letters):
                 self.assertFalse(ME.check_table(list(letters))["eligible"])
                 sim = app.LiveSimulation()
@@ -457,14 +461,14 @@ class LiveSimulationTests(unittest.TestCase):
 
     def test_six_losses_halt_ladder_not_capital(self):
         sim = self.simulation()
-        self.assertGreater(sim.money.balance, sum((1, 3, 7, 15, 31, 64)) * UNIT)
-        for side, result, multiplier in zip("BBBPPP", "PPPBBB", (1, 3, 7, 15, 31, 64)):
+        ladder = sim.ladder
+        self.assertGreater(sim.money.balance, sum(ladder))
+        for side, result, step in zip("BBBPPP", "PPPBBB", range(6)):
             self.assertEqual(sim.pending["side"], side)
-            self.assertEqual(sim.pending["stake"], multiplier * UNIT)
+            self.assertEqual(sim.pending["stake"], ladder[step])
             self.settle_next(sim, result)
-        self.assertEqual([entry["stake"] for entry in sim.log],
-                         [UNIT * n for n in (1, 3, 7, 15, 31, 64)])
-        self.assertEqual(sim.money.profit, -121 * UNIT)
+        self.assertEqual([entry["stake"] for entry in sim.log], list(ladder))
+        self.assertEqual(sim.money.profit, -sum(ladder))
         self.assertEqual((sim.money.hands_played, sim.money.losses), (6, 6))
         self.assertIsNone(sim.money.blocked)
         self.assertEqual(sim.method_state["ladder_step"], 6)
@@ -739,7 +743,7 @@ class MethodProfileSimulationTests(unittest.TestCase):
 
     def test_switching_profile_mid_session_uses_the_new_ladder_next_hand(self):
         sim = self.simulation("3-3", ME.DEFAULT_LADDER["3-3"])
-        self.assertEqual(sim.pending["stake"], UNIT)
+        self.assertEqual(sim.pending["stake"], sim.ladder[0])
         sim.set_method("3-2", self.LADDER_32)
         sim._arm()
         self.assertEqual(sim.pending["stake"], self.LADDER_32[0])
@@ -934,11 +938,12 @@ class LobbyEntryTests(unittest.TestCase):
                   if message["method"] == "Input.dispatchMouseEvent"]
         self.assertEqual({message["params"]["x"] for message in clicks}, {box["x"]})
 
-    def test_needs_an_approved_portal_tab_before_clicking_anything(self):
-        self.session._cdp_pages.return_value = [dict(self.PORTAL, url="https://example.invalid/")]
+    def test_reports_when_there_is_no_usable_tab_before_clicking_anything(self):
+        # Không còn trang chủ cố định: chỉ cần KHÔNG có tab HTTPS công khai nào.
+        self.session._cdp_pages.return_value = []
         ok, note = self.stream.open_lobby_from_portal()
         self.assertFalse(ok)
-        self.assertIn(BR.PORTAL_HOST, note)
+        self.assertTrue(note)
         self.websocket.create_connection.assert_not_called()
 
     def test_reports_when_the_lobby_tab_never_appears(self):
@@ -959,6 +964,38 @@ class LobbyEntryTests(unittest.TestCase):
         self.assertTrue(ok, note)
         self.assertIn("Quét toàn sảnh", note)
         self.assertEqual(len(self.sockets), 1, "Sảnh trong iframe thì không mở tab nào thêm")
+
+    def test_wheel_scroll_uses_real_mouse_wheel_when_human_mouse_is_on(self):
+        self.stream.human_mouse = True
+        socket = self.Socket([
+            {"id": 1, "result": {}},                               # cài overlay con trỏ (addScriptToEvaluateOnNewDocument)
+            {"id": 2, "result": {}},                               # cài overlay con trỏ (Runtime.evaluate)
+            {"id": 3, "result": {"result": {"value": 0}}},        # đọc scrollTop hiện tại
+            {"id": 4, "result": {}},                               # cú lăn chuột đưa về đích
+            {"id": 5, "result": {"result": {"value": 500}}},       # đã đạt đích sau cú lăn
+            {"id": 6, "result": {"result": {"value": 500}}},       # chốt đúng pixel bằng JS
+        ])
+        box = {"x": 100.0, "y": 200.0, "width": 300.0, "height": 400.0}
+        # move_to sinh số điểm ngẫu nhiên theo ghost-cursor; chỉ cần xác nhận NÓ được
+        # gọi đúng tâm khung, không cần khớp từng sự kiện mouseMoved trong transcript.
+        with patch.object(HM.HumanMouse, "move_to", return_value=[]) as move_to:
+            top = self.stream._wheel_scroll_to(socket, 9, 500, box)
+        self.assertEqual(top, 500)
+        move_to.assert_called_once_with(250.0, 400.0)
+        wheels = [m for m in socket.sent if m["method"] == "Input.dispatchMouseWheelEvent"]
+        self.assertTrue(wheels, "phải lăn chuột thật, không gán scrollTop trực tiếp")
+        self.assertTrue(all(w["params"]["x"] == 250.0 and w["params"]["y"] == 400.0
+                            for w in wheels), "phải lăn ngay giữa khung danh sách")
+        self.assertTrue(all(w["params"]["deltaY"] > 0 for w in wheels))
+
+    def test_wheel_scroll_falls_back_to_js_when_human_mouse_is_off(self):
+        self.stream.human_mouse = False
+        socket = self.Socket([{"id": 1, "result": {"result": {"value": 240}}}])
+        top = self.stream._wheel_scroll_to(socket, 9, 240,
+                                           {"x": 0.0, "y": 0.0, "width": 10.0, "height": 10.0})
+        self.assertEqual(top, 240)
+        self.assertNotIn("Input.dispatchMouseWheelEvent", [m["method"] for m in socket.sent])
+        self.assertNotIn("Input.dispatchMouseEvent", [m["method"] for m in socket.sent])
 
     def status_transcript(self, value):
         return [[{"method": "Runtime.executionContextCreated",
@@ -1552,7 +1589,7 @@ class MethodBlockRegressionTests(unittest.TestCase):
                                started=True, strong=old)
                 self.assertEqual(plan["action"], "bet")
                 self.assertEqual((plan["strong"], plan["side"], plan["block_pos"]), (new, new, 0))
-                self.assertEqual(plan["stake"], 7 * UNIT)
+                self.assertEqual(plan["stake"], self.LADDER[2])
                 self.assertEqual(results, before)
 
     def test_midblock_keeps_original_strong_even_when_current_strong_flips(self):
@@ -1622,12 +1659,15 @@ class BrowserUrlRegressionTests(unittest.TestCase):
                 self.assertTrue(BR.valid_site_url(url))
 
     def test_lobby_needs_the_exact_evo_path(self):
+        # is_lobby_url vẫn chỉ nhận đúng /frontend/evo/r3 — đó là nơi CÓ bảng cầu.
         for url in (self.origin + "/", self.origin + "/other/path?table_id=01#category=all_games",
                     self.origin + "/frontend/evo/", self.origin + "/frontend/other",
                     self.origin + "/frontend/evo/r3evil", self.mirror + "/frontend/evo",
                     self.mirror + "/"):
             with self.subTest(url=url):
-                self.assertFalse(BR.valid_site_url(url))
+                self.assertFalse(BR.is_lobby_url(url))
+                # Nhưng mọi trang HTTPS công khai đều được phép mở (không phụ thuộc trang chủ).
+                self.assertTrue(BR.valid_site_url(url), url)
         self.assertTrue(BR.valid_site_url(self.origin + BR.LOBBY_PATH + "/"))
         self.assertTrue(BR.valid_site_url(self.origin + BR.LOBBY_PATH + "/x"))
         # Sảnh nằm trong iframe của trang vào: hai URL đều thuộc danh sách được phép.
@@ -1649,12 +1689,20 @@ class BrowserUrlRegressionTests(unittest.TestCase):
                      "no-dot-host"):
             with self.subTest(host=host):
                 self.assertFalse(BR.valid_site_url("https://" + host + BR.LOBBY_PATH + "/"))
-        # Mirror đổi liên tục: mọi tên miền công khai có đúng đường dẫn đều được đọc.
+        # Không còn gắn với trang chủ nào: mọi tên miền công khai HTTPS đều mở được.
         self.assertTrue(BR.valid_site_url("https://sub." + self.host + BR.LOBBY_PATH + "/"))
         for url in ("https://" + BR.PORTAL_HOST + "/",
                     "https://" + BR.PORTAL_HOST + "/gamelobby",
                     "https://" + BR.PORTAL_HOST + "/other/page",
-                    "https://neo179.com" + BR.PORTAL_PATH):
+                    "https://neo179.com" + BR.PORTAL_PATH,
+                    "https://api.neo179.com/vb9prod-ecp/api/v1/profile",
+                    "https://some-other-casino.example/anything"):
+            with self.subTest(url=url):
+                self.assertTrue(BR.valid_site_url(url))
+                self.assertTrue(BR.is_portal_url(url))
+        # Vẫn loại đúng những thứ không phải trang HTTPS công khai.
+        for url in ("https://example.invalid/entry", "http://neo179.com/",
+                    "https://127.0.0.1/", "https://user:pw@neo179.com/"):
             with self.subTest(url=url):
                 self.assertFalse(BR.valid_site_url(url))
 
@@ -1711,7 +1759,7 @@ class BrowserUrlRegressionTests(unittest.TestCase):
                 patch.object(BR.BrowserSession, "_start_driver") as launch, \
                 patch.object(BR.BrowserSession, "alive") as alive, \
                 patch.object(BR.BrowserSession, "stop") as stop:
-            for url in ("file:///C:/not-a-page", "https://example.invalid/",
+            for url in ("file:///C:/not-a-page",
                         "http://" + self.host, self.origin + ":8443/",
                         "https://user:password@" + self.host + "/"):
                 with self.subTest(url=url):
@@ -1929,10 +1977,9 @@ class BrowserCdpRegressionTests(unittest.TestCase):
         self.cdp_json.assert_not_called()
         self.websocket.create_connection.assert_not_called()
 
-    def test_attach_requires_an_approved_page_not_an_iframe_or_unrelated_target(self):
+    def test_attach_requires_a_public_https_page_not_an_iframe_or_worker(self):
         for pages in ([], [None, "invalid", {}, dict(self.page, type="iframe"),
                            dict(self.page, type="service_worker"),
-                           dict(self.page, url="https://example.invalid/"),
                            dict(self.page, url="http://" + LOBBY_HOST)]):
             with self.subTest(pages=pages):
                 self.metadata["list"] = pages
@@ -1976,7 +2023,7 @@ class BrowserCdpRegressionTests(unittest.TestCase):
         self.assertEqual(self.session._cdp_page(), table)
         self.metadata["list"] = [portal]
         self.assertEqual(self.session._cdp_page(), portal)
-        self.metadata["list"] = [dict(portal, url="https://example.invalid/")]
+        self.metadata["list"] = [dict(portal, url="http://example.invalid/")]
         self.assertIsNone(self.session._cdp_page())
 
     def test_optional_version_metadata_failure_does_not_prevent_attach(self):
@@ -2176,7 +2223,8 @@ class BrowserCdpRegressionTests(unittest.TestCase):
                     self.assertLessEqual(timeout.args[0], BR.SCRIPT_TIMEOUT)
 
     def test_scan_rejects_changed_or_unapproved_root_before_reading(self):
-        for changes in ({"url": "https://example.invalid/"}, {"type": "iframe"},
+        # Chỉ loại trang KHÔNG phải HTTPS công khai; URL HTTPS bất kỳ giờ đều hợp lệ.
+        for changes in ({"url": "http://example.invalid/"}, {"type": "iframe"},
                         {"targetId": "different-target"}):
             with self.subTest(changes=changes):
                 messages = self.transcript(first_root=dict(self.root, **changes))[:3]
@@ -2198,8 +2246,8 @@ class BrowserCdpRegressionTests(unittest.TestCase):
         self.reader_script.assert_not_called()
         self.assert_commands(ws, ["Runtime.enable", "Target.getTargetInfo"])
 
-    def test_scan_discards_partial_reports_when_final_root_leaves_site_or_changes_target(self):
-        for changes in ({"url": "https://example.invalid/?PRIVATE"}, {"type": "iframe"},
+    def test_scan_discards_partial_reports_when_final_root_leaves_https_or_changes_target(self):
+        for changes in ({"url": "http://example.invalid/?PRIVATE"}, {"type": "iframe"},
                         {"targetId": "different-target"}):
             with self.subTest(changes=changes):
                 ws = self.scripted_socket(self.transcript(last_root=dict(self.root, **changes)))
@@ -2319,6 +2367,70 @@ class ChromeLaunchFailureNoteTests(unittest.TestCase):
         sleep.assert_not_called()
 
 
+class ChipConfirmationTests(unittest.TestCase):
+    """[data-role="selected-chip"] đổi MUỘN HƠN cú bấm một nhịp (càng muộn khi dealer
+    đang mở bài), nên một lần đọc ngay sau click_delay thường còn nguyên mệnh giá của
+    chip trước — đó là nguồn báo nhầm "Bấm chọn chip 100 nhưng khay đang chọn 20" và
+    dừng một lượt đặt đúng tiền."""
+
+    def run_confirm(self, readings, denom=100, wait=None, poll=0.2):
+        """Đồng hồ/nghỉ giả: mỗi lần đọc tốn đúng một nhịp, không chờ thật trong test."""
+        if wait is None:
+            wait = TB.CHIP_CONFIRM_TIMEOUT
+        seen = list(readings)
+        slept = []
+        now = [0.0]
+
+        def read():
+            value = seen.pop(0) if seen else readings[-1]
+            now[0] += poll
+            return value
+
+        def nap(seconds):
+            slept.append(seconds)
+            now[0] += seconds
+
+        ok, value = TB.confirm_selected_chip(denom, read, wait=wait, poll=poll,
+                                             clock=lambda: now[0], nap=nap)
+        return ok, value, len(slept)
+
+    def test_a_matching_first_read_does_not_wait_at_all(self):
+        ok, value, waits = self.run_confirm([100])
+        self.assertTrue(ok)
+        self.assertEqual(value, 100)
+        self.assertEqual(waits, 0)
+
+    def test_a_stale_read_is_re_read_instead_of_stopping_the_bet(self):
+        for readings in ([20, 100], [20, 40, 100], [None, 20, 100]):
+            with self.subTest(readings=readings):
+                ok, value, waits = self.run_confirm(readings)
+                self.assertTrue(ok, readings)
+                self.assertEqual(value, 100)
+                self.assertGreaterEqual(waits, 1)
+
+    def test_a_value_that_stays_wrong_stops_after_the_window(self):
+        ok, value, waits = self.run_confirm([20])
+        self.assertFalse(ok)
+        self.assertEqual(value, 20)
+        self.assertGreaterEqual(waits, 3, "phải đọc lại nhiều lần trong cửa sổ, không kết luận một nhịp")
+
+    def test_an_unreadable_tray_never_blocks_the_bet(self):
+        ok, value, _waits = self.run_confirm([None])
+        self.assertTrue(ok)
+        self.assertIsNone(value)
+
+    def test_the_window_length_is_what_buys_the_retries(self):
+        ok, value, waits = self.run_confirm([20], wait=0)
+        self.assertEqual((ok, value, waits), (False, 20, 0))
+
+    def test_the_shipped_window_is_wide_enough_for_a_dealer_render(self):
+        self.assertGreaterEqual(TB.CHIP_CONFIRM_TIMEOUT, 2.0)
+        self.assertGreaterEqual(TB.CHIP_CONFIRM_TIMEOUT / TB.CHIP_CONFIRM_POLL, 5)
+
+    def test_place_bet_uses_the_windowed_read(self):
+        self.assertIn("confirm_selected_chip(", inspect.getsource(TB.place_bet))
+
+
 class WindowConfigTests(unittest.TestCase):
     """Cấu hình cửa sổ Chrome do người dùng nhập; transcript CDP giả lập, không mở Chrome thật."""
 
@@ -2419,11 +2531,11 @@ class WindowConfigTests(unittest.TestCase):
 
 
 class ChipMatchingTests(unittest.TestCase):
-    """Chip trên bàn hiển thị theo đơn vị nghìn; phải quy đổi VNĐ và ghép đúng mệnh giá."""
+    """Chip dùng đúng thang số của sàn (VN2); phải ghép đúng mệnh giá thật trên khay."""
 
     TRAY = [20, 50, 100, 500, 2000, 10000]
 
-    def live(self, banker=0, player=0, tie=0, unit=1000, denominations=None):
+    def live(self, banker=0, player=0, tie=0, unit=1, denominations=None):
         spots = {}
         for side, units in (("B", banker), ("P", player), ("T", tie)):
             spots[side] = {"amount": units, "amount_vnd": float(units * unit),
@@ -2433,63 +2545,370 @@ class ChipMatchingTests(unittest.TestCase):
                 "spots": spots, "total": float((banker + player + tie) * unit),
                 "total_units": banker + player + tie}
 
-    def test_chip_value_maps_thousands_to_vnd(self):
-        self.assertEqual(TB.decompose(20000)["chips"], [20])
-        self.assertEqual(TB.decompose(50000)["chips"], [50])
-        self.assertEqual(TB.decompose(100000)["chips"], [100])
+    def test_chip_value_is_the_number_shown_on_the_table(self):
+        # Đơn vị mặc định = 1: số trên chip chính là số tiền theo VN2 của sàn.
+        self.assertEqual(TB.decompose(20)["chips"], [20])
+        self.assertEqual(TB.decompose(100)["chips"], [100])
+        self.assertEqual(TB.decompose(500)["chips"], [500])
 
-    def test_120_thousand_needs_one_100_and_one_20(self):
-        split = TB.decompose(120000)
+    def test_120_needs_one_100_and_one_20(self):
+        split = TB.decompose(120)
         self.assertTrue(split["exact"])
         self.assertEqual(sorted(split["chips"]), [20, 100])
-        self.assertEqual(split["total_vnd"], 120000)
+        self.assertEqual(split["total_vnd"], 120)
 
-    def test_140_thousand_needs_100_plus_two_20s(self):
-        split = TB.decompose(140000)
+    def test_140_needs_100_plus_two_20s(self):
+        split = TB.decompose(140)
         self.assertTrue(split["exact"])
         self.assertEqual(split["chips"], [100, 20, 20])
 
     def test_decomposition_reports_an_ungroupable_amount(self):
-        # Khay không có mệnh giá 10 nên 10.000 không ghép được.
-        split = TB.decompose(10000, 1000, [20, 50, 100])
+        # Khay không có mệnh giá 10 nên 10 không ghép được.
+        split = TB.decompose(10, 1, [20, 50, 100])
         self.assertFalse(split["exact"])
-        self.assertEqual(split["remainder_vnd"], 10000)
+        self.assertEqual(split["remainder_vnd"], 10)
 
-    def test_compare_match_uses_vnd_not_chip_units(self):
-        result = ME.compare_chips("B", 120000, self.live(banker=120))
+    def test_compare_match_uses_the_table_amount(self):
+        result = ME.compare_chips("B", 120, self.live(banker=120))
         self.assertEqual(result["status"], "match")
         self.assertEqual(sorted(result["suggested_chips"]), [20, 100])
 
     def test_compare_flags_wrong_amount_and_still_suggests_chips(self):
-        result = ME.compare_chips("B", 140000, self.live(banker=120))
+        result = ME.compare_chips("B", 140, self.live(banker=120))
         self.assertEqual(result["status"], "wrong_amount")
         self.assertEqual(result["suggested_chips"], [100, 20, 20])
 
     def test_compare_flags_wrong_side(self):
-        result = ME.compare_chips("P", 100000, self.live(banker=100))
+        result = ME.compare_chips("P", 100, self.live(banker=100))
         self.assertEqual(result["status"], "wrong_side")
 
     def test_compare_flags_extra_bets(self):
-        result = ME.compare_chips("B", 100000, self.live(banker=100, player=50000))
+        result = ME.compare_chips("B", 100, self.live(banker=100, player=50))
         self.assertEqual(result["status"], "extra_bets")
 
     def test_compare_no_bet_still_offers_the_chip_recipe(self):
-        result = ME.compare_chips("B", 100000, self.live())
+        result = ME.compare_chips("B", 100, self.live())
         self.assertEqual(result["status"], "no_bet")
         self.assertEqual(result["suggested_chips"], [100])
 
     def test_compare_unknown_when_the_table_was_not_read(self):
-        result = ME.compare_chips("B", 100000, {"ok": False})
+        result = ME.compare_chips("B", 100, {"ok": False})
         self.assertEqual(result["status"], "unknown")
 
     def test_compare_rejects_an_amount_the_tray_cannot_make(self):
-        result = ME.compare_chips("B", 10000, self.live(banker=0, denominations=[20, 50, 100]))
+        result = ME.compare_chips("B", 10, self.live(banker=0, denominations=[20, 50, 100]))
         self.assertEqual(result["status"], "ungroupable")
 
-    def test_custom_unit_keeps_chip_numbers_aligned(self):
-        # 1 đơn vị = 10.000 đ thì chip "20" là 200.000 đ.
-        split = TB.decompose(200000, 10000)
+    def test_custom_unit_still_supported_for_other_tables(self):
+        # Bàn khác có thể đặt 1 đơn vị = 10: chip "20" là 200.
+        split = TB.decompose(200, 10)
         self.assertEqual(split["chips"], [20])
+
+
+class BetGateTests(unittest.TestCase):
+    """Gate "chờ ván mới": chỉ tự đặt chip khi cả 3 cửa đang trống (ván trước đã gom chip)."""
+
+    def live(self, banker=0, player=0, tie=0, ok=True):
+        return {"ok": ok, "spots": {
+            "B": {"amount": banker}, "P": {"amount": player}, "T": {"amount": tie}}}
+
+    def test_all_spots_empty_is_clear(self):
+        self.assertTrue(app.table_is_clear(self.live()))
+
+    def test_any_spot_with_chips_is_not_clear(self):
+        self.assertFalse(app.table_is_clear(self.live(banker=100)))
+        self.assertFalse(app.table_is_clear(self.live(tie=20)))
+
+    def test_unread_table_is_never_considered_clear(self):
+        self.assertFalse(app.table_is_clear({"ok": False}))
+        self.assertFalse(app.table_is_clear(None))
+        self.assertFalse(app.table_is_clear(self.live(ok=False)))
+
+    def test_wait_returns_true_as_soon_as_the_table_clears(self):
+        host = SimpleNamespace(exit_requested=False,
+                               _read_chip_state=Mock(side_effect=[
+                                   {"ok": True, "spots": {"B": {"amount": 100}, "P": {"amount": 0},
+                                                          "T": {"amount": 0}}},
+                                   {"ok": True, "spots": {"B": {"amount": 0}, "P": {"amount": 0},
+                                                          "T": {"amount": 0}}}]))
+        with patch.object(app.time, "sleep"):
+            ok, note = app.BCRApp._wait_for_next_hand(host, 1, timeout=5, poll=0)
+        self.assertTrue(ok)
+        self.assertEqual(note, "")
+        self.assertEqual(host._read_chip_state.call_count, 2)
+
+    def test_wait_gives_up_after_timeout_with_chips_still_on_table(self):
+        host = SimpleNamespace(exit_requested=False,
+                               _read_chip_state=Mock(return_value={
+                                   "ok": True, "spots": {"B": {"amount": 100}, "P": {"amount": 0},
+                                                         "T": {"amount": 0}}}))
+        clock = iter([0, 0.1, 0.1, 10.0])
+        with patch.object(app.time, "sleep"), \
+             patch.object(app.time, "monotonic", side_effect=lambda: next(clock)):
+            ok, note = app.BCRApp._wait_for_next_hand(host, 1, timeout=5, poll=0)
+        self.assertFalse(ok)
+        self.assertIn("còn chip ván trước", note)
+
+    def test_wait_aborts_immediately_when_the_app_is_closing(self):
+        host = SimpleNamespace(exit_requested=True, _read_chip_state=Mock())
+        ok, note = app.BCRApp._wait_for_next_hand(host, 1, timeout=5, poll=0)
+        self.assertFalse(ok)
+        self.assertTrue(note)
+        host._read_chip_state.assert_not_called()
+
+
+class PlacementGatedHandCountingTests(unittest.TestCase):
+    """Vào bàn từ sảnh phải chờ tải trang: tay chưa bấm được chip thật thì chưa được tính.
+
+    Đây là lỗi "chưa đặt được nhưng vẫn tính tay đầu tiên" — bật Tự đặt chip thì mỗi tay
+    phải có xác nhận đặt chip thật trước khi tiền trong sổ giả lập nhúc nhích.
+    """
+
+    def setUp(self):
+        self.now = 1_800_000_000.0
+        clock = patch.object(app.time, "time", side_effect=lambda: self.now)
+        clock.start()
+        self.addCleanup(clock.stop)
+
+    def row(self, letters, **changes):
+        row = dict(key="baccarat01", label="Baccarat 01", letters=letters,
+                   ts=self.now, stable=2, conflict=False)
+        row.update(changes)
+        return row
+
+    def simulation(self, baseline=BASELINE):
+        book = M.MoneyBook(capital=CAPITAL, unit=UNIT, take_profit_pct=100)
+        sim = app.LiveSimulation(book, ladder=[UNIT * m for m in (1, 3, 7, 15, 32, 64)])
+        sim.bind(self.row(baseline))
+        self.assertTrue(sim.start(self.row(baseline), verified=True, now=self.now))
+        return sim
+
+    def next_hand(self, sim, letters, delay=1):
+        """Một chữ mới trên cầu, đưa vào đúng luồng process() của poll."""
+        self.now += delay
+        return sim.process(self.row(letters, key=sim.table_key, ts=self.now), now=self.now)
+
+    def test_hand_is_held_while_the_placement_is_not_confirmed(self):
+        sim = self.simulation()
+        sim.mark_placing()
+        self.assertFalse(self.next_hand(sim, BASELINE + "B"))
+        self.assertEqual(sim.letters, BASELINE)
+        self.assertEqual(sim.results, list(BASELINE))
+        self.assertEqual(sim.money.balance, CAPITAL)
+        self.assertEqual(sim.log, [])
+        self.assertIn("Chờ xác nhận", sim.note)
+
+    def test_prompt_confirmation_settles_the_next_hand(self):
+        sim = self.simulation()
+        plan = sim.pending
+        sim.mark_placing(plan)
+        self.assertTrue(sim.mark_placed(True, "Đã đặt 1 đơn vị chip", plan))
+        self.assertTrue(self.next_hand(sim, BASELINE + "B"))
+        self.assertEqual(sim.letters, BASELINE + "B")
+        self.assertEqual(len(sim.log), 1)
+        self.assertEqual(sim.log[-1]["stake"], plan["stake"])
+        self.assertIn(sim.log[-1]["outcome"], ("win", "loss", "push"))
+        self.assertEqual(sim.place_skips, 0)
+
+    def test_failed_placement_consumes_the_letter_without_touching_the_book(self):
+        sim = self.simulation()
+        plan = sim.pending
+        sim.mark_placing(plan)
+        sim.mark_placed(False, "ô cược không phản hồi", plan)
+        method_state = deepcopy(sim.method_state)
+        self.assertFalse(self.next_hand(sim, BASELINE + "B"))
+        self.assertEqual(sim.letters, BASELINE + "B")
+        self.assertEqual(sim.money.balance, CAPITAL)
+        self.assertEqual(sim.money.hands_played, 0)
+        self.assertEqual(sim.money.profit, 0)
+        self.assertEqual(sim.method_state, method_state)
+        self.assertEqual(sim.block_hands, 0)
+        self.assertEqual(len(sim.log), 1)
+        self.assertEqual(sim.log[-1]["outcome"], "not_placed")
+        self.assertEqual(sim.log[-1]["stake"], 0)
+        self.assertEqual(sim.log[-1]["delta"], 0.0)
+        self.assertEqual(sim.log[-1]["source"], "chip-not-placed")
+        self.assertTrue(sim.running)
+        # Kế hoạch tay kế tiếp giữ nguyên bậc cược và chưa có dấu vết lượt bấm cũ.
+        self.assertIsNot(sim.pending, plan)
+        self.assertEqual(sim.pending["baseline"], BASELINE + "B")
+        self.assertEqual(sim.pending["ladder_step"], plan["ladder_step"])
+        self.assertNotIn("placed", sim.pending)
+        self.assertIn("không được tính", sim.note)
+
+    def test_stuck_pending_placement_fails_after_the_confirmation_timeout(self):
+        sim = self.simulation()
+        plan = sim.pending
+        sim.mark_placing(plan)
+        self.assertFalse(self.next_hand(sim, BASELINE + "B", delay=app.PLACE_CONFIRM_TIMEOUT + 1))
+        self.assertEqual(plan["placed"], "failed")
+        self.assertEqual(sim.letters, BASELINE + "B")
+        self.assertEqual(sim.log[-1]["outcome"], "not_placed")
+        self.assertEqual(sim.money.balance, CAPITAL)
+
+    def test_unplaced_hands_stop_the_session_after_the_skip_limit(self):
+        sim = self.simulation()
+        road = BASELINE
+        for expected in range(1, app.PLACE_SKIP_LIMIT + 1):
+            plan = sim.pending
+            sim.mark_placing(plan)
+            sim.mark_placed(False, "chưa bấm được chip", plan)
+            road += "B"
+            self.assertFalse(self.next_hand(sim, road))
+            self.assertEqual(sim.place_skips, expected)
+        self.assertFalse(sim.running)
+        self.assertIn("kiểm tra khay chip", sim.note)
+        self.assertEqual(sim.money.balance, CAPITAL)
+        self.assertEqual(len(sim.log), app.PLACE_SKIP_LIMIT)
+
+    def test_confirmation_later_than_the_result_does_not_claim_that_hand(self):
+        sim = self.simulation()
+        plan = sim.pending
+        sim.mark_placing(plan)
+        self.assertFalse(self.next_hand(sim, BASELINE + "B"))
+        self.assertTrue(sim.mark_placed(True, "Đã đặt 1 đơn vị chip", plan))
+        self.assertFalse(self.next_hand(sim, BASELINE + "B"))
+        self.assertFalse(sim.running)
+        self.assertEqual(sim.letters, BASELINE)
+        self.assertEqual(sim.money.balance, CAPITAL)
+        self.assertEqual(sim.log, [])
+        self.assertIn("đối chiếu chip", sim.note)
+
+    def test_hands_are_still_counted_when_no_placement_is_tracked(self):
+        """Giả lập thuần (Tự đặt chip tắt): không có mark_placing thì mọi tay vẫn tính."""
+        sim = self.simulation()
+        self.assertTrue(self.next_hand(sim, BASELINE + "B"))
+        self.assertEqual(sim.letters, BASELINE + "B")
+        self.assertEqual(len(sim.log), 1)
+        self.assertNotEqual(sim.money.balance, CAPITAL)
+
+    def test_a_late_result_cannot_label_the_plan_that_replaced_it(self):
+        sim = self.simulation()
+        old = sim.pending
+        sim.mark_placing(old)
+        fresh = {key: value for key, value in old.items() if key not in ("placed", "placing_at")}
+        sim.pending = dict(fresh, armed_at=self.now)
+        self.assertFalse(sim.mark_placed(True, "kết quả của lượt cũ", old))
+        self.assertNotIn("placed", sim.pending)
+        self.assertEqual(old["placed"], "pending")
+
+
+class AutoPlaceReportingTests(unittest.TestCase):
+    """Lượt tự đặt chip phải báo kết quả về sim ở MỌI nhánh thoát, kể cả nhánh lỗi."""
+
+    class InlineThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    def setUp(self):
+        self.now = 1_800_000_000.0
+        clock = patch.object(app.time, "time", side_effect=lambda: self.now)
+        clock.start()
+        self.addCleanup(clock.stop)
+
+    def host(self, sim, **changes):
+        host = SimpleNamespace(
+            sim=sim,
+            auto_place_var=Mock(get=Mock(return_value=True)),
+            human_mouse_var=Mock(get=Mock(return_value=False)),
+            place_busy=False, exit_requested=False,
+            _chip_unit=Mock(return_value=UNIT),
+            chip_live={"denominations": [1, 2, 5]},
+            place_status=Mock(),
+            events=queue.Queue(), browser=Mock(),
+            _wait_for_next_hand=Mock(return_value=(True, "")),
+        )
+        # place_armed_bet gọi các helper qua self; host rút gọn phải có đúng method thật.
+        for name in ("_set_place_status", "_finish_place", "_on_placed"):
+            setattr(host, name, MethodType(getattr(app.BCRApp, name), host))
+        for key, value in changes.items():
+            setattr(host, key, value)
+        return host
+
+    def simulation(self):
+        book = M.MoneyBook(capital=CAPITAL, unit=UNIT, take_profit_pct=100)
+        row = dict(key="baccarat01", label="Baccarat 01", letters=BASELINE,
+                   ts=self.now, stable=2, conflict=False)
+        sim = app.LiveSimulation(book, ladder=[UNIT * m for m in (1, 3, 7, 15, 32, 64)])
+        sim.bind(row)
+        self.assertTrue(sim.start(row, verified=True, now=self.now))
+        return sim
+
+    def run_placement(self, host, place_bet=None, threads=True):
+        thread = self.InlineThread if threads else Mock()
+        with patch.object(app.threading, "Thread", thread), \
+             patch.object(TB, "place_bet", place_bet or Mock(return_value=(True, "Đã đặt", {1: 1}))):
+            app.BCRApp.place_armed_bet(host, host.sim.pending)
+            while not host.events.empty():
+                kind, data = host.events.get_nowait()
+                self.assertEqual(kind, "placed")
+                app.BCRApp._on_placed(host, *data)
+        return thread
+
+    def test_success_is_reported_against_the_plan_that_started_it(self):
+        host = self.host(self.simulation())
+        plan = host.sim.pending
+        self.run_placement(host)
+        self.assertEqual(plan["placed"], "ok")
+        self.assertEqual(plan["baseline"], BASELINE)
+        self.assertFalse(host.place_busy)
+
+    def test_gate_timeout_is_reported_as_not_placed(self):
+        host = self.host(self.simulation(),
+                         _wait_for_next_hand=Mock(return_value=(False, "bàn vẫn còn chip ván trước")))
+        plan = host.sim.pending
+        self.run_placement(host)
+        self.assertEqual(plan["placed"], "failed")
+        self.assertIn("chip ván trước", plan["place_note"])
+
+    def test_a_crash_inside_the_placement_thread_still_reports(self):
+        host = self.host(self.simulation())
+        plan = host.sim.pending
+        self.run_placement(host, place_bet=Mock(side_effect=RuntimeError("boom")))
+        self.assertEqual(plan["placed"], "failed")
+        self.assertIn("Lỗi khi tự đặt chip", plan["place_note"])
+
+    def test_busy_placer_reports_instead_of_staying_silent(self):
+        host = self.host(self.simulation(), place_busy=True)
+        plan = host.sim.pending
+        threads = self.run_placement(host, threads=False)
+        threads.assert_not_called()
+        self.assertEqual(plan["placed"], "failed")
+        self.assertIn("chưa xong", plan["place_note"])
+        self.assertTrue(host.place_busy)
+
+    def test_stake_that_no_chip_can_form_reports_instead_of_staying_silent(self):
+        host = self.host(self.simulation(), _chip_unit=Mock(return_value=UNIT * 1000))
+        plan = host.sim.pending
+        threads = self.run_placement(host, threads=False)
+        threads.assert_not_called()
+        self.assertEqual(plan["placed"], "failed")
+        self.assertIn("không ghép được", plan["place_note"])
+
+    def test_closing_the_app_reports_the_cancellation(self):
+        host = self.host(self.simulation(), exit_requested=True)
+        plan = host.sim.pending
+        threads = self.run_placement(host, threads=False)
+        threads.assert_not_called()
+        self.assertEqual(plan["placed"], "failed")
+
+    def test_auto_place_off_leaves_the_plan_untracked(self):
+        host = self.host(self.simulation(), auto_place_var=Mock(get=Mock(return_value=False)))
+        plan = host.sim.pending
+        self.run_placement(host, threads=False)
+        self.assertNotIn("placed", plan)
+
+    def test_a_result_for_another_plan_does_not_touch_the_current_one(self):
+        host = self.host(self.simulation())
+        current = host.sim.pending
+        other = dict(current, armed_at=self.now)
+        app.BCRApp._on_placed(host, True, "kết quả lượt cũ", other)
+        self.assertFalse(host.place_busy)
+        self.assertNotIn("placed", current)
+        self.assertNotIn("placed", other)
 
 
 if __name__ == "__main__":

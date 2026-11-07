@@ -8,6 +8,7 @@ những bàn đã thích. Không gọi API nội bộ, không đọc cookie/toke
 """
 
 import json
+import random
 import re
 import time
 from urllib.parse import urlsplit
@@ -124,6 +125,23 @@ SCROLL_JS = """(() => {
         n = n.parentElement;
     }
     return -1;
+})()"""
+
+# Hộp (x, y, width, height) của khung cuộn danh sách bàn, để đặt chuột vào giữa
+# trước khi lăn thật — không lăn tại một điểm cố định ngoài danh sách.
+SCROLL_BOX_JS = """(() => {
+    let n = document.querySelector('[data-role="table-tile"]');
+    while (n) {
+        const st = getComputedStyle(n);
+        if (/(auto|scroll)/.test(st.overflowY) && n.scrollHeight > n.clientHeight + 20) {
+            const r = n.getBoundingClientRect();
+            if (r.width < 10 || r.height < 10) return null;
+            return {x: r.x + r.width / 2, y: r.y + r.height / 2,
+                    width: r.width, height: r.height};
+        }
+        n = n.parentElement;
+    }
+    return null;
 })()"""
 
 TILE_BOX_JS = """(() => {
@@ -276,6 +294,12 @@ class LobbyStream:
         self._seq = 0
         self.human_mouse = bool(human_mouse)
         self._cursor = None
+        self._cursor_overlay_shown = False
+        # True nếu lần bấm gần nhất phải rơi về cú bấm 3-sự-kiện vì HumanMouse lỗi
+        # giữa chừng (gói ghost-cursor hỏng, mất kết nối CDP tạm thời...). UI có thể
+        # đọc cờ này để biết vì sao chuột ảo không di chuyển cho một cú bấm cụ thể.
+        self.last_mouse_fallback = False
+        self.rng = random.Random()
         self.session_lost = False
         self.favorite_mode = ""
 
@@ -380,15 +404,74 @@ class LobbyStream:
             self._cursor = (float(x), float(y))
             return
         try:
-            mouse = HM.HumanMouse(lambda method, params: self._command(ws, method, params))
+            command = lambda method, params=None: self._command(ws, method, params)
+            if not self._cursor_overlay_shown:
+                # Lớp con trỏ xanh giống mouse_demo.py: chỉ hiển thị, không chiếm
+                # quyền chuột hệ điều hành và không đổi dữ liệu gửi đi.
+                HM.install_cursor_overlay(command)
+                self._cursor_overlay_shown = True
+            mouse = HM.HumanMouse(command)
             if self._cursor is not None:
                 mouse.last = self._cursor
             mouse.click(x, y)
             self._cursor = (float(x), float(y))
+            self.last_mouse_fallback = False
         except Exception:
-            # Không để một cú lướt chuột hỏng chặn việc vào bàn.
+            # Không để một cú lướt chuột hỏng chặn việc vào bàn. Ghi lại để biết
+            # chuột người thật đã tạm rơi về cú bấm 3-sự-kiện cho lượt này — nếu
+            # không, "không thấy chuột ảo di chuyển" sẽ không có dấu vết nào để tra.
+            self.last_mouse_fallback = True
             self._dispatch_click(ws, x, y)
             self._cursor = (float(x), float(y))
+
+    def _wheel_scroll_to(self, ws, context_id, target_top, box):
+        """Cuộn danh sách bàn bằng chuột lăn thật, thay vì gán ``scrollTop`` bằng JS.
+
+        Di chuột (ghost-cursor) tới giữa khung danh sách rồi gửi nhiều cú lăn nhỏ
+        qua ``Input.dispatchMouseWheelEvent`` cho tới khi đạt ``target_top`` hoặc hết
+        kiên nhẫn — mô phỏng người dùng lăn chuột, không nhảy thẳng một bước lớn.
+        Trả vị trí cuộn đọc được cuối cùng (``int``) hoặc ``-1`` nếu hỏng.
+        """
+        if not self.human_mouse or box is None:
+            result = self._evaluate(ws, SCROLL_JS % int(target_top), context_id)
+            return result.get("result", {}).get("value", -1)
+        command = lambda method, params=None: self._command(ws, method, params)
+        if not self._cursor_overlay_shown:
+            HM.install_cursor_overlay(command)
+            self._cursor_overlay_shown = True
+        mouse = HM.HumanMouse(command)
+        if self._cursor is not None:
+            mouse.last = self._cursor
+        px = box["x"] + box["width"] * 0.5
+        py = box["y"] + box["height"] * 0.5
+        try:
+            mouse.move_to(px, py)
+            self._cursor = (px, py)
+        except Exception:
+            pass
+        current = self._try_value(ws, SCROLL_JS % -1, context_id)
+        current = current if isinstance(current, (int, float)) else 0
+        remaining = float(target_top) - float(current)
+        attempts = 0
+        # Mỗi cú lăn chỉ đi một đoạn nhỏ (như bàn di chuột thật), tối đa 14 cú mỗi lượt
+        # gọi để không treo lâu nếu trang không phản hồi scroll.
+        while abs(remaining) > 4 and attempts < 14:
+            step = max(-220.0, min(220.0, remaining)) * self.rng.uniform(0.55, 0.95)
+            try:
+                self._command(ws, "Input.dispatchMouseWheelEvent", {
+                    "x": px, "y": py, "deltaX": 0, "deltaY": step})
+            except Exception:
+                break
+            time.sleep(0.03 + 0.03 * random.random())
+            current = self._try_value(ws, SCROLL_JS % -1, context_id)
+            if not isinstance(current, (int, float)):
+                break
+            remaining = float(target_top) - float(current)
+            attempts += 1
+        # Chốt đúng vị trí đích bằng JS: lăn chuột có thể bị trình duyệt làm tròn/giới
+        # hạn tốc độ nên không khớp pixel tuyệt đối; việc đọc bảng cầu cần đúng vị trí.
+        result = self._evaluate(ws, SCROLL_JS % int(target_top), context_id)
+        return result.get("result", {}).get("value", -1)
 
     @staticmethod
     def _star_favorites(snapshot):
@@ -502,13 +585,16 @@ class LobbyStream:
                     snapshot = fresh
             deadline = time.monotonic() + max_seconds
             start_top = snapshot["scroll"]["top"]
+            scroll_box = self._try_value(ws, SCROLL_BOX_JS, context_id)
+            if not isinstance(scroll_box, dict):
+                scroll_box = None
             steps = 0
             seen = set()
             tiles = {}
             stagnant = 0
             position = 0
             while time.monotonic() < deadline and steps < MAX_SCROLL_STEPS:
-                self._evaluate(ws, SCROLL_JS % position, context_id)
+                self._wheel_scroll_to(ws, context_id, position, scroll_box)
                 time.sleep(SCROLL_SETTLE)
                 result = self._evaluate(ws, TILES_JS, context_id)
                 snapshot = result.get("result", {}).get("value") or snapshot
@@ -529,7 +615,7 @@ class LobbyStream:
                     break
                 position = min(position + SCROLL_STEP, bottom)
                 steps += 1
-            self._evaluate(ws, SCROLL_JS % start_top, context_id)
+            self._wheel_scroll_to(ws, context_id, start_top, scroll_box)
             favorite_ids = None
             if favorites_only:
                 if self.favorite_mode == "stars":
@@ -834,8 +920,8 @@ class LobbyStream:
                    for page in (self.session._last_cdp_targets
                                 if isinstance(self.session._last_cdp_targets, list) else [])):
                 return False, self._health_note({"status": "auth", "entry": True})
-            return False, ("Chưa thấy tab sảnh Baccarat. Hãy tự mở %s → EVO → Baccarat trong cửa sổ "
-                           "Chrome rồi bấm lại nút này." % BR.PORTAL_HOST)
+            return False, ("Chưa thấy tab sảnh Baccarat. Hãy tự mở trang cổng của bạn → EVO → Baccarat "
+                           "trong cửa sổ Chrome rồi bấm lại nút này.")
         expired = ""
         # Tab vừa launch thường nằm cuối danh sách; thử tab mới trước, bỏ qua tab cũ đã EV.7.
         for lobby in reversed(lobbies):
@@ -859,6 +945,56 @@ class LobbyStream:
         return False, expired or ("Tab sảnh báo phiên Evolution không còn hợp lệ. Hãy đăng nhập lại "
                                   "ở trang gốc rồi mở lại EVO; app không đổi link sảnh.")
 
+    def reload_portal(self, wait_seconds=20):
+        """Tải lại tab trang vào NEO79 (an toàn: đây là trang thường, không phải /entry).
+
+        Dùng khi sảnh EVO đã bị site đá phiên và nút “Chơi game” không còn mở được tab mới:
+        trang vào có thể đã mất trạng thái. Tải lại trang vào lấy lại phiên cổng để lần bấm
+        sau mở EVO bằng một launch token mới thay vì lặp lại token cũ đã chết.
+
+        Không đụng tới tab EVO, không sửa URL sảnh, không chạm khu vực cược.
+        """
+        import websocket
+
+        self._reset()
+        ws = None
+        try:
+            portal = next((page for page in self.session._cdp_pages()
+                           if BR.is_portal_url(page.get("url"))), None)
+            if portal is None:
+                return False, ("Không có tab HTTPS nào để tải lại; hãy mở trang cổng của bạn "
+                               "và đăng nhập.")
+            ws = websocket.create_connection(
+                BR.validated_endpoint(portal), suppress_origin=True, timeout=BR.SCRIPT_TIMEOUT,
+                redirect_limit=0, http_no_proxy=["127.0.0.1", "localhost", "::1"])
+            self._command(ws, "Page.enable")
+            self._command(ws, "Page.reload", {"ignoreCache": False})
+            ws.close()
+            ws = None
+            deadline = time.monotonic() + wait_seconds
+            while time.monotonic() < deadline:
+                time.sleep(1.0)
+                page = next((p for p in self.session._cdp_pages()
+                             if BR.is_portal_url(p.get("url"))), None)
+                if page is None:
+                    continue
+                state = self._lobby_status(page, wait_seconds=2.0)
+                status = state.get("status")
+                if status == "ok":
+                    return True, "Đã tải lại trang vào, phiên cổng còn hiệu lực."
+                if status == "auth":
+                    return False, ("Tải lại trang vào xong nhưng cổng vẫn báo đăng xuất; "
+                                   "hãy đăng nhập lại trên trang cổng rồi thử lại.")
+            return True, "Đã tải lại trang vào; nếu nút “Chơi game” vẫn không mở, hãy đăng nhập lại."
+        except Exception as exc:
+            return False, "Không tải lại được trang vào (%s)." % type(exc).__name__
+        finally:
+            if ws is not None:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+
     def open_lobby_from_portal(self, wait_seconds=30):
         """Bấm “Chơi game” của Evolution trên trang vào và nhận tab sảnh vừa mở.
 
@@ -878,8 +1014,8 @@ class LobbyStream:
             portal = next((page for page in self.session._cdp_pages()
                            if BR.is_portal_url(page.get("url"))), None)
             if portal is None:
-                return False, ("Không có tab trang vào %s trong Chrome CDP 9222; hãy mở %s "
-                               "và đăng nhập." % (BR.PORTAL_HOST, BR.START_URL))
+                return False, ("Không có tab HTTPS nào đang mở trong Chrome CDP 9222; hãy mở trang "
+                               "cổng của bạn, đăng nhập, rồi bấm lại nút này.")
             ws = connect(portal)
             self._command(ws, "Runtime.enable")
             box, reason, deadline = None, "evo_item_not_found", time.monotonic() + wait_seconds

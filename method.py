@@ -2,7 +2,8 @@
 """Các phương pháp vào cầu: lọc bàn, đánh khối bên mạnh -> bên đổi, bậc cược nhập tay theo khối.
 
 Quy tắc của người dùng:
-1. Chọn bàn: đã đi 15-20 tay, cầu ngắn (không có bệt từ 7 tay trở lên), chưa từng có cầu 3-3.
+1. Chọn bàn: đã đi trong khoảng tay người dùng đặt (mặc định 10-50),
+   cầu ngắn (không có bệt từ 6 tay trở lên), chưa từng có cầu 3-3.
 2. Cầu đang mạnh bên nào -> đánh mấy tay đầu khối bên đó, rồi đổi sang bên kia mấy tay còn lại.
    Khối 3-3 đi 6 tay, khối 3-2 đi 5 tay.
 3. Thắng thì quay về bậc 1. Thua thì sang bậc kế tiếp trong danh sách mức cược người dùng nhập.
@@ -21,18 +22,36 @@ PROFILES = {          # (số tay bên mạnh, số tay bên đổi) của một
 }
 DEFAULT_PROFILE = "3-3"
 # Mức cược mặc định chỉ để điền sẵn vào ô nhập; người dùng tự đổi từng bậc, không nhân cứng.
+# Đơn vị theo đúng số hiển thị trên sàn (VN2): bậc 1 = 100, không phải 100.000.
 DEFAULT_LADDER = {
-    "3-3": [100_000, 300_000, 700_000, 1_500_000, 3_100_000, 6_400_000],
-    "3-2": [40_000, 160_000, 360_000, 740_000, 1_700_000],
+    "3-3": [100, 300, 700, 1500, 3100, 6400],
+    "3-2": [40, 160, 360, 740, 1700],
 }
 # Hệ số nhân cố định cho cơ chế "tự nhân": bậc n = bậc 1 × MULTIPLIER_LADDER[n-1].
 # Cấu trúc gốc 1-3-7-15-32-64; khối 3-2 chỉ cần 5 bậc đầu.
 MULTIPLIER_LADDER = (1, 3, 7, 15, 32, 64)
 PROFILE_LABEL = {"3-3": "3-3 · 6 tay (3 mạnh + 3 đổi)", "3-2": "3-2 · 5 tay (3 mạnh + 2 đổi)"}
-STREAK_IS_BET = 7       # từ 7 tay liên tiếp tính là bệt -> loại bàn
-MIN_HANDS = 15
-MAX_HANDS = 20
-LOOKBACK_STRONG = 10    # số tay phân thắng bại gần nhất để xác định bên mạnh
+MAX_STREAK_ALLOWED = 6  # bệt tối đa 6 tay còn nhận; từ 7 tay liền loại bàn
+MIN_HANDS = 10
+MAX_HANDS = 50
+# Người dùng chỉnh khoảng tay đã đi trong Cài đặt; hai mốc dưới là biên hợp lệ.
+HANDS_LOWER = 10
+HANDS_UPPER = 50
+
+
+def normalize_hand_range(min_hands=MIN_HANDS, max_hands=MAX_HANDS):
+    """Chuẩn hoá khoảng tay đã đi: kẹp trong HANDS_LOWER..HANDS_UPPER và bảo đảm min<=max."""
+    def clamp(value, fallback):
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            number = fallback
+        return max(HANDS_LOWER, min(HANDS_UPPER, number))
+    low = clamp(min_hands, MIN_HANDS)
+    high = clamp(max_hands, MAX_HANDS)
+    if low > high:
+        low, high = high, low
+    return low, high
 
 
 def block_hands(profile):
@@ -70,7 +89,11 @@ def parse_road(text):
     return [mapping[ch] for ch in text.upper() if ch in mapping]
 
 
-def has_long_streak(results, limit=STREAK_IS_BET):
+def has_long_streak(results, limit=MAX_STREAK_ALLOWED + 1):
+    """Tìm vệt dài vượt mức cho phép: vệt dài hơn ``limit - 1`` bị coi là bệt.
+
+    Mặc định loại bàn khi có 7 tay liền trở lên (tức chỉ nhận tối đa 6 tay).
+    """
     for side, length in E.run_lengths(results):
         if length >= limit:
             return side, length
@@ -86,10 +109,18 @@ def has_3_3(results):
     return False, None
 
 
-def strong_side(results, lookback=LOOKBACK_STRONG):
-    """Bên mạnh = nhiều tay thắng hơn trong lookback tay phân thắng bại gần nhất.
-    Hòa điểm thì lấy bên của vệt hiện tại."""
-    dec = E.decisions_only(results)[-lookback:]
+def strong_side(results, lookback=None):
+    """Bên mạnh = bên ra nhiều tay hơn trên TOÀN BỘ ván đang đi (đúng số liệu
+    Banker/Player hiển thị trên UI), không chỉ vài tay gần nhất. Hòa điểm thì
+    lấy bên của vệt hiện tại.
+
+    ``lookback`` được giữ lại trong chữ ký để tương thích lời gọi cũ nhưng
+    không còn cắt bớt lịch sử; truyền số dương vẫn hoạt động như trước nếu có
+    nơi nào cố tình muốn giới hạn, nhưng mặc định None nghĩa là toàn ván.
+    """
+    dec = E.decisions_only(results)
+    if lookback:
+        dec = dec[-lookback:]
     if not dec:
         return None, {}
     b, p = dec.count(E.BANKER), dec.count(E.PLAYER)
@@ -103,6 +134,7 @@ def strong_side(results, lookback=LOOKBACK_STRONG):
 
 def check_table(results, min_hands=MIN_HANDS, max_hands=MAX_HANDS):
     """Kết luận bàn này có đủ điều kiện để vào theo nguyên tắc 1 hay không."""
+    min_hands, max_hands = normalize_hand_range(min_hands, max_hands)
     hands = len(results)
     streak_side, streak_len = has_long_streak(results)
     already_33, pair = has_3_3(results)
@@ -110,7 +142,7 @@ def check_table(results, min_hands=MIN_HANDS, max_hands=MAX_HANDS):
     if streak_side:
         streak_detail = "có bệt %s %d tay" % (E.SIDE_NAME[streak_side], streak_len)
     else:
-        streak_detail = "chưa có vệt nào tới %d tay" % STREAK_IS_BET
+        streak_detail = "chưa có vệt nào quá %d tay" % MAX_STREAK_ALLOWED
     if already_33:
         three3_detail = "đã có 3-3 (%s-%s)" % (E.SIDE_NAME[pair[0]], E.SIDE_NAME[pair[1]])
     else:
@@ -120,7 +152,7 @@ def check_table(results, min_hands=MIN_HANDS, max_hands=MAX_HANDS):
         {"name": "Số tay đã đi %d-%d" % (min_hands, max_hands),
          "ok": min_hands <= hands <= max_hands,
          "detail": "ván này đã đi %d tay" % hands},
-        {"name": "Cầu ngắn, không bệt từ %d tay" % STREAK_IS_BET,
+        {"name": "Cầu ngắn, bệt tối đa %d tay" % MAX_STREAK_ALLOWED,
          "ok": streak_side is None, "detail": streak_detail},
         {"name": "Chưa từng có cầu 3-3", "ok": not already_33, "detail": three3_detail},
     ]
@@ -180,7 +212,7 @@ def plan(results, stakes, ladder_step=0, hands_in_block=0, started=False,
     reason = "%s: tay %d/%d của khối %s, bậc %d/%d -> bắt %s %s." % (
         label, pos + 1, block, profile, ladder_step + 1, len(stakes),
         E.SIDE_NAME[side], M.fmt_money(stake))
-    if streak_side and streak_len >= STREAK_IS_BET:
+    if streak_side:
         reason += " Cẩn thận: bàn vừa xuất hiện bệt %d tay." % streak_len
     if already_33:
         reason += " Bàn đã có 3-3, nguyên tắc 1 không còn thoả."

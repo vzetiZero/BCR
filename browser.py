@@ -63,17 +63,7 @@ def is_lobby_host(host):
     tra riêng trong is_lobby_url; nhờ vậy mirror hiện tại vẫn dùng được mà không
     phải sửa danh sách đuôi cứng mỗi lần site đổi tên.
     """
-    if not isinstance(host, str) or not 4 <= len(host) <= 253:
-        return False
-    if host != host.lower() or host.startswith(".") or host.endswith(".") or ".." in host:
-        return False
-    if host == "localhost" or host.endswith(".localhost") or host.endswith(".local"):
-        return False
-    if re.fullmatch(r"[0-9.]+", host) or ":" in host:
-        return False
-    return re.fullmatch(
-        r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
-        r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+", host) is not None
+    return is_public_host(host)
 
 
 def is_lobby_url(url):
@@ -108,25 +98,65 @@ def is_evo_entry_url(url):
         return False
 
 
-def is_portal_url(url):
-    """Trang vào cổng: chỉ dùng https://www.neo179.com/gamelobby/live."""
-    if not isinstance(url, str) or "\\" in url:
+def is_public_host(host):
+    """Tên miền công khai hợp lệ: có dấu chấm, không phải IP/localhost/tên nội bộ."""
+    if not isinstance(host, str) or not 4 <= len(host) <= 253:
+        return False
+    if host != host.lower() or host.startswith(".") or host.endswith(".") or ".." in host:
+        return False
+    if host == "localhost" or host.endswith(".localhost") or host.endswith(".local"):
+        return False
+    if re.fullmatch(r"[0-9.]+", host) or ":" in host:
+        return False
+    return re.fullmatch(
+        r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+        r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+", host) is not None
+
+
+def is_portal_host(host):
+    """Giữ tên cũ cho tương thích; nay nhận mọi tên miền công khai.
+
+    App không còn phụ thuộc trang chủ cụ thể: bạn có thể vào bất kỳ cổng nào rồi tự
+    mở sảnh. Việc nhận diện sảnh EVO vẫn dựa trên đường dẫn /frontend/evo/r3.
+    """
+    return is_public_host(host)
+
+
+def is_public_https_url(url):
+    """HTTPS trên tên miền công khai, cổng 443, không userinfo/ký tự điều khiển."""
+    if not isinstance(url, str) or not url or "\\" in url:
         return False
     if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in url):
         return False
     try:
         parsed = urlsplit(url)
-        return (parsed.scheme == "https" and parsed.hostname == PORTAL_HOST
-                and parsed.path.startswith(PORTAL_PATH)
+        return (parsed.scheme == "https" and is_public_host(parsed.hostname)
                 and parsed.username is None and parsed.password is None
                 and parsed.port in (None, 443))
     except (ValueError, TypeError):
         return False
 
 
+def is_portal_url(url):
+    """Trang thường (không phải sảnh EVO, không phải /entry) trên tên miền công khai.
+
+    Dùng để nhận diện "tab cổng" khi cần mở sảnh hoặc tải lại trang vào. Không ràng
+    buộc tên miền nào, nên đổi nhà cái/cổng không phải sửa code.
+    """
+    return (is_public_https_url(url) and not is_lobby_url(url)
+            and not is_evo_entry_url(url))
+
+
 def valid_site_url(url):
-    """Chỉ HTTPS đúng host, cổng mặc định, không userinfo hoặc URL cục bộ."""
-    return is_lobby_url(url) or is_portal_url(url)
+    """Cho phép mọi trang HTTPS công khai (trừ trang /entry dùng-một-lần của EVO).
+
+    App không còn gắn với một trang chủ cụ thể: bạn vào cổng nào cũng được. Trang
+    /entry bị loại vì tải lại nó là mất phiên; đọc/đặt chip vẫn chỉ chạy khi trang
+    thật sự có sảnh EVO hoặc bảng cầu.
+    """
+    if not is_public_https_url(url):
+        return False
+    return not is_evo_entry_url(url)
 
 
 def _safe_url(url):
