@@ -16,6 +16,7 @@ import json
 import time
 
 import browser as BR
+import human_mouse as HM
 
 SIDES = ("B", "P", "T")
 SPOT_ROLE = (("Banker", "B"), ("Player", "P"), ("Tie", "T"))
@@ -242,6 +243,138 @@ def read(session, timeout=None, unit=DEFAULT_CHIP_UNIT):
     except Exception as exc:
         out["error"] = type(exc).__name__
         return out
+    finally:
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+
+# Vị trí (tâm) của ô cược và của từng chip mệnh giá trên khay, trả về bằng getBoundingClientRect.
+TARGETS_JS = r"""(() => {
+  const center = (r) => (r.width > 4 && r.height > 4
+    ? {x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2)} : null);
+  const role = %s;
+  const spot = document.querySelector('[data-role="bet-spot-' + role + '"]');
+  const tray = document.querySelector('[data-role="chip-stack"]');
+  const chips = {};
+  if (tray) {
+    for (const el of tray.querySelectorAll('[data-role="chip"][data-value]')) {
+      const v = parseInt(el.getAttribute('data-value'), 10);
+      if (Number.isInteger(v) && v > 0 && !(v in chips)) {
+        const c = center(el.getBoundingClientRect());
+        if (c) chips[v] = c;
+      }
+    }
+  }
+  return {spot: spot ? center(spot.getBoundingClientRect()) : null, chips};
+})()"""
+
+
+def place_bet(session, side, chips, unit=DEFAULT_CHIP_UNIT, human_mouse=True,
+              click_delay=0.28):
+    """Dùng chuột đặt các chip (kết quả của ``decompose``) vào ô cược ``side``.
+
+    Evolution Baccarat: bấm một chip mệnh giá trên khay để chọn mệnh giá đó, rồi mỗi
+    cú bấm vào ô bet-spot đặt thêm một chip mệnh giá đó. Vì vậy đặt ``count`` chip cùng
+    mệnh giá nghĩa là bấm ô cược ``count`` lần liên tiếp.
+
+    side: 'B' (Banker), 'P' (Player) hoặc 'T' (Tie).
+    chips: danh sách mệnh giá hiển thị (đơn vị) cần bấm, từ ``decompose``.
+
+    Trả (ok, note, placed) trong đó placed là dict mệnh giá -> số chip đã bấm được.
+    Không ném lỗi ra UI; mọi lỗi gói vào note.
+    """
+    role = {"B": "Banker", "P": "Player", "T": "Tie"}.get(side)
+    placed = {}
+    if role is None:
+        return False, "Cửa không hợp lệ: %r." % (side,), placed
+    chips = [int(c) for c in (chips or []) if int(c) > 0]
+    if not chips:
+        return False, "Không có chip nào để bấm.", placed
+    ws = None
+    try:
+        page = session._cdp_page()
+        if page is None:
+            return False, "Không có tab đang mở để đặt chip.", placed
+        import websocket
+        ws = websocket.create_connection(
+            BR.validated_endpoint(page), suppress_origin=True, timeout=BR.SCRIPT_TIMEOUT,
+            redirect_limit=0, http_no_proxy=["127.0.0.1", "localhost", "::1"])
+        seq = 0
+        contexts = []
+
+        def command(method, params=None):
+            nonlocal seq
+            seq += 1
+            ws.send(json.dumps({"id": seq, "method": method, "params": params or {}}))
+            deadline = time.monotonic() + BR.SCRIPT_TIMEOUT
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("cdp_timeout")
+                ws.settimeout(remaining)
+                message = json.loads(ws.recv())
+                if message.get("method") == "Runtime.executionContextCreated":
+                    context = message.get("params", {}).get("context", {})
+                    if (context.get("auxData") or {}).get("isDefault"):
+                        contexts.append(context["id"])
+                if message.get("id") == seq:
+                    if "error" in message:
+                        raise RuntimeError("cdp_command_failed")
+                    return message.get("result", {})
+
+        command("Runtime.enable")
+        deadline = time.monotonic() + 6
+        while not contexts and time.monotonic() < deadline:
+            command("Runtime.evaluate", {"expression": "1", "returnByValue": True})
+
+        targets = None
+        for context_id in list(contexts):
+            value = command("Runtime.evaluate", {
+                "expression": TARGETS_JS % json.dumps(role), "contextId": context_id,
+                "returnByValue": True, "silent": True,
+                "timeout": BR.SCRIPT_TIMEOUT * 1000}).get("result", {}).get("value")
+            if isinstance(value, dict) and value.get("spot"):
+                targets = value
+                break
+        if targets is None:
+            return False, "Không tìm thấy ô cược %s hoặc khay chip." % role, placed
+
+        spot = targets["spot"]
+        tray_chips = targets.get("chips") or {}
+        try:
+            command("Page.bringToFront")
+        except Exception:
+            pass
+
+        mouse = HM.HumanMouse(lambda method, params: command(method, params),
+                              enabled=bool(human_mouse))
+
+        # Gộp chip cùng mệnh giá để bấm ô cược đúng số lần.
+        counts = {}
+        for denom in chips:
+            counts[denom] = counts.get(denom, 0) + 1
+
+        for denom in sorted(counts, reverse=True):
+            pos = tray_chips.get(denom)
+            if pos is None:
+                continue
+            mouse.click(pos["x"], pos["y"])
+            time.sleep(click_delay)
+            for _ in range(counts[denom]):
+                mouse.click(spot["x"], spot["y"])
+                time.sleep(click_delay)
+            placed[denom] = counts[denom]
+
+        if not placed:
+            return False, "Không bấm được chip nào (mệnh giá cần không có trên khay).", placed
+        total_units = sum(k * v for k, v in placed.items())
+        return True, ("Đã đặt %d đơn vị chip vào %s (%s)." % (
+            total_units, role, ", ".join("%d×%d" % (v, k) for k, v in sorted(placed.items())))), placed
+    except Exception as exc:
+        return False, "Không đặt được chip (%s)." % type(exc).__name__, placed
     finally:
         if ws is not None:
             try:

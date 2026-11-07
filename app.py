@@ -116,6 +116,7 @@ class LiveSimulation:
         self.note = "Chọn bàn để theo dõi."
         self.block_hands = 0
         self.cycle_done = False
+        self.on_arm = None
 
     @property
     def cycle_hands(self):
@@ -193,6 +194,8 @@ class LiveSimulation:
         self.pending = dict(plan, armed_at=time.time(), baseline=self.letters)
         self.note = "Chờ %s · %s đ · ván kế tiếp." % (
             E.SIDE_NAME[plan["side"]], M.fmt_money(plan["stake"]))
+        if self.on_arm is not None:
+            self.on_arm(plan)
 
     def process(self, row, now=None):
         if not self.running:
@@ -255,6 +258,7 @@ class BCRApp:
     def __init__(self, root, state_file=STATE_FILE, auto_connect=True):
         self.root, self.state_file = root, Path(state_file)
         self.sim = LiveSimulation()
+        self.sim.on_arm = self.place_armed_bet
         self.ladder_store = {}
         self.ladder_shown_profile = None
         self.browser = BR.BrowserSession()
@@ -270,11 +274,14 @@ class BCRApp:
         self.cycle_retry_at = 0.0
         self.cycle_table_key = None
         self.session_lost = False
+        self.recover_busy = False
+        self.recover_attempts = 0
         self.trace_file = self.state_file.with_name("bcr_trace.jsonl")
         self.chip_live = None
         self.chip_check = None
         self.chip_read_at = 0.0
         self.chip_busy = False
+        self.place_busy = False
         self.stream = LS.LobbyStream(self.browser)
         self.sweep_note_text = "Quét sảnh để tìm bàn đạt 3 điều kiện."
         self.next_scan = 0
@@ -290,6 +297,10 @@ class BCRApp:
         self.auto_hunt_var = tk.BooleanVar(value=True)
         self.favorites_only = tk.BooleanVar(value=True)
         self.human_mouse_var = tk.BooleanVar(value=True)
+        self.auto_place_var = tk.BooleanVar(value=False)
+        self.auto_recover_var = tk.BooleanVar(value=True)
+        self.ladder_mode_var = tk.StringVar(value="manual")
+        self.ladder_base_var = tk.StringVar(value=M.fmt_input_money(ME.DEFAULT_LADDER[ME.DEFAULT_PROFILE][0]))
         self._last_sweep_favorites = False
         self.chrome_fullscreen_var = tk.BooleanVar(value=BR.WIN_FULLSCREEN)
         self.chrome_w_var = tk.StringVar(value=str(BR.WIN_W))
@@ -354,7 +365,7 @@ class BCRApp:
                                command=lambda k=key: self.show_page(k))
             button.pack(fill="x", padx=10, pady=3)
             self.nav_buttons[key] = button
-        self._label(sidebar, "CHỈ THEO DÕI\nKhông đặt tiền", 9, "#9badc5", justify="left").pack(
+        self._label(sidebar, "Loadding", 9, "#9badc5", justify="left").pack(
             side="bottom", anchor="w", padx=20, pady=24)
         main = tk.Frame(self.root, bg=BG)
         main.pack(side="left", fill="both", expand=True, padx=22, pady=18)
@@ -363,6 +374,14 @@ class BCRApp:
         self.page_title = self._label(header, "Tổng quan trực tiếp", 22, bold=True)
         self.page_title.pack(side="left")
         self._label(header, " DỮ LIỆU TRỰC TIẾP  /  VỐN ", 9, ACCENT, True).pack(side="right")
+        self.hunt_banner = tk.Frame(main, bg=PALE, highlightbackground=ACCENT, highlightthickness=1)
+        self.hunt_spinner = self._label(self.hunt_banner, "●", 13, ACCENT, True, bg=PALE)
+        self.hunt_spinner.pack(side="left", padx=(14, 8), pady=8)
+        self.hunt_text = self._label(self.hunt_banner, "", 10, ACCENT, True, bg=PALE, anchor="w", justify="left")
+        self.hunt_text.pack(side="left", fill="x", expand=True, pady=8)
+        self.hunt_cancel = self._button(self.hunt_banner, "Dừng tự quét", self.cancel_auto_hunt)
+        self.hunt_cancel.pack(side="right", padx=10, pady=6)
+        self._hunt_frame = 0
         connect = self._card(main)
         connect.pack(fill="x", pady=(0, 12))
         row = tk.Frame(connect, bg=PANEL)
@@ -402,8 +421,7 @@ class BCRApp:
         self.sweep_note.pack(side="left", fill="x", expand=True, padx=10)
         self.step_label = self._label(main, "", 9, MUTED, anchor="w")
         self.step_label.pack(fill="x", pady=(0, 12))
-        self._label(main, "Chỉ đối chiếu dữ liệu, không gửi lệnh đặt tiền.", 9, MUTED, anchor="w").pack(
-            side="bottom", fill="x", pady=(10, 0))
+
         self.stack = tk.Frame(main, bg=BG)
         self.stack.pack(fill="both", expand=True)
         self.stack.rowconfigure(0, weight=1)
@@ -487,7 +505,9 @@ class BCRApp:
                                        wraplength=330)
         self.chip_status.pack(fill="x", padx=14)
         self.chip_detail = self._label(plan, "", 9, MUTED, anchor="w", justify="left", wraplength=330)
-        self.chip_detail.pack(fill="x", padx=14, pady=(0, 8))
+        self.chip_detail.pack(fill="x", padx=14, pady=(0, 4))
+        self.place_status = self._label(plan, "", 9, MUTED, anchor="w", justify="left", wraplength=330)
+        self.place_status.pack(fill="x", padx=14, pady=(0, 8))
         self.verify_check = tk.Checkbutton(plan, text="Cầu khớp site · bàn chuẩn B 0,95 / P 1:1",
                                           variable=self.verified, bg=PANEL, fg=TEXT, selectcolor=PALE,
                                           activebackground=PANEL, font=("Segoe UI", 9), anchor="w")
@@ -588,12 +608,30 @@ class BCRApp:
             tk.Radiobutton(method, text=ME.PROFILE_LABEL[name], variable=self.profile_var, value=name,
                            command=self._rebuild_ladder_inputs, bg=PANEL, fg=TEXT, selectcolor=PALE,
                            activebackground=PANEL, font=("Segoe UI", 10)).pack(anchor="w")
+        self.ladder_mode_frame = tk.Frame(method, bg=PANEL)
+        self.ladder_mode_frame.pack(fill="x", pady=(10, 0))
+        self._label(self.ladder_mode_frame, "Cơ chế điền mức cược", 10, MUTED, True).pack(anchor="w")
+        self.ladder_mode_buttons = {}
+        for key, title in (("manual", "Tự config — điền từng bậc"),
+                           ("multiply", "Tự nhân — theo cấu trúc 1-3-7-15-32-64")):
+            tk.Radiobutton(self.ladder_mode_frame, text=title, variable=self.ladder_mode_var,
+                           value=key, command=self._on_ladder_mode_change, bg=PANEL, fg=TEXT,
+                           selectcolor=PALE, activebackground=PANEL, font=("Segoe UI", 10)).pack(anchor="w")
+        self.ladder_base_row = tk.Frame(method, bg=PANEL)
+        self.ladder_base_row.pack(fill="x", pady=(6, 0))
+        self._label(self.ladder_base_row, "Bậc 1 (đ)", 10, MUTED).pack(side="left", padx=(0, 8))
+        self.ladder_base_entry = tk.Entry(self.ladder_base_row, textvariable=self.ladder_base_var,
+                                          width=14, font=("Segoe UI", 11), relief="solid", bd=1)
+        self.ladder_base_entry.pack(side="left", ipady=4)
+        self._bind_money_input(self.ladder_base_entry, self.ladder_base_var)
+        self._label(self.ladder_base_row, "· các bậc sau tự nhân: ×3 ×7 ×15 ×32 ×64", 9, MUTED).pack(side="left", padx=8)
         self.ladder_frame = tk.Frame(method, bg=PANEL)
         self.ladder_frame.pack(fill="x", pady=(10, 0))
         self.ladder_vars = []
         self._rebuild_ladder_inputs()
         self._label(method, "Thắng ở bậc nào thì quay về bậc 1. Hòa giữ bậc và hoàn tiền.\n"
-                            "Mỗi ô là một tay trong khối — tự điền số tiền tùy ý, app không nhân cứng bậc sau với bậc trước.",
+                            "Tự config: mỗi ô là một tay trong khối, điền số tiền tùy ý.\n"
+                            "Tự nhân: chỉ điền bậc 1, app điền các bậc sau theo hệ số cố định.",
                     9, MUTED, justify="left").pack(anchor="w", pady=(6, 0))
         self._button(card, "Lưu phiên cũ & áp dụng phương pháp mới", self.apply_settings, True).pack(anchor="w", padx=20, pady=(14, 0))
         cycle = tk.Frame(card, bg=PANEL)
@@ -628,8 +666,16 @@ class BCRApp:
                           (self.cdp_var, "Chrome app mở có cổng 9222 (mặc định bật, để quét cả sảnh)")):
             tk.Checkbutton(card, text=text, variable=var, command=self._save_state, bg=PANEL,
                            activebackground=PANEL, font=("Segoe UI", 10)).pack(anchor="w", padx=16)
+        tk.Checkbutton(card, text="Tự phục hồi phiên khi bị văng “Bạn đã đăng xuất” (EV.7): tự mở lại EVO rồi quét tiếp",
+                       variable=self.auto_recover_var, command=self._save_state, bg=PANEL,
+                       fg=TEXT, selectcolor=PALE, activebackground=PANEL,
+                       font=("Segoe UI", 10)).pack(anchor="w", padx=16)
         tk.Checkbutton(card, text="Chuột người thật khi bấm sảnh/ô bàn (WindMouse + ghost-cursor)",
                        variable=self.human_mouse_var, command=self.apply_mouse_setting, bg=PANEL,
+                       fg=TEXT, selectcolor=PALE, activebackground=PANEL,
+                       font=("Segoe UI", 10)).pack(anchor="w", padx=16)
+        tk.Checkbutton(card, text="Tự đặt chip vào ô cược khi chốt kế hoạch (dùng DP ra số chip rồi bấm)",
+                       variable=self.auto_place_var, command=self._save_state, bg=PANEL,
                        fg=TEXT, selectcolor=PALE, activebackground=PANEL,
                        font=("Segoe UI", 10)).pack(anchor="w", padx=16)
         window = tk.Frame(card, bg=PANEL)
@@ -717,6 +763,7 @@ class BCRApp:
         for child in self.ladder_frame.winfo_children():
             child.destroy()
         self.ladder_vars = []
+        multiply = self.ladder_mode_var.get() == "multiply"
         for i, text in enumerate(raw):
             field = tk.Frame(self.ladder_frame, bg=PANEL)
             field.grid(row=i // 3, column=i % 3, padx=(0, 12), pady=(0, 8))
@@ -726,12 +773,55 @@ class BCRApp:
                              relief="solid", bd=1)
             entry.pack(ipady=4)
             self._bind_money_input(entry, var)
+            if multiply:
+                entry.config(state="readonly", readonlybackground=PALE)
             self.ladder_vars.append(var)
         self.ladder_shown_profile = profile
         self._sync_method_texts(profile)
+        self._sync_ladder_mode_state()
+
+    def _sync_ladder_mode_state(self):
+        """Đồng bộ trạng thái ô bậc 1 và các ô bậc theo cơ chế đang chọn."""
+        if not hasattr(self, "ladder_base_entry"):
+            return
+        multiply = self.ladder_mode_var.get() == "multiply"
+        self.ladder_base_entry.config(state="normal" if multiply else "readonly",
+                                      readonlybackground=PALE if not multiply else "white")
+        if multiply:
+            try:
+                base = M.parse_money(self.ladder_base_var.get())
+            except ValueError:
+                base = 0
+            if base > 0:
+                stakes = ME.multiply_ladder(base, self.profile_var.get())
+                for var, value in zip(self.ladder_vars, stakes):
+                    var.set(M.fmt_input_money(value))
+                self.ladder_store[self.ladder_shown_profile] = [M.fmt_input_money(s) for s in stakes]
+
+    def _on_ladder_mode_change(self):
+        """Đổi cơ chế: bảo lưu bậc 1 và tự điền/nhả các ô bậc cược cho khớp."""
+        multiply = self.ladder_mode_var.get() == "multiply"
+        if multiply:
+            # Lấy bậc 1 hiện đang hiển thị làm gốc cho cơ chế tự nhân.
+            try:
+                base = M.parse_money(self.ladder_vars[0].get())
+            except (ValueError, IndexError):
+                base = ME.DEFAULT_LADDER[self.profile_var.get()][0]
+            self.ladder_base_var.set(M.fmt_input_money(base))
+        self._rebuild_ladder_inputs()
 
     def _ladder_from_inputs(self):
         """Đọc các ô bậc cược thành số tiền; báo rõ ô nào nhập sai."""
+        if self.ladder_mode_var.get() == "multiply":
+            try:
+                base = M.parse_money(self.ladder_base_var.get())
+            except ValueError:
+                raise ValueError("Bậc 1 (%r) chưa hợp lệ — nhập số tiền, ví dụ 20,000." % self.ladder_base_var.get())
+            if base <= 0:
+                raise ValueError("Bậc 1 phải lớn hơn 0.")
+            stakes = ME.multiply_ladder(base, self.profile_var.get())
+            self.ladder_store[self.profile_var.get()] = [M.fmt_input_money(s) for s in stakes]
+            return stakes
         stakes = []
         for i, var in enumerate(self.ladder_vars):
             try:
@@ -919,6 +1009,7 @@ class BCRApp:
             return
         self.sweep_busy = True
         self.session_lost = False  # người dùng chủ động nhận lại tab sau khi đăng nhập
+        self.recover_attempts = 0
         self.sweep_note_text = "Đang tìm tab sảnh Baccarat bạn đã tự mở…"
         def work():
             try:
@@ -997,6 +1088,15 @@ class BCRApp:
             except Exception as exc:
                 self.events.put(("table_opened", (False, "Không mở được bàn (%s)." % type(exc).__name__, "")))
         threading.Thread(target=work, daemon=True).start()
+        self.refresh()
+
+    def cancel_auto_hunt(self):
+        """Người dùng chủ động dừng vòng tự quét tìm bàn."""
+        self.cycle_waiting = False
+        self.cycle_retry_at = 0.0
+        self.cycle_table_key = None
+        self.sweep_note_text = "Đã dừng tự quét tìm bàn."
+        self._trace("hunt_cancelled")
         self.refresh()
 
     def _schedule_cycle_retry(self, reason, exclude_key=None):
@@ -1133,6 +1233,38 @@ class BCRApp:
             lines.append("Vào bàn để đọc chip đang đặt.")
         self.chip_detail.config(text="\n".join(lines))
 
+    def place_armed_bet(self, plan):
+        """Dùng DP (decompose) ra số chip tối thiểu rồi bấm đặt vào ô cược bằng chuột.
+
+        Gọi từ hook ``self.sim.on_arm`` mỗi khi kế hoạch được chốt. Chỉ chạy khi bật
+        “Tự đặt chip” và kế hoạch có cửa + số tiền; chạy ở thread nền, không chặn UI
+        và không ảnh hưởng việc chốt kế hoạch (plan vẫn được giữ để ghi kết quả).
+        """
+        if not self.auto_place_var.get() or self.place_busy or self.exit_requested:
+            return
+        side, stake = plan.get("side"), plan.get("stake") or 0
+        if not side or stake <= 0:
+            return
+        unit = self._chip_unit()
+        denominations = (self.chip_live or {}).get("denominations") or None
+        split = TB.decompose(stake, unit, denominations)
+        if not split.get("chips"):
+            self.place_status.config(
+                text="Không tự đặt: %s đ không ghép được bằng chip có sẵn." % M.fmt_money(stake),
+                fg=RED)
+            return
+        self.place_busy = True
+        self.place_status.config(text="Đang tự đặt %s đ vào %s…" % (
+            M.fmt_money(stake), E.SIDE_NAME[side]), fg=ACCENT)
+        chips = split["chips"]
+
+        def work():
+            ok, note, _placed = TB.place_bet(self.browser, side, chips, unit=unit,
+                                             human_mouse=self.human_mouse_var.get())
+            self.events.put(("placed", (ok, note)))
+
+        threading.Thread(target=work, daemon=True).start()
+
     def poll(self):
         if self.closing:
             return
@@ -1248,6 +1380,14 @@ class BCRApp:
             elif kind == "chips":
                 self.chip_busy = False
                 self.chip_live = data
+            elif kind == "placed":
+                self.place_busy = False
+                ok, note = data
+                if hasattr(self, "place_status"):
+                    self.place_status.config(text=note, fg=(GREEN if ok else RED))
+            elif kind == "recovered":
+                ok, note = data
+                self._on_recovered(ok, note)
         self._auto_start_verified_table()
         if self.sim.process(self.tables.get(self.sim.table_key)):
             self._save_state()
@@ -1299,7 +1439,11 @@ class BCRApp:
         return isinstance(diag, dict) and diag.get("reason") == "authentication_required"
 
     def _session_lost_step(self, note):
-        """Mất phiên là dấu dừng: tắt vòng tự quét để app không bấm tiếp lên trang lỗi."""
+        """Mất phiên: dừng vòng tự quét rồi (nếu bật) tự mở lại EVO để phục hồi.
+
+        Không bấm tiếp lên trang lỗi EV.7; thay vào đó mở lại sảnh từ trang gốc NEO79.
+        Nếu không bật tự phục hồi thì chỉ dừng và báo hướng dẫn như cũ.
+        """
         self.session_lost = True
         self.cycle_waiting = False
         self.cycle_attempts = 0
@@ -1310,6 +1454,58 @@ class BCRApp:
                        "bấm thẻ Evolution một lần, rồi bấm “Nhận tab sảnh”.")
         self.sweep_note_text = note
         self._trace("session_lost")
+        self.refresh()
+        recover = getattr(self, "_try_recover_session", None)
+        if recover is not None:
+            recover()
+
+    def _try_recover_session(self):
+        """Tự phục hồi phiên bị văng: mở lại sảnh EVO từ trang gốc rồi quét tiếp.
+
+        Có giới hạn số lần thử liên tiếp để không lặp vô hạn khi site vẫn đá phiên;
+        chỉ chạy khi bật “Tự phục hồi phiên” và chưa có lần phục hồi đang chạy.
+        """
+        recover_var = getattr(self, "auto_recover_var", None)
+        enabled = bool(recover_var.get()) if recover_var is not None else False
+        if not enabled or self.recover_busy or self.exit_requested:
+            return
+        if self.recover_attempts >= 3:
+            self.sweep_note_text = ("Đã tự mở lại EVO 3 lần nhưng phiên vẫn bị văng. Hãy đăng nhập "
+                                    "lại trang gốc rồi bấm “Nhận tab sảnh”.")
+            self.refresh()
+            return
+        self.recover_busy = True
+        self.recover_attempts += 1
+        self.sweep_note_text = ("Phát hiện văng phiên · đang tự mở lại EVO (lần %d/3)…"
+                                % self.recover_attempts)
+        self._trace("recover_attempt", dict(attempt=self.recover_attempts))
+
+        def work():
+            try:
+                ok, note = self.stream.open_lobby_from_portal()
+            except Exception as exc:
+                ok, note = False, "Không mở lại được EVO (%s)." % type(exc).__name__
+            self.events.put(("recovered", (ok, note)))
+
+        threading.Thread(target=work, daemon=True).start()
+        self.refresh()
+
+    def _on_recovered(self, ok, note):
+        """Xử lý kết quả một lần tự phục hồi phiên."""
+        self.recover_busy = False
+        if ok:
+            self.session_lost = False
+            self.recover_attempts = 0
+            self.sweep_note_text = "Đã mở lại EVO · quét sảnh để tìm bàn…"
+            self._trace("recovered")
+            self.sweep_lobby()
+        else:
+            self.sweep_note_text = "Tự phục hồi chưa xong: " + note
+            self._trace("recover_failed", dict(note=note))
+            # Thử lại sau một nhịp nghỉ; nếu site vẫn đá thì sau 3 lần sẽ dừng và báo.
+            self.cycle_waiting = True
+            self.cycle_retry_at = time.time() + CYCLE_RETRY_SECONDS
+            self._try_recover_session()
         self.refresh()
 
     def _resume_cycle_hunt(self, now):
@@ -1501,6 +1697,7 @@ class BCRApp:
         self.auto_open_button.config(state="disabled" if self.chrome_busy or self.sweep_busy
                                      or self.open_table_busy else "normal")
         self.sweep_note.config(text=self.sweep_note_text)
+        self._refresh_hunt_banner()
         self.road_title.config(text=self.sim.table_name)
         road = self.sim.results
         self.road_count.config(text="%d tay · Banker %d  /  Player %d  /  Hòa %d" % (
@@ -1648,6 +1845,7 @@ class BCRApp:
             messagebox.showerror("Không lưu được bản sao", str(exc), parent=self.root)
             return
         self.sim = LiveSimulation(book, profile=profile, ladder=stakes)
+        self.sim.on_arm = self.place_armed_bet
         self._sync_cycle_strip()
         self._sync_method_texts()
         self.verified.set(False)
@@ -1681,6 +1879,13 @@ class BCRApp:
             self.auto_hunt_var.set(bool(settings.get("auto_hunt", True)))
             self.favorites_only.set(bool(settings.get("favorites_only", True)))
             self.human_mouse_var.set(bool(settings.get("human_mouse", True)))
+            self.auto_place_var.set(bool(settings.get("auto_place", False)))
+            self.auto_recover_var.set(bool(settings.get("auto_recover", True)))
+            saved_mode = settings.get("ladder_mode", "manual")
+            self.ladder_mode_var.set(saved_mode if saved_mode in ("manual", "multiply") else "manual")
+            saved_base = settings.get("ladder_base")
+            if isinstance(saved_base, str) and saved_base.strip():
+                self.ladder_base_var.set(saved_base)
             saved_unit = settings.get("chip_unit", TB.DEFAULT_CHIP_UNIT)
             if isinstance(saved_unit, (int, float)) and not isinstance(saved_unit, bool) and saved_unit > 0:
                 self.chip_unit_var.set(M.fmt_input_money(int(saved_unit)))
@@ -1707,6 +1912,7 @@ class BCRApp:
             self.sim.note = "Đã khôi phục sổ vốn. Chọn và xác nhận lại bàn để chạy; không tự tính các tay lúc tắt app."
         except (OSError, ValueError, TypeError, AttributeError):
             self.sim = LiveSimulation()
+            self.sim.on_arm = self.place_armed_bet
             self.state_read_error = True
             self.connection_text = "Không đọc được file phiên. Giữ nguyên file gốc; không tự ghi đè."
 
@@ -1724,8 +1930,12 @@ class BCRApp:
                                   auto_cycle=self.auto_cycle_var.get(),
                                   auto_hunt=self.auto_hunt_var.get(),
                                   favorites_only=self.favorites_only.get(),
-                                  human_mouse=self.human_mouse_var.get(),
-                                  chip_unit=self._chip_unit(),
+                                   human_mouse=self.human_mouse_var.get(),
+                                   auto_place=self.auto_place_var.get(),
+                                   auto_recover=self.auto_recover_var.get(),
+                                   ladder_mode=self.ladder_mode_var.get(),
+                                   ladder_base=self.ladder_base_var.get(),
+                                   chip_unit=self._chip_unit(),
                                   chrome_window=dict(width=window["width"], height=window["height"],
                                                      percent=window["percent"],
                                                      fullscreen=window["fullscreen"]),

@@ -25,6 +25,9 @@ DEFAULT_LADDER = {
     "3-3": [100_000, 300_000, 700_000, 1_500_000, 3_100_000, 6_400_000],
     "3-2": [40_000, 160_000, 360_000, 740_000, 1_700_000],
 }
+# Hệ số nhân cố định cho cơ chế "tự nhân": bậc n = bậc 1 × MULTIPLIER_LADDER[n-1].
+# Cấu trúc gốc 1-3-7-15-32-64; khối 3-2 chỉ cần 5 bậc đầu.
+MULTIPLIER_LADDER = (1, 3, 7, 15, 32, 64)
 PROFILE_LABEL = {"3-3": "3-3 · 6 tay (3 mạnh + 3 đổi)", "3-2": "3-2 · 5 tay (3 mạnh + 2 đổi)"}
 STREAK_IS_BET = 7       # từ 7 tay liên tiếp tính là bệt -> loại bàn
 MIN_HANDS = 15
@@ -38,6 +41,16 @@ def block_hands(profile):
 
 def strong_hands(profile):
     return PROFILES[profile][0]
+
+
+def multiply_ladder(base, profile=DEFAULT_PROFILE):
+    """Sinh danh sách mức cược bằng hệ số cố định 1-3-7-15-32-64 từ bậc 1 (``base``).
+
+    Số bậc khớp số tay của khối: 6 bậc cho 3-3, 5 bậc cho 3-2.
+    """
+    need = block_hands(profile)
+    base = float(base)
+    return [base * MULTIPLIER_LADDER[i] for i in range(need)]
 
 
 def ladder_stakes(profile, ladder=None):
