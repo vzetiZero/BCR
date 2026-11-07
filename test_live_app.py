@@ -3785,6 +3785,17 @@ class PlacementGatedHandCountingTests(unittest.TestCase):
         self.assertEqual(len(sim.log), 1)
         self.assertNotEqual(sim.money.balance, CAPITAL)
 
+    def test_live_hook_without_placement_confirmation_does_not_count_the_loss(self):
+        sim = self.simulation()
+        sim.on_arm = lambda _plan: None
+        sim.pending.pop("placed", None)
+        before = deepcopy(sim.method_state)
+        self.assertFalse(self.next_hand(sim, BASELINE + "B"))
+        self.assertEqual(sim.money.hands_played, 0)
+        self.assertEqual(sim.method_state, before)
+        self.assertEqual(sim.pending["stake"], UNIT)
+        self.assertEqual(sim.log[-1]["outcome"], "not_placed")
+
     def test_a_late_result_cannot_label_the_plan_that_replaced_it(self):
         sim = self.simulation()
         old = sim.pending
@@ -3903,6 +3914,7 @@ class AutoPlaceReportingTests(unittest.TestCase):
         click_time = self.now
 
         def slow_confirm(*args, **kwargs):
+            kwargs["on_bet_click"]()
             self.now += 30
             return True, "Đã đặt · ô cược xác nhận +20", {20: 1}
 

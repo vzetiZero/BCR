@@ -488,7 +488,7 @@ SELECTED_CHIP_JS = r"""(() => {
 
 
 def place_bet(session, side, chips, unit=DEFAULT_CHIP_UNIT, human_mouse=True,
-              click_delay=0.10, amount=None, glide_seconds=0.25):
+              click_delay=0.10, amount=None, glide_seconds=0.25, on_bet_click=None):
     """Dùng chuột đặt các chip (kết quả của ``decompose``) vào ô cược ``side``.
 
     Evolution Baccarat: bấm một chip mệnh giá trên khay để chọn mệnh giá đó, rồi mỗi
@@ -762,6 +762,8 @@ def place_bet(session, side, chips, unit=DEFAULT_CHIP_UNIT, human_mouse=True,
                                % (denom, "?" if confirmed is None else confirmed)), placed
             for _ in range(counts[denom]):
                 mouse.click(bet_point["x"], bet_point["y"])
+                if on_bet_click is not None:
+                    on_bet_click()
                 time.sleep(click_delay)
             placed[denom] = counts[denom]
 
