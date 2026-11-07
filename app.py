@@ -251,7 +251,9 @@ class LiveSimulation:
             return False
         target["placed"] = "ok" if ok else "failed"
         target["place_note"] = note
-        target["confirmed_at"] = time.time()
+        # Ưu tiên giờ bấm thật trong thread nền (placed_at); nếu không có (nhánh báo
+        # sớm trên luồng UI) mới dùng giờ hiện tại.
+        target["confirmed_at"] = target.get("placed_at") or time.time()
         return True
 
     def _skip_unplaced_hand(self, letters, plan):
@@ -323,9 +325,21 @@ class LiveSimulation:
             else:
                 # Chữ mới đã về mà chip chưa được xác nhận: giữ tay này lại, chờ nhịp poll
                 # kế tiếp (xác nhận về thì tính, báo thất bại thì bỏ tay không đụng vốn).
+                # Mốc thấy kết quả để đối chiếu giờ bấm thật: xác nhận muộn hơn nghĩa là
+                # chip rơi sang cửa sổ tay sau, không được tính cho tay này.
+                plan.setdefault("result_seen_at", current_time)
                 self.note = "Chờ xác nhận đã đặt chip thật xong rồi mới tính tay này."
                 return False
         if plan.get("placed") == "failed":
+            return self._skip_unplaced_hand(letters, plan)
+        if (plan.get("result_seen_at")
+                and (plan.get("confirmed_at") or 0) > plan["result_seen_at"]):
+            # Xác nhận ok nhưng giờ bấm thật muộn hơn lúc kết quả đã về: chip thuộc cửa
+            # sổ đặt cược của tay sau (lượt bấm trượt cửa sổ tay này). Settle ở đây là
+            # tính lỗ oan, đẩy bậc cược và lấy kết quả tay chưa đặt làm tham chiếu.
+            plan["placed"] = "failed"
+            plan["place_note"] = ("chip chỉ được xác nhận sau khi kết quả tay này đã về "
+                                  "(bấm sang cửa sổ tay sau) nên tay này không được tính.")
             return self._skip_unplaced_hand(letters, plan)
         self.place_skips = 0
         result = letters[-1]
@@ -1428,9 +1442,21 @@ class BCRApp:
                 if not ok_gate:
                     self.events.put(("placed", (False, gate_note, plan)))
                     return
+                # Kết quả tay này đã về trong lúc chờ gate thì cửa sổ đặt cược đã đóng;
+                # bấm nữa là chip rơi sang tay sau (đúng lỗi "tay 1 chưa đặt, tay 2 mang
+                # chip 40 trong khi kế hoạch báo 120"). Bỏ lượt, không bấm liều.
+                row_letters = (self.tables.get(self.sim.table_key) or {}).get("letters")
+                if row_letters and row_letters != plan.get("baseline"):
+                    self.events.put(("placed", (False, "Kết quả tay này đã về trước khi bấm chip; "
+                                                       "không bấm sang cửa sổ tay sau.", plan)))
+                    return
                 ok, note, _placed = TB.place_bet(self.browser, side, [], unit=unit,
                                                  human_mouse=self.human_mouse_var.get(),
                                                  amount=stake)
+                # Giờ THẬT lượt bấm xong, ghi ngay trong thread nền. Nếu giờ này muộn
+                # hơn thời điểm poll thấy chữ kết quả, chip đã rơi sang cửa sổ tay sau
+                # chứ không thuộc tay này — process() sẽ bỏ tay, không tính lỗ oan.
+                plan["placed_at"] = time.time()
                 self.events.put(("placed", (ok, note, plan)))
             except Exception as exc:
                 # Thread chết giữa chừng mà không báo thì kế hoạch kẹt ở "pending" và

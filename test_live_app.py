@@ -3507,11 +3507,11 @@ class PlacementGatedHandCountingTests(unittest.TestCase):
         self.assertEqual(len(sim.log), app.PLACE_SKIP_LIMIT)
 
     def test_late_successful_confirmation_still_counts_the_held_hand(self):
-        """Xác nhận chip về cùng nhịp (hoặc trễ hơn) chữ kết quả vẫn phải tính tay.
+        """Xác nhận chip về cùng nhịp poll với chữ kết quả vẫn phải tính tay.
 
-        place_bet chỉ báo ok khi đã thấy chip lên ô cược trong cửa sổ đặt cược, nên
-        lượt đọc xác nhận về muộn không đổi sự thật chip thuộc tay này. Dừng cả phiên
-        ở đây chính là lỗi "tay đầu đặt được, các tay sau không đặt được nữa".
+        Cùng một mốc thời gian thì không phân biệt được trước/sau; dừng cả phiên ở đây
+        chính là lỗi "tay đầu đặt được, các tay sau không đặt được nữa". Xác nhận muộn
+        HẲN (giờ bấm thật sau lúc kết quả về) thì bỏ tay — xem test bên dưới.
         """
         sim = self.simulation()
         plan = sim.pending
@@ -3536,6 +3536,57 @@ class PlacementGatedHandCountingTests(unittest.TestCase):
         self.assertEqual(sim.money.balance, CAPITAL)
         self.assertEqual(len(sim.log), 1)
         self.assertEqual(sim.log[-1]["outcome"], "not_placed")
+
+    def test_confirmation_after_the_result_skips_the_hand_and_keeps_the_ladder(self):
+        """Chip bấm xong SAU khi kết quả tay này đã về: chip thuộc cửa sổ tay sau.
+
+        Đúng lỗi người dùng báo: tay 1 chưa đặt được nhưng vẫn bị tính lỗ, tay 2 đáng
+        lẽ đặt 40 (bậc đầu) thì kế hoạch lại báo 120 (bậc 2). Tay chưa đặt phải bị bỏ,
+        vốn và bậc cược không nhúc nhích, phiên vẫn chạy.
+        """
+        sim = self.simulation()
+        plan = sim.pending
+        sim.mark_placing(plan)
+        self.assertFalse(self.next_hand(sim, BASELINE + "B"))
+        self.now += 5
+        self.assertTrue(sim.mark_placed(True, "ô cược xác nhận +40", plan))
+        method_state = deepcopy(sim.method_state)
+        self.assertFalse(self.next_hand(sim, BASELINE + "B"))
+        self.assertTrue(sim.running)
+        self.assertEqual(sim.letters, BASELINE + "B")
+        self.assertEqual(sim.money.balance, CAPITAL)
+        self.assertEqual(sim.money.hands_played, 0)
+        self.assertEqual(sim.money.profit, 0)
+        self.assertEqual(sim.method_state, method_state)
+        self.assertEqual(sim.block_hands, 0)
+        self.assertEqual(len(sim.log), 1)
+        self.assertEqual(sim.log[-1]["outcome"], "not_placed")
+        self.assertEqual(sim.log[-1]["stake"], 0)
+        self.assertEqual(sim.log[-1]["source"], "chip-not-placed")
+        self.assertEqual(sim.pending["ladder_step"], plan["ladder_step"])
+        self.assertEqual(sim.pending["stake"], plan["stake"])
+        self.assertEqual(sim.pending["baseline"], BASELINE + "B")
+        self.assertIn("không được tính", sim.note)
+
+    def test_click_timestamped_before_the_result_settles_even_if_reported_late(self):
+        """Giờ bấm THẬT trong thread nền mới là căn cứ, không phải giờ báo cáo về UI.
+
+        Chip đã lên ô cược trước khi kết quả về (placed_at sớm) thì dù lượt xác nhận
+        đọc được muộn, tay này vẫn là tay có cược thật và phải được tính.
+        """
+        sim = self.simulation()
+        plan = sim.pending
+        sim.mark_placing(plan)
+        plan["placed_at"] = self.now
+        self.assertFalse(self.next_hand(sim, BASELINE + "B", delay=10))
+        self.now += 3
+        self.assertTrue(sim.mark_placed(True, "ô cược xác nhận +20", plan))
+        self.assertTrue(self.next_hand(sim, BASELINE + "B"))
+        self.assertTrue(sim.running)
+        self.assertEqual(sim.letters, BASELINE + "B")
+        self.assertEqual(len(sim.log), 1)
+        self.assertIn(sim.log[-1]["outcome"], ("win", "loss", "push"))
+        self.assertEqual(sim.place_skips, 0)
 
     def test_hands_are_still_counted_when_no_placement_is_tracked(self):
         """Giả lập thuần (Tự đặt chip tắt): không có mark_placing thì mọi tay vẫn tính."""
@@ -3575,6 +3626,7 @@ class AutoPlaceReportingTests(unittest.TestCase):
     def host(self, sim, **changes):
         host = SimpleNamespace(
             sim=sim,
+            tables={sim.table_key: dict(key=sim.table_key, letters=sim.letters)},
             auto_place_var=Mock(get=Mock(return_value=True)),
             human_mouse_var=Mock(get=Mock(return_value=False)),
             place_busy=False, exit_requested=False,
@@ -3625,6 +3677,30 @@ class AutoPlaceReportingTests(unittest.TestCase):
         self.run_placement(host)
         self.assertEqual(plan["placed"], "failed")
         self.assertIn("chip ván trước", plan["place_note"])
+
+    def test_result_arriving_before_the_click_aborts_instead_of_betting_next_window(self):
+        """Kết quả tay này đã về trong lúc chờ gate: cửa sổ đặt cược đã đóng.
+
+        Bấm tiếp là chip rơi sang cửa sổ tay sau — đúng lỗi "tay 1 chưa đặt được, tay 2
+        mang chip 40 trong khi kế hoạch báo 120". Phải bỏ lượt, không gọi place_bet.
+        """
+        sim = self.simulation()
+        host = self.host(sim)
+        host.tables[sim.table_key]["letters"] = BASELINE + "B"
+        plan = sim.pending
+        place_bet = Mock(return_value=(True, "Đã đặt", {1: 1}))
+        self.run_placement(host, place_bet=place_bet)
+        place_bet.assert_not_called()
+        self.assertEqual(plan["placed"], "failed")
+        self.assertIn("trước khi bấm chip", plan["place_note"])
+
+    def test_missing_table_row_does_not_block_the_click(self):
+        """Chưa đọc được hàng cầu (mới vào bàn) thì không có căn cứ bỏ lượt: cứ xuống bàn."""
+        sim = self.simulation()
+        host = self.host(sim, tables={})
+        plan = sim.pending
+        self.run_placement(host)
+        self.assertEqual(plan["placed"], "ok")
 
     def test_a_crash_inside_the_placement_thread_still_reports(self):
         host = self.host(self.simulation())
