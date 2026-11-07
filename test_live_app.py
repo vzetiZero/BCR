@@ -3828,6 +3828,27 @@ class AutoPlaceReportingTests(unittest.TestCase):
         self.run_placement(host)
         self.assertEqual(plan["placed"], "ok")
 
+    def test_placement_timestamp_is_the_click_commit_not_the_slow_confirmation(self):
+        """Giờ đặt = lúc cửa sổ còn mở (trước place_bet), không phải lúc đọc xác nhận xong.
+
+        Vòng xác nhận chip trên ô cược có thể hoàn tất sau khi kết quả đã về; nếu ghi giờ
+        đó thành giờ bấm thì tay đặt thật bị bỏ oan (lỗi "đặt được nhưng không tính tay").
+        """
+        sim = self.simulation()
+        host = self.host(sim)
+        plan = sim.pending
+        click_time = self.now
+
+        def slow_confirm(*args, **kwargs):
+            self.now += 30
+            return True, "Đã đặt · ô cược xác nhận +20", {20: 1}
+
+        self.run_placement(host, place_bet=slow_confirm)
+        self.assertEqual(plan["placed"], "ok")
+        self.assertEqual(plan["placed_at"], click_time)
+        self.assertEqual(plan["confirmed_at"], click_time)
+        self.assertLess(plan["confirmed_at"], self.now)
+
     def test_a_crash_inside_the_placement_thread_still_reports(self):
         host = self.host(self.simulation())
         plan = host.sim.pending

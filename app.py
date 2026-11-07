@@ -1508,13 +1508,15 @@ class BCRApp:
                     self.events.put(("placed", (False, "Kết quả tay này đã về trước khi bấm chip; "
                                                        "không bấm sang cửa sổ tay sau.", plan)))
                     return
+                # Ghi giờ bấm NGAY lúc cửa sổ đặt cược còn mở (vừa đối chiếu cầu xong),
+                # không chờ place_bet đọc xác nhận chip xong. Vòng xác nhận DOM có thể
+                # hoàn tất SAU khi chữ kết quả đã về dù chip lên ô đúng cửa sổ tay này;
+                # lấy giờ xác nhận làm giờ bấm sẽ bỏ oan tay đặt thật (lỗi "đặt được nhưng
+                # không tính"). ok=True của place_bet đã chứng minh chip được ô cược nhận.
+                plan["placed_at"] = time.time()
                 ok, note, _placed = TB.place_bet(self.browser, side, [], unit=unit,
                                                  human_mouse=self.human_mouse_var.get(),
                                                  amount=stake)
-                # Giờ THẬT lượt bấm xong, ghi ngay trong thread nền. Nếu giờ này muộn
-                # hơn thời điểm poll thấy chữ kết quả, chip đã rơi sang cửa sổ tay sau
-                # chứ không thuộc tay này — process() sẽ bỏ tay, không tính lỗ oan.
-                plan["placed_at"] = time.time()
                 self.events.put(("placed", (ok, note, plan)))
             except Exception as exc:
                 # Thread chết giữa chừng mà không báo thì kế hoạch kẹt ở "pending" và
