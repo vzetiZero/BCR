@@ -1750,8 +1750,17 @@ class TableCycleTests(unittest.TestCase):
         host.sweep_lobby.assert_not_called()
         self.assertIn("tự quét lại sau %d giây" % app.CYCLE_RETRY_SECONDS, host.sweep_note_text)
 
-    def test_a_single_manual_sweep_button_still_sweeps_once(self):
+    def test_first_scan_without_eligible_table_starts_auto_hunt_countdown(self):
         host = self.host()
+        app.BCRApp.auto_open_table(host, allow_sweep=True)
+        self.assertTrue(host.cycle_waiting)
+        self.assertEqual(host.cycle_attempts, 1)
+        self.assertEqual(host.cycle_retry_at, self.now + app.CYCLE_RETRY_SECONDS)
+        host.sweep_lobby.assert_not_called()
+        self.assertIn("tự quét lại sau %d giây" % app.CYCLE_RETRY_SECONDS, host.sweep_note_text)
+
+    def test_a_single_manual_sweep_button_still_sweeps_once(self):
+        host = self.host(auto_hunt_var=Mock(get=lambda: False))
         app.BCRApp.auto_open_table(host, allow_sweep=True)
         self.assertFalse(host.cycle_waiting)
         host.sweep_lobby.assert_called_once_with()

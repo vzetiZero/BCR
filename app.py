@@ -1293,6 +1293,13 @@ class BCRApp:
             if info["eligible"]:
                 candidates.append((info["hands"], row, info))
         if not candidates:
+            if not self.cycle_waiting and self.auto_hunt_var.get():
+                # A first lobby scan can return tables that simply do not meet
+                # the filters. Start the same visible retry loop used later in
+                # the hunt instead of leaving auto-hunt idle after that scan.
+                self.cycle_waiting = True
+                self.cycle_attempts = 0
+                self.cycle_table_key = exclude_key
             if self._schedule_cycle_retry("Chưa có bàn đạt 3 điều kiện"):
                 return
             if self.cycle_waiting or not allow_sweep:
