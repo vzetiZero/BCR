@@ -103,7 +103,7 @@ class AutoStartAtEntryTests(unittest.TestCase):
     def host(self, entry_letters, row):
         book = M.MoneyBook(capital=CAPITAL, unit=UNIT, take_profit_pct=100)
         # Chu trình tự đổi bàn tắt để test chỉ đi đúng một tay/lần gọi như trước.
-        host = SimpleNamespace(tables={row["key"]: row}, sim=app.LiveSimulation(book), verified=Mock(),
+        host = SimpleNamespace(tables={row["key"]: row}, sim=app.LiveSimulation(book),
                                auto_start_table_key=row["key"], auto_start_letters=entry_letters,
                                auto_start_deadline=self.now + app.ENTRY_WAIT, sweep_note_text="",
                                auto_cycle_var=Mock(get=lambda: False), cycle_waiting=False,
@@ -122,7 +122,6 @@ class AutoStartAtEntryTests(unittest.TestCase):
         self.assertTrue(host.sim.running)
         self.assertEqual(host.sim.letters, row["letters"])
         self.assertEqual(host.sim.pending["baseline"], row["letters"])
-        self.assertTrue(host.verified.set.called)
         self.assertIsNone(host.auto_start_table_key)
 
     def test_first_hand_after_entry_settles_and_earlier_hands_are_never_counted(self):
@@ -1702,18 +1701,16 @@ class TableCycleTests(unittest.TestCase):
             host.sweep_lobby.assert_not_called()
             self.assertEqual(host.cycle_retry_at, 0.0)
 
-    def test_manual_pause_stops_the_auto_hunt(self):
-        host = self.host(cycle_waiting=True, cycle_retry_at=self.now + app.CYCLE_RETRY_SECONDS)
+    def test_the_stop_hunt_button_ends_the_auto_hunt(self):
+        host = self.host(cycle_waiting=True, cycle_attempts=2, cycle_table_key="id:t1",
+                         cycle_retry_at=self.now + app.CYCLE_RETRY_SECONDS)
         host.sim.running = True
-        host.tables = {"id:t1": self.row("t1")}
-        host.sim.table_key = "id:t1"
-        host.sim.letters = BASELINE
-        host.verified = Mock(get=lambda: True)
-        host.browser = Mock(connected=True)
-        host._save_state = Mock()
-        app.BCRApp.toggle_simulation(host)
-        self.assertFalse(host.sim.running)
-        self.assertEqual((host.cycle_waiting, host.cycle_retry_at), (False, 0.0))
+        app.BCRApp.cancel_auto_hunt(host)
+        self.assertEqual((host.cycle_waiting, host.cycle_retry_at, host.cycle_table_key),
+                         (False, 0.0, None))
+        self.assertIn("Đã dừng tự quét", host.sweep_note_text)
+        app.BCRApp._resume_cycle_hunt(host, self.now + 600)
+        host.sweep_lobby.assert_not_called()
 
     def test_a_detached_chrome_keeps_the_hunt_waiting(self):
         host = self.host(cycle_waiting=True, cycle_retry_at=self.now - 1,
@@ -1728,7 +1725,7 @@ class TableCycleTests(unittest.TestCase):
         row.update(source="evo-bead", screen_stable=2)
         host = self.host(tables={"id:t9": row}, cycle_waiting=True, cycle_attempts=4,
                          cycle_table_key="id:t1", auto_start_letters=row["letters"],
-                         auto_start_table_key="id:t9", verified=Mock(),
+                         auto_start_table_key="id:t9",
                          auto_start_deadline=self.now + app.ENTRY_WAIT,
                          cycle_retry_at=self.now + app.CYCLE_RETRY_SECONDS)
         host.sim.arm_at_entry = Mock(return_value=True)
@@ -1791,6 +1788,185 @@ class TableStreakFilterTests(unittest.TestCase):
                        hands_in_block=1, started=True, strong="B")
         self.assertEqual(plan["action"], "bet")
         self.assertIn("bệt 4 tay", plan["reason"])
+
+    def test_configured_cap_is_clamped_and_garbage_keeps_the_default(self):
+        self.assertEqual(ME.normalize_streak(5), 5)
+        self.assertEqual(ME.normalize_streak("7"), 7)
+        self.assertEqual(ME.normalize_streak(0), ME.STREAK_LOWER)
+        self.assertEqual(ME.normalize_streak(99), ME.STREAK_UPPER)
+        self.assertEqual(ME.normalize_streak(None), ME.MAX_STREAK_ALLOWED)
+        self.assertEqual(ME.normalize_streak("abc"), ME.MAX_STREAK_ALLOWED)
+
+    def test_raising_the_cap_accepts_a_four_hand_streak(self):
+        letters = "BBBBPBPPBPB"
+        self.assertFalse(ME.check_table(list(letters))["eligible"])
+        info = ME.check_table(list(letters), max_streak=4)
+        self.assertTrue(info["eligible"], info["checks"])
+        check = next(c for c in info["checks"] if c["name"].startswith("Cầu ngắn"))
+        self.assertEqual(check["name"], "Cầu ngắn, bệt tối đa 4 tay")
+        self.assertEqual(check["detail"], "chưa có vệt nào quá 4 tay")
+        self.assertEqual(ME.has_long_streak(list(letters), 4), (None, 0))
+        self.assertEqual(ME.has_long_streak(list(letters), 3), ("B", 4))
+
+    def test_lowering_the_cap_rejects_a_three_hand_streak(self):
+        letters = "BBBPBPBPBPB"
+        self.assertTrue(ME.check_table(list(letters))["eligible"])
+        info = ME.check_table(list(letters), max_streak=2)
+        self.assertFalse(info["eligible"])
+        check = next(c for c in info["checks"] if c["name"].startswith("Cầu ngắn"))
+        self.assertEqual(check["detail"], "có bệt Banker 3 tay")
+        self.assertEqual(ME.has_long_streak(list(letters), 2), ("B", 3))
+
+    def test_tie_still_bridges_the_streak_under_a_custom_cap(self):
+        letters = "BBTBBPBPPBPB"
+        self.assertTrue(ME.check_table(list(letters), max_streak=4)["eligible"])
+        self.assertFalse(ME.check_table(list(letters), max_streak=3)["eligible"])
+        self.assertEqual(ME.has_long_streak(list(letters), 4), (None, 0))
+
+    def test_plan_honours_the_configured_cap(self):
+        letters = list("BBBBPBPPBPB")
+        raised = ME.plan(letters, ME.DEFAULT_LADDER["3-3"], max_streak=4)
+        self.assertEqual(raised["action"], "start")
+        default = ME.plan(letters, ME.DEFAULT_LADDER["3-3"])
+        self.assertEqual(default["action"], "wait")
+        self.assertEqual(default["reason"], "có bệt Banker 4 tay")
+
+    def test_midblock_caution_uses_the_configured_cap(self):
+        letters = list("BBBPBPBPBPBBBB")
+        plan = ME.plan(letters, ME.DEFAULT_LADDER["3-3"], hands_in_block=1, started=True,
+                       strong="B", max_streak=4)
+        self.assertEqual(plan["action"], "bet")
+        self.assertNotIn("bệt", plan["reason"])
+
+
+class RoadFilterConfigTests(unittest.TestCase):
+    """Bộ lọc cầu nằm trong Cài đặt: khoảng tay đã đi + số tay bệt tối đa, lưu xuống state."""
+
+    def host(self, low="10", high="50", streak="3"):
+        sim = app.LiveSimulation(M.MoneyBook(capital=CAPITAL, unit=UNIT))
+        var = lambda value: Mock(get=lambda: value, set=Mock())
+        return SimpleNamespace(sim=sim, hands_min_var=var(low), hands_max_var=var(high),
+                               streak_var=var(streak), hands_note=Mock(), root=Mock(),
+                               _save_state=Mock(), refresh=Mock(), apply_settings=Mock())
+
+    def test_set_road_filter_clamps_both_ranges(self):
+        sim = app.LiveSimulation(M.MoneyBook(capital=CAPITAL, unit=UNIT))
+        self.assertEqual(sim.set_road_filter(12, 40, 5), (12, 40, 5))
+        self.assertEqual(sim.set_road_filter(3, 900, 99), (ME.HANDS_LOWER, ME.HANDS_UPPER,
+                                                          ME.STREAK_UPPER))
+        self.assertEqual(sim.set_road_filter(40, 12, 0), (12, 40, ME.STREAK_LOWER))
+        self.assertEqual((sim.min_hands, sim.max_hands, sim.max_streak), (12, 40, ME.STREAK_LOWER))
+
+    def test_filter_reaches_the_plan_of_the_running_simulation(self):
+        host = self.host()
+        host.sim.bind(dict(key="id:t1", label="Baccarat t1", letters="BBBBPBPPBPB"))
+        self.assertEqual(host.sim.plan()["action"], "wait")
+        host.sim.set_road_filter(10, 50, 4)
+        self.assertEqual(host.sim.plan()["action"], "start")
+
+    def test_saving_the_filter_writes_back_the_clamped_numbers(self):
+        host = self.host(low="3", high="900", streak="99")
+        app.BCRApp.apply_road_filter(host)
+        host.hands_min_var.set.assert_called_once_with(str(ME.HANDS_LOWER))
+        host.hands_max_var.set.assert_called_once_with(str(ME.HANDS_UPPER))
+        host.streak_var.set.assert_called_once_with(str(ME.STREAK_UPPER))
+        self.assertIn("bệt tối đa %d tay" % ME.STREAK_UPPER, host.hands_note.config.call_args[1]["text"])
+        host._save_state.assert_called_once_with()
+        host.refresh.assert_called_once_with()
+
+    def test_saving_the_filter_does_not_archive_the_session(self):
+        host = self.host(streak="4")
+        app.BCRApp.apply_road_filter(host)
+        host.apply_settings.assert_not_called()
+        self.assertEqual(host.sim.max_streak, 4)
+
+    def test_a_non_numeric_filter_is_refused_without_touching_the_simulation(self):
+        host = self.host(streak="ba tay")
+        with patch("app.messagebox.showerror") as error:
+            app.BCRApp.apply_road_filter(host)
+        self.assertTrue(error.called)
+        self.assertEqual(host.sim.max_streak, ME.MAX_STREAK_ALLOWED)
+        host._save_state.assert_not_called()
+
+
+class ManualTablePickTests(unittest.TestCase):
+    """Chọn bàn trong danh sách là vào đánh luôn; nút Bắt đầu/Tạm dừng đã bỏ khỏi UI."""
+
+    def setUp(self):
+        self.now = 1_800_000_000.0
+        clock = patch.object(app.time, "time", side_effect=lambda: self.now)
+        clock.start()
+        self.addCleanup(clock.stop)
+
+    def row(self, key="id:t1", letters=BASELINE):
+        return dict(key=key, table_id=key.split(":")[1], label="Baccarat " + key, letters=letters,
+                    ts=self.now, stable=3, conflict=False, read_error="", game_type="",
+                    source="evo-ws-histories", ws_confirmed_letters=letters, screen_stable=0)
+
+    def host(self, row=None, selection=None):
+        rows = {row["key"]: row} if row else {}
+        picked = (row["key"],) if row else ()
+        return SimpleNamespace(tables=rows,
+                               sim=app.LiveSimulation(M.MoneyBook(capital=CAPITAL, unit=UNIT)),
+                               live_tree=Mock(selection=Mock(return_value=picked if selection is None
+                                                             else selection)),
+                               _save_state=Mock(), refresh=Mock())
+
+    def test_picking_an_eligible_table_arms_it_right_away(self):
+        host = self.host(self.row())
+        app.BCRApp.load_live_selected(host)
+        self.assertTrue(host.sim.running)
+        self.assertEqual(host.sim.table_key, "id:t1")
+        self.assertEqual(host.sim.pending["action"], "start")
+        self.assertEqual(host.sim.pending["baseline"], BASELINE)
+        host._save_state.assert_called_once_with()
+        host.refresh.assert_called_once_with()
+
+    def test_picking_an_ineligible_table_reports_the_reason_and_bets_nothing(self):
+        host = self.host(self.row(letters="BBBBPBPPBPB"))
+        app.BCRApp.load_live_selected(host)
+        self.assertFalse(host.sim.running)
+        self.assertIsNone(host.sim.pending)
+        self.assertEqual(host.sim.note, "có bệt Banker 4 tay")
+        self.assertEqual(host.sim.money.hands_played, 0)
+
+    def test_repicking_the_running_table_keeps_the_block_in_progress(self):
+        host = self.host(self.row())
+        app.BCRApp.load_live_selected(host)
+        host.sim.method_state["hands_in_block"] = 2
+        host.sim.method_state["started"] = True
+        host.sim.pending = None
+        app.BCRApp.load_live_selected(host)
+        self.assertTrue(host.sim.running)
+        self.assertEqual(host.sim.method_state["hands_in_block"], 2)
+        self.assertIsNone(host.sim.pending)
+        self.assertEqual(host.sim.note, "Đang theo dõi bàn này.")
+
+    def test_picking_another_table_switches_the_block_to_it(self):
+        first, second = self.row("id:t1"), self.row("id:t2", letters=PLAYER_BASELINE)
+        host = self.host(first)
+        app.BCRApp.load_live_selected(host)
+        host.sim.method_state["hands_in_block"] = 2
+        host.tables[second["key"]] = second
+        host.live_tree.selection.return_value = (second["key"],)
+        app.BCRApp.load_live_selected(host)
+        self.assertTrue(host.sim.running)
+        self.assertEqual(host.sim.table_key, "id:t2")
+        self.assertEqual(host.sim.letters, PLAYER_BASELINE)
+        self.assertEqual(host.sim.method_state["hands_in_block"], 0)
+
+    def test_no_selection_asks_for_a_row(self):
+        host = self.host()
+        app.BCRApp.load_live_selected(host)
+        self.assertFalse(host.sim.running)
+        self.assertIn("Chọn một dòng bàn", host.sim.note)
+        host._save_state.assert_called_once_with()
+
+    def test_the_start_pause_widgets_are_gone_from_the_app(self):
+        source = inspect.getsource(app.BCRApp)
+        for gone in ("start_button", "toggle_simulation", "verify_check", "self.verified"):
+            with self.subTest(widget=gone):
+                self.assertNotIn(gone, source)
 
 
 class MethodBlockRegressionTests(unittest.TestCase):
@@ -3384,40 +3560,6 @@ class AutoPlaceReportingTests(unittest.TestCase):
         self.run_placement(host, place_bet=Mock(return_value=(False, note, {})))
         self.assertEqual(plan["placed"], "failed")
         self.assertIn("không ghép được", plan["place_note"])
-
-    def extension_host(self, sim, live, result=None):
-        return self.host(
-            sim,
-            collector_httpd=Mock(), collector_store=Mock(extension_alive=Mock(return_value=True)),
-            _read_chip_state=Mock(return_value=live),
-            _ext_command=Mock(return_value=result if result is not None else {"ok": True, "total": 1}),
-        )
-
-    def test_extension_path_uses_the_tray_read_at_click_time(self):
-        host = self.extension_host(self.simulation(), {"ok": True, "denominations": [20, 40, 50]})
-        plan = host.sim.pending
-        self.run_placement(host)
-        self.assertEqual(plan["placed"], "ok")
-        host._ext_command.assert_called_once()
-        name, args = host._ext_command.call_args[0]
-        self.assertEqual(name, "place_chips")
-        self.assertEqual(args["chips"], [20])
-
-    def test_extension_path_reports_an_unreadable_tray(self):
-        host = self.extension_host(self.simulation(), {"ok": False, "error": "no_chips"})
-        plan = host.sim.pending
-        self.run_placement(host)
-        self.assertEqual(plan["placed"], "failed")
-        self.assertIn("Chưa đọc được khay chip", plan["place_note"])
-        host._ext_command.assert_not_called()
-
-    def test_extension_path_reports_a_tray_that_cannot_form_the_stake(self):
-        host = self.extension_host(self.simulation(), {"ok": True, "denominations": [100, 500]})
-        plan = host.sim.pending
-        self.run_placement(host)
-        self.assertEqual(plan["placed"], "failed")
-        self.assertIn("không ghép được", plan["place_note"])
-        host._ext_command.assert_not_called()
 
     def test_closing_the_app_reports_the_cancellation(self):
         host = self.host(self.simulation(), exit_requested=True)

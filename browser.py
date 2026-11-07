@@ -16,7 +16,7 @@ from urllib.request import urlopen
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROFILE_DIR = os.path.join(HERE, "chrome_profile")
-READER_JS = os.path.join(HERE, "extension", "reader.js")
+READER_JS = os.path.join(HERE, "reader.js")
 DRIVER_PATH = os.path.join(HERE, "drivers", "chromedriver.exe")
 LOBBY_PATH = "/frontend/evo/r3"
 START_URL = "https://www.neo179.com/gamelobby/live"

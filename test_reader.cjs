@@ -2,7 +2,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const test = require('node:test');
-const source = fs.readFileSync(__dirname + '/extension/reader.js', 'utf8');
+const source = fs.readFileSync(__dirname + '/reader.js', 'utf8');
 
 function canvas(history, {id = 'tableABC', title = 'Baccarat Tốc Độ A', type = 'baccarat', stale = false} = {}) {
   const root = {stateNode: {}};

@@ -1,6 +1,5 @@
-/* BCR reader — logic ĐỌC bảng cầu, dùng chung cho 2 đường:
- *   1) extension (content.js gọi, rồi POST về 127.0.0.1:8777)
- *   2) driver (browser.py nạp file này vào từng frame bằng execute_script, không cần extension)
+/* BCR reader — logic ĐỌC bảng cầu cho Chrome driver.
+ * browser.py nạp file này vào từng frame bằng execute_script.
  * Chỉ đọc DOM, không bấm, không đổi trang, không gửi đi đâu. */
 window.__BCR_SCAN = (function () {
   "use strict";

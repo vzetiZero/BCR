@@ -3,7 +3,8 @@
 
 Quy tắc của người dùng:
 1. Chọn bàn: đã đi trong khoảng tay người dùng đặt (mặc định 10-50),
-   cầu ngắn (không có bệt từ 4 tay trở lên; tay hoà không ngắt bệt), chưa từng có cầu 3-3.
+   cầu ngắn (bệt tối đa N tay, N cấu hình trong Cài đặt, mặc định 3; tay hoà không ngắt bệt),
+   chưa từng có cầu 3-3.
 2. Cầu đang mạnh bên nào -> đánh mấy tay đầu khối bên đó, rồi đổi sang bên kia mấy tay còn lại.
    Khối 3-3 đi 6 tay, khối 3-2 đi 5 tay.
 3. Thắng thì quay về bậc 1. Thua thì sang bậc kế tiếp trong danh sách mức cược người dùng nhập.
@@ -32,11 +33,23 @@ DEFAULT_LADDER = {
 MULTIPLIER_LADDER = (1, 3, 7, 15, 32, 64)
 PROFILE_LABEL = {"3-3": "3-3 · 6 tay (3 mạnh + 3 đổi)", "3-2": "3-2 · 5 tay (3 mạnh + 2 đổi)"}
 MAX_STREAK_ALLOWED = 3  # bệt tối đa 3 tay còn nhận; từ 4 tay liền loại bàn
+# Người dùng đổi số tay bệt tối đa trong Cài đặt; hai mốc dưới là biên hợp lệ.
+STREAK_LOWER = 1
+STREAK_UPPER = 12
 MIN_HANDS = 10
 MAX_HANDS = 50
 # Người dùng chỉnh khoảng tay đã đi trong Cài đặt; hai mốc dưới là biên hợp lệ.
 HANDS_LOWER = 10
 HANDS_UPPER = 50
+
+
+def normalize_streak(value=MAX_STREAK_ALLOWED):
+    """Kẹp số tay bệt tối đa vào biên hợp lệ; giá trị không phải số thì giữ mặc định."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = MAX_STREAK_ALLOWED
+    return max(STREAK_LOWER, min(STREAK_UPPER, number))
 
 
 def normalize_hand_range(min_hands=MIN_HANDS, max_hands=MAX_HANDS):
@@ -89,15 +102,16 @@ def parse_road(text):
     return [mapping[ch] for ch in text.upper() if ch in mapping]
 
 
-def has_long_streak(results, limit=MAX_STREAK_ALLOWED + 1):
-    """Tìm vệt dài vượt mức cho phép: vệt dài hơn ``limit - 1`` bị coi là bệt.
+def has_long_streak(results, max_streak=MAX_STREAK_ALLOWED):
+    """Tìm vệt dài vượt mức cho phép: vệt dài hơn ``max_streak`` tay bị coi là bệt.
 
     Mặc định loại bàn khi có 4 tay liền trở lên (tức chỉ nhận tối đa 3 tay). Tay hoà
     không đếm và cũng không ngắt bệt: B-B-T-B-B là một bệt Banker 4 tay, vì
     ``E.run_lengths`` chỉ chạy trên các tay phân thắng bại.
     """
+    max_streak = normalize_streak(max_streak)
     for side, length in E.run_lengths(results):
-        if length >= limit:
+        if length > max_streak:
             return side, length
     return None, 0
 
@@ -134,17 +148,19 @@ def strong_side(results, lookback=None):
     return side, {"banker": b, "player": p, "tie_break": False}
 
 
-def check_table(results, min_hands=MIN_HANDS, max_hands=MAX_HANDS):
+def check_table(results, min_hands=MIN_HANDS, max_hands=MAX_HANDS,
+                max_streak=MAX_STREAK_ALLOWED):
     """Kết luận bàn này có đủ điều kiện để vào theo nguyên tắc 1 hay không."""
     min_hands, max_hands = normalize_hand_range(min_hands, max_hands)
+    max_streak = normalize_streak(max_streak)
     hands = len(results)
-    streak_side, streak_len = has_long_streak(results)
+    streak_side, streak_len = has_long_streak(results, max_streak)
     already_33, pair = has_3_3(results)
 
     if streak_side:
         streak_detail = "có bệt %s %d tay" % (E.SIDE_NAME[streak_side], streak_len)
     else:
-        streak_detail = "chưa có vệt nào quá %d tay" % MAX_STREAK_ALLOWED
+        streak_detail = "chưa có vệt nào quá %d tay" % max_streak
     if already_33:
         three3_detail = "đã có 3-3 (%s-%s)" % (E.SIDE_NAME[pair[0]], E.SIDE_NAME[pair[1]])
     else:
@@ -154,7 +170,7 @@ def check_table(results, min_hands=MIN_HANDS, max_hands=MAX_HANDS):
         {"name": "Số tay đã đi %d-%d" % (min_hands, max_hands),
          "ok": min_hands <= hands <= max_hands,
          "detail": "ván này đã đi %d tay" % hands},
-        {"name": "Cầu ngắn, bệt tối đa %d tay" % MAX_STREAK_ALLOWED,
+        {"name": "Cầu ngắn, bệt tối đa %d tay" % max_streak,
          "ok": streak_side is None, "detail": streak_detail},
         {"name": "Chưa từng có cầu 3-3", "ok": not already_33, "detail": three3_detail},
     ]
@@ -172,12 +188,13 @@ def check_table(results, min_hands=MIN_HANDS, max_hands=MAX_HANDS):
 
 
 def plan(results, stakes, ladder_step=0, hands_in_block=0, started=False,
-         strong=None, profile=DEFAULT_PROFILE, min_hands=MIN_HANDS, max_hands=MAX_HANDS):
+         strong=None, profile=DEFAULT_PROFILE, min_hands=MIN_HANDS, max_hands=MAX_HANDS,
+         max_streak=MAX_STREAK_ALLOWED):
     """Bàn tay tiếp theo nên làm gì. Trả về cửa, số tiền, vị trí trong khối theo phương pháp đã chọn."""
     stakes = ladder_stakes(profile, stakes)
     cycle = strong_hands(profile)
     block = block_hands(profile)
-    info = check_table(results, min_hands, max_hands)
+    info = check_table(results, min_hands, max_hands, max_streak)
 
     if not started:
         if not info["eligible"]:
@@ -200,7 +217,7 @@ def plan(results, stakes, ladder_step=0, hands_in_block=0, started=False,
 
     pos = hands_in_block
     side = strong if pos < cycle else weak
-    streak_side, streak_len = has_long_streak(results)
+    streak_side, streak_len = has_long_streak(results, max_streak)
     already_33, _ = has_3_3(results)
 
     if ladder_step >= len(stakes):

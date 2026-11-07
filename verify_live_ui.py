@@ -8,7 +8,8 @@ from unittest.mock import patch
 
 from PIL import ImageGrab
 
-from app import BCRApp, STATE_FILE
+import method as ME
+from app import BCRApp, STATE_FILE, row_problem
 
 
 root = tk.Tk()
@@ -16,6 +17,7 @@ temporary = tempfile.TemporaryDirectory(prefix="bcr-ui-check-")
 state = Path(temporary.name) / "state.json"
 before = hashlib.sha256(STATE_FILE.read_bytes()).hexdigest()
 app = BCRApp(root, state_file=state, auto_connect=False)
+app.auto_place_var.set(False)          # lượt kiểm tra UI không bao giờ bấm chip thật
 errors = []
 root.report_callback_exception = lambda *args: errors.append(str(args[1]))
 started = time.time()
@@ -34,7 +36,7 @@ def screenshot(name):
 
 
 def begin():
-    app.start_button.invoke()
+    assert not hasattr(app, "start_button") and not hasattr(app, "toggle_simulation")
     assert not app.sim.running
     app.search.set("khong-co-ban")
     app.only_eligible.set(True)
@@ -48,13 +50,16 @@ def begin():
         app.apply_settings()
         assert error.called
     app.entries["capital"].set("20000000")
+    app.entries["take_profit_pct"].set("10")
     with patch("app.messagebox.askyesno", return_value=True):
         app.apply_settings()
     assert len(list(state.parent.glob("bcr-session-*.json"))) == 1
     assert app.entries["capital"].get() == "20,000,000", app.entries["capital"].get()
-    assert [v.get() for v in app.ladder_vars] == ["100,000", "300,000", "700,000", "1,500,000",
-                                                  "3,100,000", "6,400,000"], app.ladder_vars[0].get()
+    assert [v.get() for v in app.ladder_vars] == ["100", "300", "700", "1,500",
+                                                  "3,100", "6,400"], app.ladder_vars[0].get()
     assert app.sim.money.capital == 20_000_000
+    assert app.sim.money.take_profit_pct == 10
+    road_filter()
     screenshot("ui-settings.png")
     app.nav_buttons["history"].invoke()
     with patch("app.messagebox.showinfo") as info:
@@ -62,8 +67,30 @@ def begin():
         assert info.called
     screenshot("ui-history.png")
     app.nav_buttons["overview"].invoke()
-    root.geometry("1080x740+20+20")
+    root.geometry("560x620+20+20")
     root.after(400, minimum)
+
+
+def road_filter():
+    """Bộ lọc cầu nằm trong Cài đặt: đổi số tay bệt không được tạo phiên mới."""
+    app.hands_min_var.set("12")
+    app.hands_max_var.set("40")
+    app.streak_var.set("5")
+    app.apply_road_filter()
+    assert (app.sim.min_hands, app.sim.max_hands, app.sim.max_streak) == (12, 40, 5)
+    saved = json.loads(state.read_text(encoding="utf-8"))["settings"]
+    assert (saved["hands_min"], saved["hands_max"], saved["max_streak"]) == (12, 40, 5), saved
+    assert len(list(state.parent.glob("bcr-session-*.json"))) == 1
+    with patch("app.messagebox.showerror") as error:
+        app.streak_var.set("ba tay")
+        app.apply_road_filter()
+        assert error.called
+    assert app.sim.max_streak == 5
+    app.hands_min_var.set("10")
+    app.hands_max_var.set("50")
+    app.streak_var.set("3")
+    app.apply_road_filter()
+    assert (app.sim.min_hands, app.sim.max_hands, app.sim.max_streak) == (10, 50, 3)
 
 
 def minimum():
@@ -75,10 +102,14 @@ def minimum():
     screenshot("ui-minimum-scrolled.png")
     report["minimum_layout"] = {"table_height": app.live_tree.winfo_height(),
                                 "table_accessible_after_scroll": True,
+                                "window_width": root.winfo_width(),
                                 "window_height": root.winfo_height()}
     canvas.yview_moveto(0)
-    root.geometry("1380x920+20+20")
-    report["checks"].extend(["empty_start_guard", "search_filter", "invalid_settings", "archive_new_session", "empty_export"])
+    root.geometry("600x900+20+20")
+    root.update()
+    screenshot("ui-overview.png")
+    report["checks"].extend(["no_start_button", "search_filter", "invalid_settings", "archive_new_session",
+                             "take_profit_config", "road_filter_config", "empty_export", "compact_layout"])
     app.attach_button.invoke()
     root.after(500, check_live)
 
@@ -108,15 +139,23 @@ def check_live():
     app.live_tree.selection_set(first)
     app.load_live_selected()
     assert app.sim.table_key == first
-    app.start_button.invoke()
-    assert not app.sim.running
+    row = app.tables[first]
+    info = ME.check_table(list(row["letters"]), app.sim.min_hands, app.sim.max_hands, app.sim.max_streak)
+    if info["eligible"] and not row_problem(row):
+        assert app.sim.running and app.sim.pending, app.sim.note
+        report["auto_arm"] = {"side": app.sim.pending["side"], "stake": app.sim.pending["stake"],
+                              "hands": len(row["letters"])}
+    else:
+        assert not app.sim.running
+        report["auto_arm"] = {"refused": app.sim.note}
+    app.sim.pause("Kết thúc lượt kiểm tra UI.")
     app.only_eligible.set(True)
     app._render_tables()
     report['eligible_count'] = len(app.live_tree.get_children())
     app.only_eligible.set(False)
     app.refresh()
     assert app.disconnect_button.cget('text') == 'Ngắt kết nối'
-    report['checks'].extend(['read_only_attach', 'live_search', 'live_selection', 'confirmation_guard', 'eligible_filter'])
+    report['checks'].extend(['read_only_attach', 'live_search', 'auto_arm_on_pick', 'eligible_filter'])
     screenshot("ui-live-overview.png")
     app.page_scrolls['overview'].yview_moveto(1)
     screenshot('ui-attached-tables.png')
