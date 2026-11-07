@@ -371,6 +371,25 @@ class LiveSimulationTests(unittest.TestCase):
                 self.assertIsNone(sim.pending)
                 self.assert_pristine_book(sim)
 
+    def test_table_exits_after_a_live_road_exceeds_its_streak_filter(self):
+        book = M.MoneyBook(capital=CAPITAL, unit=UNIT, take_profit_pct=100)
+        ladder = [UNIT * m for m in (1, 3, 7, 15, 32, 64)]
+        sim = app.LiveSimulation(book, ladder=ladder, max_streak=6)
+        sim.bind(self.row(PLAYER_BASELINE))
+        self.assertTrue(sim.start(self.row(PLAYER_BASELINE), verified=True, now=self.now))
+
+        for _ in range(6):
+            self.settle_next(sim, "P")
+
+        self.assertFalse(sim.running)
+        self.assertTrue(sim.cycle_done)
+        self.assertTrue(sim.filter_exit_done)
+        self.assertFalse(sim.take_profit_done)
+        self.assertEqual(sim.block_hands, 6)
+        self.assertEqual(sim.money.hands_played, 6)
+        self.assertIn("bệt Player 7 tay", sim.note)
+        self.assertIsNone(sim.pending)
+
     def test_blocked_book_cannot_start(self):
         sim = self.simulation(start=False)
         sim.money.blocked = ("TAKE_PROFIT", "Chốt lời của phiên đã chạm")
@@ -645,30 +664,19 @@ class LiveSimulationTests(unittest.TestCase):
         self.assertEqual(sim.money.balance, 300_000)
         self.assertEqual(sim.pending["stake"], 300_000)
 
-    def test_blocks_repeat_at_the_same_table_and_recalculate_strong(self):
-        for baseline, old, new in ((BASELINE, "B", "P"), (PLAYER_BASELINE, "P", "B")):
-            with self.subTest(old=old, new=new):
+    def test_table_exits_when_a_live_streak_breaks_the_entry_filter(self):
+        for baseline, result in ((BASELINE, "P"), (PLAYER_BASELINE, "B")):
+            with self.subTest(result=result):
                 sim = self.simulation(baseline)
-                settled_keys = set()
-                for position, side in enumerate(old * 3 + new * 3):
-                    self.assertEqual(sim.pending["side"], side)
-                    self.assertEqual(sim.pending["strong"], old)
-                    self.assertEqual(sim.pending["block_pos"], position)
-                    settled_keys.add(sim.table_key)
-                    self.settle_next(sim, new)
-                self.assertEqual(ME.strong_side(sim.results)[0], new)
-                self.assertTrue(sim.method_state["started"])
-                # KHÔNG rời bàn: khối kế tiếp mở ngay tại bàn này, tính lại bên mạnh.
-                self.assertEqual(settled_keys, {sim.table_key})
-                self.assertTrue(sim.running)
-                self.assertFalse(sim.cycle_done)
+                for _ in range(ME.MAX_STREAK_ALLOWED + 1):
+                    self.settle_next(sim, result)
+                self.assertFalse(sim.running)
+                self.assertTrue(sim.cycle_done)
+                self.assertTrue(sim.filter_exit_done)
                 self.assertFalse(sim.take_profit_done)
-                self.assertIsNotNone(sim.pending)
-                self.assertEqual(sim.pending["strong"], new)
-                self.assertEqual(sim.pending["side"], new)
-                self.assertEqual(sim.pending["block_pos"], 0)
-                self.assertEqual(sim.pending["stake"], UNIT)
-                self.assertEqual(sim.method_state["hands_in_block"], 0)
+                self.assertIn("bệt", sim.note)
+                self.assertIsNone(sim.pending)
+                self.assertEqual(sim.money.hands_played, ME.MAX_STREAK_ALLOWED + 1)
 
     def test_take_profit_ends_the_table_instead_of_starting_another_block(self):
         # Vốn nhỏ + mục tiêu 1%: chỉ một tay thắng là chạm mục tiêu.
@@ -1716,6 +1724,19 @@ class TableCycleTests(unittest.TestCase):
         self.assertFalse(host.cycle_waiting)
         self.assertEqual(captured, [], "Tắt chu trình thì không điều hướng Chrome")
         self.assertEqual(host.sweep_note_text, "")
+
+    def test_filter_violation_forces_exit_and_a_new_lobby_scan(self):
+        host = self.host(auto_cycle_var=Mock(get=lambda: False))
+        host.sim.filter_exit_done = True
+        captured, patcher = self.started_thread()
+        with patcher:
+            app.BCRApp.leave_table_for_lobby(host)
+        self.assertTrue(host.sweep_busy)
+        self.assertEqual(len(captured), 1)
+        self.assertIn("điều kiện lọc", host.sweep_note_text)
+
+        app.BCRApp._on_cycle_back(host, True, "Đã về sảnh")
+        host.sweep_lobby.assert_called_once_with()
 
     def test_cycle_hops_the_retry_timer_when_chrome_is_not_attached(self):
         host = self.host(_cdp_available=lambda: False)
@@ -3638,7 +3659,7 @@ class PlacementGatedHandCountingTests(unittest.TestCase):
             plan = sim.pending
             sim.mark_placing(plan)
             sim.mark_placed(False, "chưa bấm được chip", plan)
-            road += "B"
+            road += "P" if expected % 2 else "B"
             self.assertFalse(self.next_hand(sim, road))
             self.assertEqual(sim.place_skips, expected)
         self.assertFalse(sim.running)
