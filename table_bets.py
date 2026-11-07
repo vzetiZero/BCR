@@ -460,7 +460,7 @@ def confirm_spot_amount(start_amount, expected, read, wait=CHIP_CONFIRM_TIMEOUT,
 # thật vào ô cược. Cùng cách đọc digits() với READ_JS để nhất quán khi DOM chỉ lộ chữ.
 #
 # Site lộ trạng thái "đang chọn" ở HAI chỗ không cùng nhịp: chip trong khay gắn
-# data-selected="true" (đổi ngay theo cú bấm, cũng là chỗ extension/commands.js đọc) và
+# data-selected="true" (đổi ngay theo cú bấm) và
 # nhãn [data-role="selected-chip"] (trễ hơn một nhịp, thậm chí giữ nguyên mệnh giá cũ
 # khi dealer đang mở bài). Ưu tiên tín hiệu khay — chỉ tìm TRONG [data-role="chip-stack"]
 # và chỉ khi có ĐÚNG MỘT chip được đánh dấu — rồi mới tới nhãn. Nhãn cũng chứa một chip
