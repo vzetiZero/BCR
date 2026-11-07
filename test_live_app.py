@@ -3401,18 +3401,36 @@ class PlacementGatedHandCountingTests(unittest.TestCase):
         self.assertEqual(sim.money.balance, CAPITAL)
         self.assertEqual(len(sim.log), app.PLACE_SKIP_LIMIT)
 
-    def test_confirmation_later_than_the_result_does_not_claim_that_hand(self):
+    def test_late_successful_confirmation_still_counts_the_held_hand(self):
+        """Xác nhận chip về cùng nhịp (hoặc trễ hơn) chữ kết quả vẫn phải tính tay.
+
+        place_bet chỉ báo ok khi đã thấy chip lên ô cược trong cửa sổ đặt cược, nên
+        lượt đọc xác nhận về muộn không đổi sự thật chip thuộc tay này. Dừng cả phiên
+        ở đây chính là lỗi "tay đầu đặt được, các tay sau không đặt được nữa".
+        """
         sim = self.simulation()
         plan = sim.pending
         sim.mark_placing(plan)
         self.assertFalse(self.next_hand(sim, BASELINE + "B"))
-        self.assertTrue(sim.mark_placed(True, "Đã đặt 1 đơn vị chip", plan))
+        self.assertTrue(sim.mark_placed(True, "ô cược xác nhận +20", plan))
+        self.assertTrue(self.next_hand(sim, BASELINE + "B"))
+        self.assertTrue(sim.running)
+        self.assertEqual(sim.letters, BASELINE + "B")
+        self.assertEqual(len(sim.log), 1)
+        self.assertIn(sim.log[-1]["outcome"], ("win", "loss", "push"))
+
+    def test_late_failed_confirmation_skips_the_hand_and_keeps_running(self):
+        sim = self.simulation()
+        plan = sim.pending
+        sim.mark_placing(plan)
         self.assertFalse(self.next_hand(sim, BASELINE + "B"))
-        self.assertFalse(sim.running)
-        self.assertEqual(sim.letters, BASELINE)
+        self.assertTrue(sim.mark_placed(False, "ô cược không phản hồi", plan))
+        self.assertFalse(self.next_hand(sim, BASELINE + "B"))
+        self.assertTrue(sim.running)
+        self.assertEqual(sim.letters, BASELINE + "B")
         self.assertEqual(sim.money.balance, CAPITAL)
-        self.assertEqual(sim.log, [])
-        self.assertIn("đối chiếu chip", sim.note)
+        self.assertEqual(len(sim.log), 1)
+        self.assertEqual(sim.log[-1]["outcome"], "not_placed")
 
     def test_hands_are_still_counted_when_no_placement_is_tracked(self):
         """Giả lập thuần (Tự đặt chip tắt): không có mark_placing thì mọi tay vẫn tính."""

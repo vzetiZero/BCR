@@ -322,20 +322,11 @@ class LiveSimulation:
                                       "đã chết giữa chừng)." % int(PLACE_CONFIRM_TIMEOUT))
             else:
                 # Chữ mới đã về mà chip chưa được xác nhận: giữ tay này lại, chờ nhịp poll
-                # kế tiếp (xác nhận về, hoặc hết hạn ở nhánh trên).
-                plan["result_before_confirm"] = True
+                # kế tiếp (xác nhận về thì tính, báo thất bại thì bỏ tay không đụng vốn).
                 self.note = "Chờ xác nhận đã đặt chip thật xong rồi mới tính tay này."
                 return False
         if plan.get("placed") == "failed":
             return self._skip_unplaced_hand(letters, plan)
-        if plan.get("result_before_confirm"):
-            # Kết quả về TRƯỚC khi lượt bấm được xác nhận nên không thể biết chip vừa bấm
-            # là của tay này hay tay kế tiếp. Không tính, và dừng lại vì bàn đang có chip
-            # thật mà sổ giả lập không theo dõi.
-            self.pause("Kết quả tay này về trước khi app xác nhận đặt chip xong nên không được "
-                       "tính. Chip vừa bấm có thể nằm ở tay kế tiếp — hãy đối chiếu chip trên "
-                       "bàn rồi bấm Bắt đầu lại.")
-            return False
         self.place_skips = 0
         result = letters[-1]
         settled = self.money.settle(plan["side"], result, plan["stake"], E.PAYOUT)
