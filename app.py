@@ -160,6 +160,7 @@ class LiveSimulation:
         self.table_name = "Chưa chọn bàn"
         self.letters = ""
         self.running = False
+        self.entry_waiting = False
         self.pending = None
         self.note = "Chọn bàn để theo dõi."
         self.block_hands = 0
@@ -207,6 +208,7 @@ class LiveSimulation:
         self.cycle_done = False
         self.filter_exit_done = False
         self.take_profit_done = False
+        self.entry_waiting = False
         self.note = "Đã chọn bàn."
 
     def start(self, row, verified=False, now=None):
@@ -227,17 +229,28 @@ class LiveSimulation:
         if self.money.blocked:
             self.note = self.money.blocked[1]
             return False
+        if self.on_arm is not None:
+            initial_plan = self.plan()
+            if initial_plan["action"] != "start":
+                self.note = initial_plan["reason"]
+                return False
         self.running = True
-        self._arm()
+        if self.on_arm is not None:
+            self.entry_waiting = True
+            self.pending = None
+            self.note = "Vừa vào bàn · đang chờ kết quả tay hiện tại rồi mới đặt cược."
+        else:
+            self._arm()
         return self.running
 
     def pause(self, reason="Đã tạm dừng. Không ghi thêm kết quả vào vốn."):
         self.running = False
+        self.entry_waiting = False
         self.pending = None
         self.note = reason
 
     def arm_at_entry(self, row):
-        """Vừa vào bàn đạt chuẩn: chốt khối 3-3 ngay trên cầu đang đọc, chỉ tính tay đi sau đó."""
+        """Begin an entry wait; arm only after the first new stable table result."""
         problem = row_problem(row)
         if problem:
             self.note = problem
@@ -246,9 +259,10 @@ class LiveSimulation:
             self.note = self.money.blocked[1]
             return False
         self.bind(row)
-        self.method_state["started"] = True
         self.running = True
-        self._arm()
+        self.entry_waiting = True
+        self.pending = None
+        self.note = "Vừa vào bàn · đang chờ kết quả tay hiện tại rồi mới đặt cược."
         return self.running
 
     def _arm(self):
@@ -373,6 +387,18 @@ class LiveSimulation:
         if not letters.startswith(self.letters) or len(letters) != len(self.letters) + 1:
             self.pause("Cầu nhảy tay, đổi shoe hoặc không khớp. Đã dừng, không tính bù lãi/lỗ.")
             return False
+        if self.entry_waiting:
+            # The table may still be showing a closed betting window from before
+            # the join. Consume this first stable result without settling a wager,
+            # then arm against the newest road for the following hand.
+            self.letters = letters
+            self.results = list(letters)
+            self.entry_waiting = False
+            if self._exit_if_table_filter_failed(letters):
+                return True
+            self.note = "Vừa nhận kết quả mới sau khi vào bàn; chuẩn bị cược tay kế tiếp."
+            self._arm()
+            return True
         plan = self.pending
         if not plan or plan["baseline"] != self.letters:
             self.pause("Không có kế hoạch được chốt trước kết quả. Hãy xác nhận lại bàn.")

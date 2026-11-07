@@ -126,13 +126,23 @@ class AutoStartAtEntryTests(unittest.TestCase):
         app.BCRApp._auto_start_verified_table(host)
         self.assertTrue(host.sim.running)
         self.assertEqual(host.sim.letters, row["letters"])
-        self.assertEqual(host.sim.pending["baseline"], row["letters"])
+        self.assertTrue(host.sim.entry_waiting)
+        self.assertIsNone(host.sim.pending)
         self.assertIsNone(host.auto_start_table_key)
 
     def test_first_hand_after_entry_settles_and_earlier_hands_are_never_counted(self):
         host = self.host(BASELINE, self.screen_row(BASELINE + "T"))
         app.BCRApp._auto_start_verified_table(host)
         self.assertEqual(host.sim.money.hands_played, 0)
+        self.assertTrue(host.sim.entry_waiting)
+        baseline = host.sim.letters
+        self.now += 1
+        completed = self.screen_row(baseline + "B")
+        self.assertTrue(host.sim.process(completed, self.now))
+        self.assertEqual(host.sim.money.hands_played, 0)
+        self.assertEqual(host.sim.log, [])
+        self.assertFalse(host.sim.entry_waiting)
+        self.assertEqual(host.sim.pending["baseline"], completed["letters"])
         bet, baseline = host.sim.pending["side"], host.sim.letters
         row = self.screen_row(baseline + ("P" if bet == "B" else "B"))
         self.now += 2
@@ -179,6 +189,8 @@ class AutoStartAtEntryTests(unittest.TestCase):
         host.cycle_table_key = "id:t9"
         app.BCRApp._auto_start_verified_table(host)
         self.assertTrue(host.sim.running)
+        self.assertTrue(host.sim.entry_waiting)
+        self.assertIsNone(host.sim.pending)
         self.assertEqual((host.cycle_waiting, host.cycle_attempts, host.cycle_table_key),
                          (False, 0, None))
 
@@ -317,6 +329,28 @@ class LiveSimulationTests(unittest.TestCase):
         self.assertEqual(sim.pending["side"], "B")
         self.assertEqual(sim.pending["stake"], UNIT)
         self.assertEqual(sim.pending["armed_at"], self.now)
+
+    def test_live_start_waits_for_one_new_stable_result_before_arming(self):
+        book = M.MoneyBook(capital=CAPITAL, unit=UNIT, take_profit_pct=100)
+        sim = app.LiveSimulation(book, ladder=[UNIT * m for m in (1, 3, 7, 15, 32, 64)])
+        row = self.row(BASELINE)
+        sim.bind(row)
+        armed = []
+        sim.on_arm = armed.append
+        self.assertTrue(sim.start(row, verified=True, now=self.now))
+        self.assertTrue(sim.entry_waiting)
+        self.assertIsNone(sim.pending)
+        self.assertEqual(armed, [])
+
+        self.now += 1
+        latest = self.row(BASELINE + "B", key=sim.table_key, label=sim.table_name)
+        self.assertTrue(sim.process(latest, now=self.now))
+        self.assertFalse(sim.entry_waiting)
+        self.assertEqual(sim.letters, latest["letters"])
+        self.assertEqual(sim.money.hands_played, 0)
+        self.assertEqual(sim.log, [])
+        self.assertEqual(len(armed), 1)
+        self.assertEqual(sim.pending["baseline"], latest["letters"])
 
     def test_start_requires_manual_verification(self):
         sim = self.simulation(start=False)
