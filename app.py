@@ -375,15 +375,18 @@ class BCRApp:
         self.page_title.pack(side="left")
         self._label(header, " DỮ LIỆU TRỰC TIẾP  /  VỐN ", 9, ACCENT, True).pack(side="right")
         self.hunt_banner = tk.Frame(main, bg=PALE, highlightbackground=ACCENT, highlightthickness=1)
-        self.hunt_spinner = self._label(self.hunt_banner, "●", 13, ACCENT, True, bg=PALE)
+        self.hunt_spinner = self._label(self.hunt_banner, "●", 13, ACCENT, True)
         self.hunt_spinner.pack(side="left", padx=(14, 8), pady=8)
-        self.hunt_text = self._label(self.hunt_banner, "", 10, ACCENT, True, bg=PALE, anchor="w", justify="left")
+        self.hunt_text = self._label(self.hunt_banner, "", 10, ACCENT, True, anchor="w", justify="left")
         self.hunt_text.pack(side="left", fill="x", expand=True, pady=8)
         self.hunt_cancel = self._button(self.hunt_banner, "Dừng tự quét", self.cancel_auto_hunt)
         self.hunt_cancel.pack(side="right", padx=10, pady=6)
         self._hunt_frame = 0
         connect = self._card(main)
         connect.pack(fill="x", pady=(0, 12))
+        self.hunt_banner.pack(fill="x", pady=(0, 12), before=connect)
+        self.hunt_banner.pack_forget()
+        self._hunt_anchor = connect
         row = tk.Frame(connect, bg=PANEL)
         row.pack(fill="x", padx=14, pady=(10, 2))
         self.connection_label = self._label(
@@ -1675,6 +1678,28 @@ class BCRApp:
                 self.verified.set(False)
         self._save_state()
         self.refresh()
+
+    def _refresh_hunt_banner(self):
+        """Hiện/ẩn banner chờ khi vòng tự quét tìm bàn đang chạy, kèm đếm ngược và lượt thử."""
+        waiting = bool(getattr(self, "cycle_waiting", False)) and bool(self.auto_hunt_var.get())
+        if not waiting:
+            self.hunt_banner.pack_forget()
+            return
+        self._hunt_frame = getattr(self, "_hunt_frame", 0) + 1
+        spinner = "●○"[self._hunt_frame % 2]
+        remaining = max(0.0, self.cycle_retry_at - time.time()) if self.cycle_retry_at else 0.0
+        if remaining > 0:
+            text = "Đang tự quét tìm bàn… nghỉ %.0f giây nữa rồi quét lại (đã thử %d lượt)." % (
+                remaining, self.cycle_attempts)
+        else:
+            text = "Đang tự quét tìm bàn đạt chuẩn… (đã thử %d lượt)." % self.cycle_attempts
+        self.hunt_spinner.config(text=spinner)
+        self.hunt_text.config(text=text)
+        anchor = getattr(self, "_hunt_anchor", None)
+        if anchor is not None and anchor.winfo_exists():
+            self.hunt_banner.pack(fill="x", pady=(0, 12), before=anchor)
+        else:
+            self.hunt_banner.pack(fill="x", pady=(0, 12))
 
     def refresh(self):
         book = self.sim.money
