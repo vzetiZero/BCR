@@ -147,8 +147,9 @@ class LiveSimulation:
         self.ladder = ME.ladder_stakes(profile, ladder)
         self.min_hands, self.max_hands = ME.normalize_hand_range(min_hands, max_hands)
         self.max_streak = ME.normalize_streak(max_streak)
-        self.block_mode = (block_mode if block_mode in
-                           (ME.BLOCK_MODE_RECALCULATE, ME.BLOCK_MODE_ALTERNATE)
+        self.block_mode = (ME.BLOCK_MODE_REPEAT if block_mode == "alternate" else block_mode)
+        self.block_mode = (self.block_mode if self.block_mode in
+                           (ME.BLOCK_MODE_RECALCULATE, ME.BLOCK_MODE_REPEAT)
                            else ME.BLOCK_MODE_RECALCULATE)
         self.results = []
         self.log = []
@@ -792,7 +793,7 @@ class BCRApp:
         self._label(method, "Hướng khối 3–3 tại cùng bàn", 10, MUTED, True).pack(anchor="w", pady=(8, 0))
         for value, title in (
                 (ME.BLOCK_MODE_RECALCULATE, "Tính lại bên mạnh sau mỗi khối 6 tay (hiện tại)"),
-                (ME.BLOCK_MODE_ALTERNATE, "Đảo hướng sau mỗi khối 6 tay (P→B→P hoặc B→P→B)")):
+                (ME.BLOCK_MODE_REPEAT, "Lặp lại hướng của khối đầu tiên (3P–3B rồi tiếp tục 3P–3B)")):
             tk.Radiobutton(method, text=title, variable=self.block_mode_var, value=value,
                            command=self.apply_block_mode, bg=PANEL, fg=TEXT, selectcolor=PALE,
                            activebackground=PANEL, font=("Segoe UI", 10)).pack(anchor="w")
@@ -1043,7 +1044,7 @@ class BCRApp:
             self.cycle_check.config(text="Lặp khối %s tại bàn tới khi lãi đủ %.0f%% vốn" % (
                 profile, target))
             direction_rule = ("t\u00ednh l\u1ea1i b\u00ean m\u1ea1nh m\u1ed7i kh\u1ed1i" if self.sim.block_mode == ME.BLOCK_MODE_RECALCULATE
-                              else "\u0111\u1ea3o h\u01b0\u1edbng m\u1edf \u0111\u1ea7u m\u1ed7i kh\u1ed1i")
+                              else "l\u1eb7p l\u1ea1i h\u01b0\u1edbng c\u1ee7a kh\u1ed1i \u0111\u1ea7u ti\u00ean")
             self.cycle_rule.config(
                 text="Kh\u1ed1i %s = %d tay b\u00ean m\u1ea1nh + %d tay b\u00ean \u0111\u1ed5i; %s. "
                      "\u0110\u1ee7 %.0f%% v\u1ed1n th\u00ec r\u1eddi b\u00e0n, t\u1ef1 qu\u00e9t v\u00e0o b\u00e0n k\u1ebf ti\u1ebfp t\u1edbi khi xong %d b\u00e0n; "
@@ -2326,7 +2327,10 @@ class BCRApp:
 
     def apply_block_mode(self):
         mode = self.block_mode_var.get()
-        if mode not in (ME.BLOCK_MODE_RECALCULATE, ME.BLOCK_MODE_ALTERNATE):
+        if mode == "alternate":
+            mode = ME.BLOCK_MODE_REPEAT
+            self.block_mode_var.set(mode)
+        if mode not in (ME.BLOCK_MODE_RECALCULATE, ME.BLOCK_MODE_REPEAT):
             mode = ME.BLOCK_MODE_RECALCULATE
             self.block_mode_var.set(mode)
         self.sim.block_mode = mode
@@ -2427,7 +2431,9 @@ class BCRApp:
                     self.sim.set_method(profile, None)
                 self.ladder_store[profile] = [M.fmt_input_money(s) for s in self.sim.ladder]
             block_mode = settings.get("block_mode", ME.BLOCK_MODE_RECALCULATE)
-            if block_mode not in (ME.BLOCK_MODE_RECALCULATE, ME.BLOCK_MODE_ALTERNATE):
+            if block_mode == "alternate":
+                block_mode = ME.BLOCK_MODE_REPEAT
+            if block_mode not in (ME.BLOCK_MODE_RECALCULATE, ME.BLOCK_MODE_REPEAT):
                 block_mode = ME.BLOCK_MODE_RECALCULATE
             self.block_mode_var.set(block_mode)
             self.sim.block_mode = block_mode

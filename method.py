@@ -23,7 +23,7 @@ PROFILES = {          # (số tay bên mạnh, số tay bên đổi) của một
 }
 DEFAULT_PROFILE = "3-3"
 BLOCK_MODE_RECALCULATE = "recalculate"
-BLOCK_MODE_ALTERNATE = "alternate"
+BLOCK_MODE_REPEAT = "repeat"
 # Mức cược mặc định chỉ để điền sẵn vào ô nhập; người dùng tự đổi từng bậc, không nhân cứng.
 # Đơn vị theo đúng số hiển thị trên sàn (VN2): bậc 1 = 100, không phải 100.000.
 DEFAULT_LADDER = {
@@ -214,9 +214,7 @@ def plan(results, stakes, ladder_step=0, hands_in_block=0, started=False,
 
     if hands_in_block >= block or (started and hands_in_block == 0):
         hands_in_block = 0
-        if block_mode == BLOCK_MODE_ALTERNATE and started and strong in (E.BANKER, E.PLAYER):
-            strong = E.PLAYER if strong == E.BANKER else E.BANKER
-        else:
+        if block_mode != BLOCK_MODE_REPEAT or not started or strong not in (E.BANKER, E.PLAYER):
             strong = info["strong"] or strong
         weak = E.PLAYER if strong == E.BANKER else E.BANKER
 
