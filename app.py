@@ -358,11 +358,11 @@ class LiveSimulation:
         if self.money.blocked:
             self.pause(self.money.blocked[1])
             if self.money.blocked[0] == "TAKE_PROFIT":
-                # Đủ lãi mới rời bàn. App dùng cycle_done làm tín hiệu đưa tab về sảnh,
-                # nhưng đánh dấu take_profit_done để không quét/mở bàn mới sau đó.
+                # Đủ lãi mới rời bàn. App dùng cycle_done làm tín hiệu đưa tab về sảnh;
+                # take_profit_done để app biết đây là bàn chốt lời (rời xong mới tính bàn).
                 self.take_profit_done = True
                 self.cycle_done = True
-                self.note = ("Đã đạt mục tiêu lãi %.0f%% vốn (%s) · rời bàn và dừng phiên." % (
+                self.note = ("Đã đạt mục tiêu lãi %.0f%% vốn (%s) · rời bàn." % (
                     self.money.take_profit_pct, M.fmt_money(self.money.profit)))
         else:
             # Hết một khối 3-3/3-2 thì lặp khối tiếp theo ngay tại bàn này.
@@ -408,6 +408,8 @@ class BCRApp:
         self.cycle_attempts = 0
         self.cycle_retry_at = 0.0
         self.cycle_table_key = None
+        # Số bàn đã chốt lời xong trong phiên này; đủ ``tables_var`` bàn thì dừng hẳn.
+        self.tables_done = 0
         self.session_lost = False
         self.recover_busy = False
         self.recover_attempts = 0
@@ -431,6 +433,7 @@ class BCRApp:
         self.start_url_var = tk.StringVar(value=BR.START_URL)
         self.auto_cycle_var = tk.BooleanVar(value=True)
         self.auto_hunt_var = tk.BooleanVar(value=True)
+        self.tables_var = tk.StringVar(value="1")
         self.favorites_only = tk.BooleanVar(value=True)
         self.human_mouse_var = tk.BooleanVar(value=True)
         self.auto_place_var = tk.BooleanVar(value=False)
@@ -791,6 +794,14 @@ class BCRApp:
                                          bg=PANEL, fg=TEXT, selectcolor=PALE, activebackground=PANEL,
                                          font=("Segoe UI", 10))
         self.hunt_check.pack(anchor="w")
+        tables_row = tk.Frame(cycle, bg=PANEL)
+        tables_row.pack(anchor="w", pady=(6, 0))
+        self._label(tables_row, "Số bàn muốn chơi", 9, MUTED).pack(side="left", padx=(0, 6))
+        tk.Entry(tables_row, textvariable=self.tables_var, width=4, font=("Segoe UI", 11),
+                 relief="solid", bd=1).pack(side="left", ipady=3)
+        self._button(tables_row, "Lưu số bàn", self.apply_tables_target).pack(side="left", padx=(8, 0))
+        self.tables_note = self._label(cycle, "", 9, MUTED, justify="left", wraplength=500)
+        self.tables_note.pack(anchor="w", pady=(2, 0))
         self.cycle_rule = self._label(cycle, "", 9, MUTED, justify="left", wraplength=500)
         self.cycle_rule.pack(anchor="w", pady=(4, 0))
         self._sync_method_texts()
@@ -977,8 +988,9 @@ class BCRApp:
                 profile, target))
             self.cycle_rule.config(
                 text="Khối %s = %d tay bên mạnh + %d tay bên đổi, lặp lại tại bàn và tự tính lại bên mạnh. "
-                     "Đủ %.0f%% vốn thì bấm nút X của site về sảnh rồi dừng." % (
-                         profile, strong, hands - strong, target))
+                     "Đủ %.0f%% vốn thì rời bàn, tự quét vào bàn kế tiếp tới khi xong %d bàn; "
+                     "vốn ban đầu tự đồng bộ theo số dư sau mỗi bàn." % (
+                         profile, strong, hands - strong, target, self._tables_target()))
         if hasattr(self, "step_label"):
             self.step_label.config(text="Vào bàn là tự đánh · khối %s lặp tới khi lãi đủ %.0f%% vốn · tự đóng bàn"
                                    % (profile, target))
@@ -1034,6 +1046,52 @@ class BCRApp:
                 self.events.put(("window_applied", (False, "Không đổi được cửa sổ (%s)." % type(exc).__name__)))
         threading.Thread(target=work, daemon=True).start()
         self.refresh()
+
+    def _tables_target(self):
+        """Số bàn muốn chơi trong phiên (≥ 1); ô nhập sai thì giữ mức tối thiểu 1."""
+        try:
+            return max(1, int(str(self.tables_var.get()).strip()))
+        except (ValueError, TypeError, AttributeError):
+            return 1
+
+    def _session_complete(self):
+        return self.tables_done >= self._tables_target()
+
+    def apply_tables_target(self):
+        """Lưu số bàn muốn chơi: mỗi bàn đủ chốt lời thì rời bàn, tự quét vào bàn kế tiếp."""
+        try:
+            count = int(self.tables_var.get().strip())
+            if count < 1:
+                raise ValueError()
+        except (ValueError, TypeError):
+            messagebox.showerror("Số bàn chưa hợp lệ",
+                                 "Nhập số bàn muốn chơi ≥ 1 (ví dụ 3).", parent=self.root)
+            return
+        self.tables_var.set(str(count))
+        self._save_state()
+        self._sync_method_texts()
+        self.refresh()
+
+    def _start_next_table(self):
+        """Một bàn vừa chốt lời và đã rời khỏi bàn thành công, nhưng chưa đủ số bàn cấu hình.
+
+        Đồng bộ vốn ban đầu = số dư hiện tại để bàn kế tiếp chốt lời theo % trên số tiền
+        mới nhất (người dùng không phải sửa tay), rồi mở lại vòng quét tìm bàn.
+        """
+        book = self.sim.money
+        balance = book.rebase_to_balance()
+        if "capital" in self.entries:
+            self.entries["capital"].set(M.fmt_input_money(balance))
+        self.sim.take_profit_done = False
+        self.sim.note = "Bàn trước đã chốt lời · vốn mới %s · đang tìm bàn kế tiếp." % M.fmt_money(balance)
+        self.cycle_waiting = True
+        self.cycle_attempts = 0
+        self.cycle_retry_at = 0.0
+        self.cycle_table_key = self.sim.table_key
+        self.sweep_note_text = ("Bàn %d/%d đã chốt lời · vốn mới %s · đang quét tìm bàn kế tiếp…" % (
+            self.tables_done, self._tables_target(), M.fmt_money(balance)))
+        self._save_state()
+        self.sweep_lobby()
 
     def apply_road_filter(self):
         """Lưu bộ lọc cầu: khoảng tay đã đi (10–50) và số tay bệt tối đa còn nhận."""
@@ -1515,8 +1573,8 @@ class BCRApp:
     def _on_cycle_back(self, ok, note):
         """Kết quả đưa tab về danh sách bàn.
 
-        ``take_profit_done`` là ranh giới tuyệt đối: dù thành công hay thất bại,
-        app chỉ đóng bàn rồi dừng, không quét hay mở bàn mới.
+        Bàn chốt lời: rời bàn thành công thì tính là xong một bàn. Chưa đủ số bàn cấu
+        hình thì đồng bộ vốn và quét bàn kế tiếp; đủ rồi thì dừng hẳn (không quét/mở).
         """
         self.sweep_note_text = note
         take_profit = bool(getattr(self.sim, "take_profit_done", False))
@@ -1526,9 +1584,18 @@ class BCRApp:
                 self.cycle_waiting = False
                 self.cycle_retry_at = 0.0
                 self.cycle_table_key = None
-                self.sweep_note_text = (
-                    "Đã đạt mục tiêu lãi %.0f%% vốn (%s) · đã đóng bàn và dừng phiên." % (
-                        self.sim.money.take_profit_pct, M.fmt_money(self.sim.money.profit)))
+                self.tables_done += 1
+                self._trace("table_completed", dict(done=self.tables_done,
+                                                     target=self._tables_target(),
+                                                     balance=self.sim.money.balance))
+                if self._session_complete():
+                    self.sweep_note_text = (
+                        "Đã đạt mục tiêu lãi %.0f%% vốn (%s) · đã đóng bàn và dừng phiên "
+                        "(xong %d/%d bàn)." % (
+                            self.sim.money.take_profit_pct, M.fmt_money(self.sim.money.profit),
+                            self.tables_done, self._tables_target()))
+                else:
+                    self._start_next_table()
             elif self._auth_blame():
                 self._session_lost_step(note)
             else:
@@ -1984,7 +2051,8 @@ class BCRApp:
                 text = "Đã chốt lời · thử đóng bàn lại sau %.0f giây (lượt %d)." % (
                     remaining, self.cycle_attempts)
             else:
-                text = "Đã chốt lời · đang đóng bàn để dừng phiên…"
+                text = ("Đã chốt lời · đang đóng bàn để dừng phiên…" if self._session_complete()
+                        else "Đã chốt lời · đang rời bàn để sang bàn kế tiếp…")
         elif remaining > 0:
             text = "Đang tự quét tìm bàn… nghỉ %.0f giây nữa rồi quét lại (đã thử %d lượt)." % (
                 remaining, self.cycle_attempts)
@@ -2024,6 +2092,9 @@ class BCRApp:
                                      or self.open_table_busy else "normal")
         self.sweep_note.config(text=self.sweep_note_text)
         self._refresh_hunt_banner()
+        if hasattr(self, "tables_note"):
+            self.tables_note.config(text="Số bàn muốn chơi: %d · đã xong %d bàn trong phiên." % (
+                self._tables_target(), self.tables_done), fg=MUTED)
         self.road_title.config(text=self.sim.table_name)
         road = self.sim.results
         self.road_count.config(text="%d tay · Banker %d  /  Player %d  /  Hòa %d" % (
@@ -2172,6 +2243,7 @@ class BCRApp:
                                   min_hands=self.sim.min_hands, max_hands=self.sim.max_hands,
                                   max_streak=self.sim.max_streak)
         self.sim.on_arm = self.place_armed_bet
+        self.tables_done = 0
         self._sync_cycle_strip()
         self._sync_method_texts()
         self.history_size = -1
@@ -2234,6 +2306,9 @@ class BCRApp:
                 self.start_url_var.set(saved_url.strip())
             self.auto_cycle_var.set(bool(settings.get("auto_cycle", True)))
             self.auto_hunt_var.set(bool(settings.get("auto_hunt", True)))
+            saved_tables = settings.get("tables_to_play", 1)
+            if isinstance(saved_tables, (int, float)) and not isinstance(saved_tables, bool) and saved_tables >= 1:
+                self.tables_var.set(str(int(saved_tables)))
             self.favorites_only.set(bool(settings.get("favorites_only", True)))
             self.human_mouse_var.set(bool(settings.get("human_mouse", True)))
             self.auto_place_var.set(bool(settings.get("auto_place", False)))
@@ -2290,6 +2365,7 @@ class BCRApp:
                                   start_url=self.start_url_var.get(),
                                   auto_cycle=self.auto_cycle_var.get(),
                                   auto_hunt=self.auto_hunt_var.get(),
+                                  tables_to_play=self._tables_target(),
                                   favorites_only=self.favorites_only.get(),
                                    human_mouse=self.human_mouse_var.get(),
                                    auto_place=self.auto_place_var.get(),

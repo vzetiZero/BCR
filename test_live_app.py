@@ -1619,10 +1619,15 @@ class TableCycleTests(unittest.TestCase):
             cycle_waiting=False, cycle_attempts=0, cycle_retry_at=0.0, cycle_table_key=None,
             auto_hunt_var=Mock(get=lambda: True), auto_start_letters="", auto_start_table_key=None,
             session_lost=False, _trace=lambda *args, **kwargs: None,
+            tables_done=0, tables_var=Mock(get=lambda: "1"),
+            entries={"capital": Mock()}, _save_state=lambda: True,
             _auth_blame=lambda: False)
         host._schedule_cycle_retry = MethodType(app.BCRApp._schedule_cycle_retry, host)
         host.leave_table_for_lobby = MethodType(app.BCRApp.leave_table_for_lobby, host)
         host._on_cycle_back = MethodType(app.BCRApp._on_cycle_back, host)
+        host._tables_target = MethodType(app.BCRApp._tables_target, host)
+        host._session_complete = MethodType(app.BCRApp._session_complete, host)
+        host._start_next_table = MethodType(app.BCRApp._start_next_table, host)
         for key, value in changes.items():
             setattr(host, key, value)
         return host
@@ -1839,6 +1844,127 @@ class TableCycleTests(unittest.TestCase):
                           host.cycle_table_key), (False, 0, 0.0, None))
         app.BCRApp._resume_cycle_hunt(host, self.now + 600)
         self.assertFalse(host.cycle_waiting)
+
+
+class TableCountCycleTests(unittest.TestCase):
+    """Chơi đủ số bàn cấu hình: mỗi bàn chốt lời thì rời bàn, đồng bộ vốn và quét bàn kế;
+    xong đủ số bàn thì dừng hẳn. Đây là yêu cầu "cấu hình 3 bàn thì lặp lại 3 lần"."""
+
+    def setUp(self):
+        self.now = 1_800_000_000.0
+        clock = patch.object(app.time, "time", side_effect=lambda: self.now)
+        clock.start()
+        self.addCleanup(clock.stop)
+
+    def host(self, target="3", done=0, balance=CAPITAL + 1000, **changes):
+        book = M.MoneyBook(capital=CAPITAL, unit=UNIT, take_profit_pct=10)
+        book.balance = balance
+        book.hands_played = 5
+        sim = app.LiveSimulation(book)
+        sim.table_key = "id:t1"
+        sim.take_profit_done = True
+        host = SimpleNamespace(
+            tables={}, sim=sim,
+            auto_cycle_var=Mock(get=lambda: True), auto_hunt_var=Mock(get=lambda: True),
+            chrome_busy=False, sweep_busy=False, open_table_busy=False, exit_requested=False,
+            _cdp_available=lambda: True, stream=Mock(), events=Mock(),
+            refresh=lambda: None, sweep_lobby=Mock(), sweep_note_text="",
+            cycle_waiting=True, cycle_attempts=0, cycle_retry_at=0.0, cycle_table_key="id:t1",
+            auto_start_letters="", auto_start_table_key=None, session_lost=False,
+            _trace=lambda *a, **k: None, _auth_blame=lambda: False,
+            tables_done=done, tables_var=Mock(get=lambda: target),
+            entries={"capital": Mock()}, _save_state=lambda: True)
+        for name in ("_on_cycle_back", "_tables_target", "_session_complete", "_start_next_table"):
+            setattr(host, name, MethodType(getattr(app.BCRApp, name), host))
+        for key, value in changes.items():
+            setattr(host, key, value)
+        return host
+
+    def test_finished_table_under_the_limit_rebases_capital_and_hunts_again(self):
+        host = self.host(target="3", done=0, balance=CAPITAL + 1000)
+        app.BCRApp._on_cycle_back(host, True, "Đã rời bàn.")
+        self.assertEqual(host.tables_done, 1)
+        host.sweep_lobby.assert_called_once_with()
+        self.assertFalse(host.sim.take_profit_done)
+        self.assertTrue(host.cycle_waiting)
+        self.assertEqual(host.sim.money.start_capital, CAPITAL + 1000)
+        self.assertEqual(host.sim.money.capital, CAPITAL + 1000)
+        self.assertEqual(host.sim.money.profit, 0)
+        self.assertIsNone(host.sim.money.blocked)
+        self.assertEqual(host.sim.money.hands_played, 5)
+        host.entries["capital"].set.assert_called_once_with(M.fmt_input_money(CAPITAL + 1000))
+        self.assertIn("1/3", host.sweep_note_text)
+        self.assertEqual(host.cycle_table_key, "id:t1")
+
+    def test_each_completed_table_rebases_again_on_the_new_balance(self):
+        host = self.host(target="3", done=1, balance=CAPITAL + 2000)
+        app.BCRApp._on_cycle_back(host, True, "Đã rời bàn.")
+        self.assertEqual(host.tables_done, 2)
+        self.assertEqual(host.sim.money.start_capital, CAPITAL + 2000)
+        host.sweep_lobby.assert_called_once_with()
+        self.assertIn("2/3", host.sweep_note_text)
+
+    def test_last_table_stops_without_rebasing_or_sweeping(self):
+        host = self.host(target="3", done=2, balance=CAPITAL + 3000)
+        app.BCRApp._on_cycle_back(host, True, "Đã rời bàn.")
+        self.assertEqual(host.tables_done, 3)
+        host.sweep_lobby.assert_not_called()
+        self.assertTrue(host.sim.take_profit_done)
+        self.assertFalse(host.cycle_waiting)
+        self.assertEqual(host.sim.money.start_capital, CAPITAL)
+        self.assertIn("dừng phiên", host.sweep_note_text)
+        self.assertIn("3/3", host.sweep_note_text)
+
+    def test_default_one_table_stops_after_the_first_profit(self):
+        host = self.host(target="1", done=0)
+        app.BCRApp._on_cycle_back(host, True, "Đã rời bàn.")
+        self.assertEqual(host.tables_done, 1)
+        host.sweep_lobby.assert_not_called()
+        self.assertTrue(host.sim.take_profit_done)
+
+    def test_failed_exit_does_not_count_the_table(self):
+        host = self.host(target="3", done=0)
+        app.BCRApp._on_cycle_back(host, False, "Không về được sảnh (RuntimeError).")
+        self.assertEqual(host.tables_done, 0)
+        host.sweep_lobby.assert_not_called()
+        self.assertTrue(host.cycle_waiting)
+        self.assertEqual(host.cycle_retry_at, self.now + app.CYCLE_RETRY_SECONDS)
+
+    def test_invalid_target_falls_back_to_one(self):
+        host = self.host(target="abc")
+        self.assertEqual(app.BCRApp._tables_target(host), 1)
+        host.tables_var = Mock(get=lambda: "0")
+        self.assertEqual(app.BCRApp._tables_target(host), 1)
+        host.tables_var = Mock(get=lambda: "5")
+        self.assertEqual(app.BCRApp._tables_target(host), 5)
+
+
+class CapitalRebaseTests(unittest.TestCase):
+    """Đồng bộ vốn sau mỗi bàn: mốc vốn dời theo số dư để % chốt lời bàn sau tính trên tiền mới."""
+
+    def test_rebase_moves_the_baseline_to_the_current_balance(self):
+        book = M.MoneyBook(capital=1000, unit=10, take_profit_pct=10)
+        book.balance = 1100
+        book.hands_played = 6
+        book.wins, book.losses = 4, 2
+        book.blocked = ("TAKE_PROFIT", "đã chốt lời")
+        self.assertEqual(book.rebase_to_balance(), 1100)
+        self.assertEqual((book.start_capital, book.capital, book.balance), (1100, 1100, 1100))
+        self.assertEqual(book.profit, 0)
+        self.assertIsNone(book.blocked)
+        self.assertEqual(book.hands_played, 6)
+        self.assertEqual((book.wins, book.losses), (4, 2))
+
+    def test_next_table_target_is_percent_of_the_rebased_capital(self):
+        book = M.MoneyBook(capital=1000, unit=10, take_profit_pct=10)
+        book.balance = 1100
+        book.rebase_to_balance()
+        book.balance = 1200
+        book.check_limits()
+        self.assertIsNone(book.blocked, "9,09% vốn mới chưa đủ ngưỡng 10%")
+        book.balance = 1210
+        book.check_limits()
+        self.assertEqual(book.blocked[0], "TAKE_PROFIT", "đúng 10% của 1100 thì chốt lời")
 
 
 class TableStreakFilterTests(unittest.TestCase):

@@ -145,6 +145,19 @@ class MoneyBook:
         self.check_limits()
         return True, "Đã đồng bộ vốn thật: %s đ." % fmt_money(value)
 
+    def rebase_to_balance(self):
+        """Chốt lời xong một bàn: vốn ban đầu của bàn kế tiếp = số dư hiện tại.
+
+        Nhờ vậy mục tiêu chốt lời (% vốn) của bàn sau tính trên số tiền mới nhất mà
+        người dùng không phải sửa ô "Vốn ban đầu" bằng tay. Không reset thống kê tay
+        (sổ vẫn cumulative cả phiên); chỉ dời mốc vốn và mở lại ngưỡng dừng.
+        Trả về số dư đã dùng làm vốn mới.
+        """
+        self.capital = self.balance
+        self.start_capital = self.balance
+        self.check_limits()
+        return self.balance
+
     def check_limits(self):
         won_pct = (self.balance - self.start_capital) / self.start_capital * 100 if self.start_capital else 0
         if won_pct >= self.take_profit_pct:
