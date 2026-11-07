@@ -423,8 +423,12 @@ class LiveSimulationTests(unittest.TestCase):
             self.assertEqual(sim.money.profit, -UNIT)
             self.assertEqual(sim.method_state["ladder_step"], 1)
             self.assertEqual(sim.method_state["hands_in_block"], (index + 1) % 6)
-        self.assertFalse(sim.running)
-        self.assertTrue(sim.cycle_done)
+        # Hết 6 tay vẫn ở lại bàn: khối kế tiếp được chốt ngay, không rời bàn.
+        self.assertTrue(sim.running)
+        self.assertFalse(sim.cycle_done)
+        self.assertFalse(sim.take_profit_done)
+        self.assertEqual(sim.pending["block_pos"], 0)
+        self.assertEqual(sim.pending["side"], sim.pending["strong"])
         self.assertEqual((sim.money.hands_played, sim.money.pushes, sim.money.loss_streak), (6, 5, 1))
         self.assertEqual(sim.money.total_staked, 16 * UNIT)
         self.assertEqual(sim.money.total_returned, 15 * UNIT)
@@ -440,10 +444,14 @@ class LiveSimulationTests(unittest.TestCase):
                     self.assertEqual(sim.pending["stake"], UNIT)
                     self.settle_next(sim, "T")
                 self.assertEqual("".join(entry["bet"] for entry in sim.log), expected)
-                self.assertFalse(sim.running)
-                self.assertIsNone(sim.pending)
+                # Hết khối thì lặp lại tại chỗ: tay kế tiếp mở khối mới cùng bàn.
+                self.assertTrue(sim.running)
+                self.assertIsNotNone(sim.pending)
+                self.assertFalse(sim.cycle_done)
+                self.assertFalse(sim.take_profit_done)
+                self.assertEqual(sim.pending["block_pos"], 0)
+                self.assertEqual(sim.pending["side"], expected[0])
                 self.assertEqual(sim.block_hands, sim.cycle_hands)
-                self.assertTrue(sim.cycle_done)
 
     def test_win_resets_ladder_without_resetting_cycle(self):
         sim = self.simulation()
@@ -633,30 +641,60 @@ class LiveSimulationTests(unittest.TestCase):
         self.assertEqual(sim.money.balance, 300_000)
         self.assertEqual(sim.pending["stake"], 300_000)
 
-    def test_six_hands_leave_the_table_and_the_next_table_recalculates_strong(self):
+    def test_blocks_repeat_at_the_same_table_and_recalculate_strong(self):
         for baseline, old, new in ((BASELINE, "B", "P"), (PLAYER_BASELINE, "P", "B")):
             with self.subTest(old=old, new=new):
                 sim = self.simulation(baseline)
+                settled_keys = set()
                 for position, side in enumerate(old * 3 + new * 3):
                     self.assertEqual(sim.pending["side"], side)
                     self.assertEqual(sim.pending["strong"], old)
                     self.assertEqual(sim.pending["block_pos"], position)
+                    settled_keys.add(sim.table_key)
                     self.settle_next(sim, new)
                 self.assertEqual(ME.strong_side(sim.results)[0], new)
                 self.assertTrue(sim.method_state["started"])
-                self.assertFalse(sim.running)
-                self.assertIsNone(sim.pending)
-                self.assertTrue(sim.cycle_done)
-                self.assertIn("đủ 6 tay", sim.note)
-                # Khối mới chỉ diễn ra ở bàn khác, tính bên mạnh theo cầu của bàn đó.
-                row = self.row(PLAYER_BASELINE if new == "P" else BASELINE)
-                sim.bind(row)
-                self.assertTrue(sim.start(row, verified=True, now=self.now))
+                # KHÔNG rời bàn: khối kế tiếp mở ngay tại bàn này, tính lại bên mạnh.
+                self.assertEqual(settled_keys, {sim.table_key})
+                self.assertTrue(sim.running)
+                self.assertFalse(sim.cycle_done)
+                self.assertFalse(sim.take_profit_done)
+                self.assertIsNotNone(sim.pending)
                 self.assertEqual(sim.pending["strong"], new)
                 self.assertEqual(sim.pending["side"], new)
                 self.assertEqual(sim.pending["block_pos"], 0)
                 self.assertEqual(sim.pending["stake"], UNIT)
-                self.assertEqual(sim.block_hands, 0)
+                self.assertEqual(sim.method_state["hands_in_block"], 0)
+
+    def test_take_profit_ends_the_table_instead_of_starting_another_block(self):
+        # Vốn nhỏ + mục tiêu 1%: chỉ một tay thắng là chạm mục tiêu.
+        book = M.MoneyBook(capital=UNIT, unit=UNIT, take_profit_pct=1)
+        sim = app.LiveSimulation(book, ladder=[UNIT * m for m in (1, 3, 7, 15, 32, 64)])
+        row = self.row(BASELINE)
+        sim.bind(row)
+        self.assertTrue(sim.start(row, verified=True, now=self.now))
+        winning_side = sim.pending["side"]
+        self.settle_next(sim, winning_side)
+        self.assertEqual(sim.money.blocked[0], "TAKE_PROFIT")
+        self.assertTrue(sim.take_profit_done)
+        self.assertTrue(sim.cycle_done, "phải báo cho app đóng bàn")
+        self.assertFalse(sim.running, "chốt lời xong là dừng, không lặp khối mới")
+        self.assertIsNone(sim.pending)
+        self.assertIn("mục tiêu lãi", sim.note)
+
+    def test_ties_alone_never_reach_take_profit(self):
+        book = M.MoneyBook(capital=UNIT, unit=UNIT, take_profit_pct=1)
+        sim = app.LiveSimulation(book, ladder=[UNIT * m for m in (1, 3, 7, 15, 32, 64)])
+        row = self.row(BASELINE)
+        sim.bind(row)
+        self.assertTrue(sim.start(row, verified=True, now=self.now))
+        for _ in range(sim.cycle_hands):
+            self.assertFalse(sim.take_profit_done)
+            self.settle_next(sim, "T")
+        self.assertFalse(sim.take_profit_done)
+        self.assertFalse(sim.cycle_done)
+        self.assertTrue(sim.running)
+        self.assertEqual(sim.money.profit, 0)
 
     def test_default_now_uses_clock_without_real_waiting(self):
         sim = self.simulation(start=False)
@@ -719,9 +757,12 @@ class MethodProfileSimulationTests(unittest.TestCase):
             self.assertTrue(sim.process(row, now=self.now))
         self.assertEqual([entry["stake"] for entry in sim.log], [float(s) for s in self.LADDER_32])
         self.assertEqual(sim.money.total_staked, sum(self.LADDER_32))
+        # Thua hết 5 bậc thì dừng vì cạn thang, KHÔNG phải vì hết khối 3-2.
         self.assertFalse(sim.running)
-        self.assertTrue(sim.cycle_done)
-        self.assertIn("đủ 5 tay của khối 3-2", sim.note)
+        self.assertFalse(sim.cycle_done)
+        self.assertFalse(sim.take_profit_done)
+        self.assertIsNone(sim.pending)
+        self.assertIn("thua hết 5 bậc", sim.note)
 
     def test_each_profile_starts_with_its_own_default_ladder(self):
         self.assertEqual(app.LiveSimulation().ladder, [float(s) for s in ME.DEFAULT_LADDER["3-3"]])
@@ -1295,7 +1336,7 @@ class FavoriteFilterTests(unittest.TestCase):
 
 
 class LobbyListReturnTests(unittest.TestCase):
-    """Rời màn hình bàn bằng history.back(), không sửa hash (CDP giả lập, không mở Chrome)."""
+    """Rời bàn bằng nút X của site, history.back() dự phòng; không sửa hash (CDP giả lập)."""
 
     TABLE = dict(id="table", type="page",
                  url="https://tmrw17k36as.evo-games.com/frontend/evo/r3/#category=all_games&table_id=t1",
@@ -1323,11 +1364,13 @@ class LobbyListReturnTests(unittest.TestCase):
         self.addCleanup(sleep.stop)
 
     def transcript(self, tiles_seen=True):
+        # id2: khung không có nút X (JS trả null) nên phải dùng history.back() ở id3.
         messages = [{"method": "Runtime.executionContextCreated",
                      "params": {"context": {"id": 9, "auxData": {"isDefault": True}}}},
-                    {"id": 1, "result": {}}, {"id": 2, "result": {}}]
+                    {"id": 1, "result": {}}, {"id": 2, "result": {}},
+                    {"id": 3, "result": {}}]
         value = self.TILES if tiles_seen else {"tiles": []}
-        messages.append({"id": 3, "result": {"result": {"value": value}}})
+        messages.append({"id": 4, "result": {"result": {"value": value}}})
         return [messages]
 
     def test_uses_history_back_and_waits_for_the_tiles_to_come_back(self):
@@ -1337,10 +1380,46 @@ class LobbyListReturnTests(unittest.TestCase):
         self.assertTrue(ok, note)
         self.assertIn("danh sách bàn Baccarat", note)
         evaluate = [message for message in self.sockets[0].sent if message["method"] == "Runtime.evaluate"]
-        self.assertEqual(evaluate[0]["params"]["expression"], "history.back()")
-        self.assertEqual(evaluate[0]["params"]["contextId"], 9)
+        self.assertEqual(evaluate[0]["params"]["expression"], LS.CLOSE_TABLE_JS)
+        self.assertEqual(evaluate[1]["params"]["expression"], "history.back()")
+        self.assertEqual(evaluate[1]["params"]["contextId"], 9)
         self.assertNotIn("location.hash", json.dumps(self.sockets[0].sent))
         self.assertTrue(self.sockets[0].closed)
+
+    def test_clicks_the_sites_close_button_and_never_sends_history_back(self):
+        # Nút X người dùng chỉ ra: data-role="close-button". Bấm nó thì không lùi lịch sử
+        # nữa, vì lùi tiếp từ sảnh sẽ tới mục /entry dùng một lần (EV.7).
+        self.scripted = [[{"method": "Runtime.executionContextCreated",
+                           "params": {"context": {"id": 9, "auxData": {"isDefault": True}}}},
+                          {"id": 1, "result": {}},
+                          {"id": 2, "result": {"result": {"value": {"x": 1180.0, "y": 42.0}}}},
+                          {"id": 3, "result": {"result": {"value": self.TILES}}}]]
+        self.session._cdp_page.side_effect = [self.TABLE, self.LIST]
+        ok, note = self.stream.back_to_lobby()
+        self.assertTrue(ok, note)
+        self.assertIn("danh sách bàn Baccarat", note)
+        sent = json.dumps(self.sockets[0].sent)
+        self.assertNotIn("history.back()", sent)
+        self.assertIn('[data-role=\\"close-button\\"]', sent)
+        self.assertIn("btn.click()", sent)
+
+    def test_finds_the_close_button_inside_the_table_frame(self):
+        # Màn hình bàn có thể nằm trong iframe: phải dò nút X ở mọi context, không chỉ khung gốc.
+        self.scripted = [[{"method": "Runtime.executionContextCreated",
+                           "params": {"context": {"id": 9, "auxData": {"isDefault": True}}}},
+                          {"method": "Runtime.executionContextCreated",
+                           "params": {"context": {"id": 11, "auxData": {
+                               "isDefault": True, "frameId": "frame-table"}}}},
+                          {"id": 1, "result": {}},
+                          {"id": 2, "result": {}},
+                          {"id": 3, "result": {"result": {"value": {"x": 900.0, "y": 30.0}}}},
+                          {"id": 4, "result": {"result": {"value": self.TILES}}}]]
+        self.session._cdp_page.side_effect = [self.TABLE, self.LIST]
+        ok, note = self.stream.back_to_lobby()
+        self.assertTrue(ok, note)
+        evaluate = [message for message in self.sockets[0].sent if message["method"] == "Runtime.evaluate"]
+        self.assertEqual([message["params"]["contextId"] for message in evaluate[:2]], [9, 11])
+        self.assertNotIn("history.back()", json.dumps(self.sockets[0].sent))
 
     def test_no_history_back_when_the_tab_is_already_on_the_list(self):
         # Mục lịch sử đầu của tab sảnh là /entry dùng một lần: quay lại đó là EVO báo
@@ -1351,6 +1430,7 @@ class LobbyListReturnTests(unittest.TestCase):
         self.assertTrue(ok, note)
         self.assertIn("đã ở danh sách bàn", note.lower())
         self.assertNotIn("history.back()", json.dumps([socket.sent for socket in self.sockets]))
+        self.assertNotIn("close-button", json.dumps([socket.sent for socket in self.sockets]))
 
     def test_refuses_a_tab_that_is_not_the_lobby(self):
         self.scripted = self.transcript()
@@ -1368,8 +1448,8 @@ class LobbyListReturnTests(unittest.TestCase):
         self.assertIn("chưa thấy lại danh sách bàn", note)
 
     def test_a_context_killed_by_the_navigation_is_not_a_failed_return(self):
-        # history.back() có thể phá chính context chạy lệnh: CDP trả lỗi ngay dù tab
-        # vẫn về sảnh. Coi lỗi đó là thất bại thì app đứng mãi ở màn hình bàn.
+        # Cú bấm nút X (hoặc history.back()) có thể phá chính context chạy lệnh: CDP trả
+        # lỗi ngay dù tab vẫn về sảnh. Coi lỗi đó là thất bại thì app đứng mãi ở màn hình bàn.
         self.scripted = [[{"method": "Runtime.executionContextCreated",
                            "params": {"context": {"id": 9, "auxData": {"isDefault": True}}}},
                           {"id": 1, "result": {}},
@@ -1379,6 +1459,7 @@ class LobbyListReturnTests(unittest.TestCase):
         ok, note = self.stream.back_to_lobby()
         self.assertTrue(ok, note)
         self.assertIn("danh sách bàn Baccarat", note)
+        self.assertNotIn("history.back()", json.dumps(self.sockets[0].sent))
 
     def test_contexts_cleared_by_the_return_are_probed_again(self):
         self.scripted = [[{"method": "Runtime.executionContextCreated",
@@ -1400,7 +1481,8 @@ class LobbyListReturnTests(unittest.TestCase):
         self.scripted = [[{"method": "Runtime.executionContextCreated",
                            "params": {"context": {"id": 9, "auxData": {"isDefault": True}}}},
                           {"id": 1, "result": {}}, {"id": 2, "result": {}},
-                          {"id": 3, "result": {"result": {"value": {"auth": True}}}}]]
+                          {"id": 3, "result": {}},
+                          {"id": 4, "result": {"result": {"value": {"auth": True}}}}]]
         self.session._cdp_page.side_effect = [self.TABLE, self.LIST]
         ok, note = self.stream.back_to_lobby(wait_seconds=0)
         self.assertFalse(ok)
@@ -1408,7 +1490,7 @@ class LobbyListReturnTests(unittest.TestCase):
 
 
 class TableCycleTests(unittest.TestCase):
-    """Chu trình của người dùng: đủ 6 tay thì rời bàn, quét sảnh và mở bàn đạt chuẩn khác."""
+    """Vòng tìm bàn và đường rời bàn: chốt lời thì đóng bàn rồi dừng, không săn bàn mới."""
 
     def setUp(self):
         self.now = 1_800_000_000.0
@@ -1435,6 +1517,8 @@ class TableCycleTests(unittest.TestCase):
             session_lost=False, _trace=lambda *args, **kwargs: None,
             _auth_blame=lambda: False)
         host._schedule_cycle_retry = MethodType(app.BCRApp._schedule_cycle_retry, host)
+        host.leave_table_for_lobby = MethodType(app.BCRApp.leave_table_for_lobby, host)
+        host._on_cycle_back = MethodType(app.BCRApp._on_cycle_back, host)
         for key, value in changes.items():
             setattr(host, key, value)
         return host
@@ -1448,7 +1532,7 @@ class TableCycleTests(unittest.TestCase):
 
         return captured, patch("app.threading.Thread", side_effect=fake_thread)
 
-    def test_six_hands_note_sends_the_tab_back_to_the_lobby(self):
+    def test_leaving_the_table_sends_the_tab_back_to_the_lobby(self):
         host = self.host()
         host.sim.table_key = "id:t1"
         captured, patcher = self.started_thread()
@@ -1459,6 +1543,56 @@ class TableCycleTests(unittest.TestCase):
         self.assertIn("đủ 6 tay", host.sweep_note_text)
         self.assertEqual(host.events.put.call_args[0][0],
                          ("cycle_back", (True, "Đã rời bàn · danh sách bàn Baccarat.")))
+
+    def test_take_profit_exit_closes_the_table_even_when_auto_cycle_is_off(self):
+        host = self.host(auto_cycle_var=Mock(get=lambda: False))
+        host.sim.table_key = "id:t1"
+        host.sim.take_profit_done = True
+        captured, patcher = self.started_thread()
+        with patcher:
+            app.BCRApp.leave_table_for_lobby(host, take_profit=True)
+        self.assertTrue(host.sweep_busy)
+        self.assertIn("mục tiêu lãi", host.sweep_note_text)
+        self.assertEqual(host.events.put.call_args[0][0],
+                         ("cycle_back", (True, "Đã rời bàn · danh sách bàn Baccarat.")))
+
+    def test_successful_take_profit_exit_stops_without_another_sweep(self):
+        host = self.host(cycle_waiting=True, cycle_table_key="id:t1")
+        host.sim.take_profit_done = True
+        app.BCRApp._on_cycle_back(host, True, "Đã rời bàn · danh sách bàn Baccarat.")
+        host.sweep_lobby.assert_not_called()
+        self.assertFalse(host.cycle_waiting)
+        self.assertEqual(host.cycle_retry_at, 0.0)
+        self.assertIsNone(host.cycle_table_key)
+        self.assertIn("đã đóng bàn và dừng phiên", host.sweep_note_text)
+
+    def test_failed_take_profit_exit_retries_the_close_not_a_new_table(self):
+        host = self.host(cycle_waiting=True)
+        host.sim.take_profit_done = True
+        app.BCRApp._on_cycle_back(host, False, "Không về được sảnh (RuntimeError).")
+        host.sweep_lobby.assert_not_called()
+        self.assertTrue(host.cycle_waiting)
+        self.assertEqual(host.cycle_retry_at, self.now + app.CYCLE_RETRY_SECONDS)
+        self.assertIn("thử đóng bàn lại", host.sweep_note_text)
+
+    def test_take_profit_retry_reopens_the_close_not_the_hunt(self):
+        host = self.host(cycle_waiting=True, cycle_retry_at=self.now - 1)
+        host.sim.table_key = "id:t1"
+        host.sim.take_profit_done = True
+        captured, patcher = self.started_thread()
+        with patcher:
+            app.BCRApp._resume_cycle_hunt(host, self.now)
+        host.sweep_lobby.assert_not_called()
+        self.assertTrue(host.sweep_busy)
+        self.assertIn("mục tiêu lãi", host.sweep_note_text)
+
+    def test_take_profit_blocks_opening_another_table(self):
+        host = self.host(tables={"id:t2": self.row("t2")})
+        host.sim.take_profit_done = True
+        app.BCRApp.auto_open_table(host, allow_sweep=True)
+        self.assertFalse(host.open_table_busy)
+        host.stream.open_table.assert_not_called()
+        host.sweep_lobby.assert_not_called()
 
     def test_cycle_stays_off_when_the_user_disabled_it(self):
         host = self.host(auto_cycle_var=Mock(get=lambda: False))

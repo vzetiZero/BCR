@@ -279,6 +279,17 @@ LOBBY_HEALTH_JS = """(() => {
     };
 })()"""
 
+# Nút X đóng màn hình bàn của EVO. history.back() không đáng tin ở đây (có mục /entry
+# dùng một lần, và điều hướng phá context giữa lệnh), nên bấm đúng nút site bày ra.
+CLOSE_TABLE_JS = """(() => {
+    const btn = document.querySelector('[data-role="close-button"]');
+    if (!btn) return null;
+    const r = btn.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return null;
+    btn.click();
+    return {x: r.x + r.width / 2, y: r.y + r.height / 2};
+})()"""
+
 
 class LobbyStream:
     """Đọc luồng message sảnh qua CDP chỉ đọc trên Chrome đang mở."""
@@ -731,8 +742,26 @@ class LobbyStream:
                 except Exception:
                     pass
 
+    def _click_close_table(self, ws):
+        """Bấm nút X đóng bàn ở bất kỳ khung nào đang vẽ màn hình bàn; True nếu đã bấm.
+
+        Lỗi CDP ở đây cũng coi là đã bấm: cú bấm thường phá luôn context đang chạy lệnh.
+        Gửi thêm history.back() sau đó có thể lùi quá sảnh về mục /entry dùng một lần
+        (EV.7), nên thà để vòng chờ phía sau xác nhận bằng danh sách bàn thật.
+        """
+        clicked = False
+        for context_id in list(self.contexts):
+            try:
+                value = self._value(ws, CLOSE_TABLE_JS, context_id)
+            except Exception:
+                clicked = True
+                continue
+            if isinstance(value, dict):
+                clicked = True
+        return clicked
+
     def back_to_lobby(self, wait_seconds=25):
-        """Rời màn hình bàn bằng history/site UI, tuyệt đối không sửa hash của EVO."""
+        """Rời màn hình bàn bằng nút X của EVO (history.back() dự phòng), không sửa hash."""
         import websocket
 
         ws = None
@@ -754,15 +783,16 @@ class LobbyStream:
             if "table_id" not in fragment and "table_id=" not in url:
                 self.note = "Đã ở danh sách bàn Baccarat sẵn."
                 return True, "Đã ở danh sách bàn · không cần rời bàn."
-            # EVO xử lý hash nội bộ; history.back() đi theo lịch sử thật của site và
-            # không buộc /entry tải lại (nguyên nhân làm mất phiên launch).
-            try:
-                self._evaluate(ws, "history.back()", self.contexts[0])
-            except Exception:
-                # Điều hướng có thể phá chính context đang chạy lệnh: CDP trả lỗi ngay
-                # dù tab vẫn quay lại bình thường. Coi lỗi đó là thất bại thì app đứng
-                # mãi ở màn hình bàn sau khi đủ tay khối (đúng lỗi "chưa out ra sảnh").
-                pass
+            # Nút X đóng bàn là cách rời bàn đáng tin nhất của site; history.back() chỉ
+            # là dự phòng vì có mục /entry dùng một lần và điều hướng phá context giữa lệnh.
+            if not self._click_close_table(ws):
+                try:
+                    self._evaluate(ws, "history.back()", self.contexts[0])
+                except Exception:
+                    # Điều hướng có thể phá chính context đang chạy lệnh: CDP trả lỗi ngay
+                    # dù tab vẫn quay lại bình thường. Coi lỗi đó là thất bại thì app đứng
+                    # mãi ở màn hình bàn sau khi đủ tay khối (đúng lỗi "chưa out ra sảnh").
+                    pass
             deadline = time.monotonic() + wait_seconds
             while time.monotonic() < deadline:
                 time.sleep(1.5)

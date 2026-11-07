@@ -136,6 +136,9 @@ class LiveSimulation:
         self.block_hands = 0
         self.place_skips = 0
         self.cycle_done = False
+        # Chỉ rời bàn khi đã chạm mục tiêu lãi của phiên; hết một khối 3-3/3-2
+        # không còn là lý do rời bàn nữa.
+        self.take_profit_done = False
         self.on_arm = None
 
     @property
@@ -166,6 +169,7 @@ class LiveSimulation:
         self.method_state = fresh_method()
         self.block_hands = 0
         self.place_skips = 0
+        self.take_profit_done = False
         self.note = "Đã chọn bàn."
 
     def start(self, row, verified=False, now=None):
@@ -348,11 +352,16 @@ class LiveSimulation:
         self.block_hands += 1
         if self.money.blocked:
             self.pause(self.money.blocked[1])
-        elif self.block_hands >= self.cycle_hands:
-            self.cycle_done = True
-            self.pause("Đã đi đủ %d tay của khối %s ở bàn này — rời bàn để tìm bàn mới." % (
-                self.cycle_hands, self.profile))
+            if self.money.blocked[0] == "TAKE_PROFIT":
+                # Đủ lãi mới rời bàn. App dùng cycle_done làm tín hiệu đưa tab về sảnh,
+                # nhưng đánh dấu take_profit_done để không quét/mở bàn mới sau đó.
+                self.take_profit_done = True
+                self.cycle_done = True
+                self.note = ("Đã đạt mục tiêu lãi %.0f%% vốn (%s) · rời bàn và dừng phiên." % (
+                    self.money.take_profit_pct, M.fmt_money(self.money.profit)))
         else:
+            # Hết một khối 3-3/3-2 thì lặp khối tiếp theo ngay tại bàn này.
+            # method.plan() tự tính lại bên mạnh và reset vị trí trong khối.
             self._arm()
         return True
 
@@ -711,7 +720,8 @@ class BCRApp:
                                                  "lịch sử, đối chiếu hai nguồn, mở bàn đạt 3 điều kiện và theo dõi "
                                                  "từ ván kế tiếp. “Chỉ bàn Ưa thích” bật mặc định: app bấm ô Ưa "
                                                  "thích của sảnh và chỉ quét các bàn đã thích. App không đổi link "
-                                                 "phiên EVO. Đủ tay của khối là tự về sảnh tìm bàn mới.",
+                                                 "phiên EVO. Hết khối vẫn đánh tiếp tại bàn; chỉ khi lãi đủ mục "
+                                                 "tiêu mới tự đóng bàn và dừng.",
                                       9, MUTED, anchor="w", justify="left", wraplength=640)
         self.sweep_note.pack(side="left", fill="x", expand=True, padx=10)
         self.step_label = self._label(main, "", 9, MUTED, anchor="w")
@@ -1151,20 +1161,21 @@ class BCRApp:
         if hasattr(self, "brand_method"):
             applied = ME.strong_hands(self.sim.profile)
             self.brand_method.config(text="%d — %d" % (applied, self.sim.cycle_hands - applied))
+        target = self.sim.money.take_profit_pct
         if hasattr(self, "cycle_check"):
-            self.cycle_check.config(text="Đủ %d tay là tự rời bàn, quét sảnh tìm bàn mới" % hands)
+            self.cycle_check.config(text="Lặp khối %s tại cùng bàn tới khi lãi đủ %.0f%% vốn mới rời bàn" % (
+                profile, target))
             self.cycle_rule.config(
-                text="Mỗi bàn chỉ đi một khối %s: %d tay bên mạnh + %d tay bên đổi. Hết %d tay, app đưa tab về "
-                     "danh sách bàn Baccarat, quét lại sảnh và mở một bàn đạt 3 điều kiện khác (cầu đã đi "
-                     "%d–%d tay). Chưa tìm được bàn thì app tự lặp lại toàn bộ quy trình sau %d giây, không "
-                     "giới hạn số lượt, chỉ dừng khi vào được bàn." % (
-                         profile, strong, hands - strong, hands, self.sim.min_hands, self.sim.max_hands,
-                         CYCLE_RETRY_SECONDS))
+                text="Mỗi khối %s gồm %d tay bên mạnh + %d tay bên đổi. Hết %d tay, app lặp lại khối tiếp "
+                     "theo ngay tại bàn này (tự tính lại bên mạnh), không rời bàn sau mỗi khối. Chỉ khi lãi "
+                     "đạt %.0f%% vốn, app bấm nút đóng bàn của site để về sảnh rồi dừng phiên, không quét "
+                     "hay mở bàn mới." % (
+                         profile, strong, hands - strong, hands, target))
         if hasattr(self, "step_label"):
             self.step_label.config(text=(
                 "01  Đăng nhập trang cổng     /     02  Tự vào sảnh Baccarat rồi bấm “Nhận tab sảnh”     /     "
-                "03  Quét sảnh     /     04  Đối chiếu kết quả     /     05  Đủ %d tay (%s) · tự đổi bàn" % (
-                    hands, profile)))
+                "03  Quét sảnh     /     04  Đối chiếu kết quả     /     05  Lặp khối %s tới khi lãi đủ "
+                "%.0f%% · tự đóng bàn" % (profile, target)))
 
     def _scroll_page(self, event):
         canvas = self.page_scrolls.get(self.current_page)
@@ -1454,6 +1465,9 @@ class BCRApp:
     def auto_open_table(self, allow_sweep=False, exclude_key=None):
         if self.chrome_busy or self.sweep_busy or self.open_table_busy or self.exit_requested:
             return
+        if getattr(self.sim, "take_profit_done", False):
+            # Đã chốt lời: chỉ đóng bàn rồi dừng, không mở bàn mới.
+            return
         if not self._cdp_available() and not ext_ready(self):
             self.sweep_note_text = ("Extension chưa kết nối. Mở Chrome thật, bật extension BCR rồi thử lại."
                                     if self.collector_httpd is not None else "Gắn Chrome đang mở trước.")
@@ -1522,6 +1536,9 @@ class BCRApp:
         """Vòng tìm bàn không có trần số lần: nghỉ CYCLE_RETRY_SECONDS rồi quét lại, tới khi vào được bàn."""
         if self.session_lost:
             return False
+        if getattr(self.sim, "take_profit_done", False):
+            # Sau chốt lời không còn vòng săn bàn nào để hẹn giờ.
+            return False
         if not (self.cycle_waiting and self.auto_hunt_var.get()) or self.exit_requested:
             return False
         if exclude_key:
@@ -1533,28 +1550,45 @@ class BCRApp:
         self.refresh()
         return True
 
-    def leave_table_for_lobby(self):
-        """Hết khối tay: đưa tab về danh sách bàn rồi tự lặp quét - chọn - mở bàn tới khi vào được."""
-        if not self.auto_cycle_var.get() or self.exit_requested:
+    def leave_table_for_lobby(self, take_profit=False):
+        """Đưa tab về danh sách bàn.
+
+        Bình thường: hết khối thì quét - chọn - mở bàn mới.
+        ``take_profit=True``: chỉ rời bàn và dừng phiên, không quét/mở bàn mới.
+        """
+        take_profit = bool(take_profit or getattr(self.sim, "take_profit_done", False))
+        if self.exit_requested:
+            return
+        if not take_profit and not self.auto_cycle_var.get():
             return
         self.cycle_waiting = True
         self.cycle_attempts = 0
         self.cycle_table_key = self.sim.table_key
         self.cycle_retry_at = 0.0
-        self._trace("block_done", dict(table=self.sim.table_key, hands=self.sim.cycle_hands))
+        self._trace("take_profit_exit" if take_profit else "block_done",
+                    dict(table=self.sim.table_key, hands=self.sim.block_hands,
+                         target_pct=self.sim.money.take_profit_pct))
         if self.chrome_busy or self.sweep_busy or self.open_table_busy:
             self.cycle_retry_at = time.time() + CYCLE_RETRY_SECONDS
-            self.sweep_note_text = ("App đang bận nên việc đổi bàn hẹn quét lại sau %d giây."
-                                    % CYCLE_RETRY_SECONDS)
+            self.sweep_note_text = (
+                "Đã chốt lời nhưng app đang bận · sẽ tự rời bàn sau %d giây." % CYCLE_RETRY_SECONDS
+                if take_profit else
+                "App đang bận nên việc đổi bàn hẹn quét lại sau %d giây." % CYCLE_RETRY_SECONDS)
             self.refresh()
             return
         if not self._cdp_available():
             self.cycle_retry_at = time.time() + CYCLE_RETRY_SECONDS
-            self.sweep_note_text = ("Chưa gắn Chrome · sẽ tự quét tìm bàn ngay khi kết nối lại.")
+            self.sweep_note_text = (
+                "Đã chốt lời nhưng chưa gắn Chrome · sẽ rời bàn khi kết nối lại."
+                if take_profit else
+                "Chưa gắn Chrome · sẽ tự quét tìm bàn ngay khi kết nối lại.")
             self.refresh()
             return
         self.sweep_busy = True
-        self.sweep_note_text = "Đã đi đủ %d tay · rời bàn, về danh sách bàn Baccarat…" % self.sim.cycle_hands
+        self.sweep_note_text = (
+            "Đã đạt mục tiêu lãi %.0f%% vốn · rời bàn, dừng phiên…"
+            % self.sim.money.take_profit_pct if take_profit else
+            "Đã đi đủ %d tay · rời bàn, về danh sách bàn Baccarat…" % self.sim.cycle_hands)
         def work():
             try:
                 self.events.put(("cycle_back", self.stream.back_to_lobby()))
@@ -1789,6 +1823,42 @@ class BCRApp:
         return False, ("Không tự đặt: sau %ds bàn vẫn còn chip ván trước, chưa chắc "
                        "đang ở lượt đặt cược mới." % int(timeout))
 
+    def _on_cycle_back(self, ok, note):
+        """Kết quả đưa tab về danh sách bàn.
+
+        ``take_profit_done`` là ranh giới tuyệt đối: dù thành công hay thất bại,
+        app chỉ đóng bàn rồi dừng, không quét hay mở bàn mới.
+        """
+        self.sweep_note_text = note
+        take_profit = bool(getattr(self.sim, "take_profit_done", False))
+        self._trace("cycle_back", dict(ok=ok, take_profit=take_profit))
+        if take_profit:
+            if ok:
+                self.cycle_waiting = False
+                self.cycle_retry_at = 0.0
+                self.cycle_table_key = None
+                self.sweep_note_text = (
+                    "Đã đạt mục tiêu lãi %.0f%% vốn (%s) · đã đóng bàn và dừng phiên." % (
+                        self.sim.money.take_profit_pct, M.fmt_money(self.sim.money.profit)))
+            elif self._auth_blame():
+                self._session_lost_step(note)
+            else:
+                # Không về được sảnh: hẹn thử lại đúng việc rời bàn,
+                # không chuyển sang săn bàn mới.
+                self.cycle_waiting = True
+                self.cycle_retry_at = time.time() + CYCLE_RETRY_SECONDS
+                self.sweep_note_text = (
+                    "%s · sẽ thử đóng bàn lại sau %d giây." % (note, CYCLE_RETRY_SECONDS))
+            self.refresh()
+            return
+        if ok:
+            self.sweep_lobby()
+        elif self._auth_blame():
+            self._session_lost_step(note)
+        elif not self._schedule_cycle_retry(note):
+            self.cycle_waiting = False
+            self.refresh()
+
     def poll(self):
         if self.closing:
             return
@@ -1880,16 +1950,7 @@ class BCRApp:
                 self.sweep_note_text = note if ok else "Đã lưu cấu hình. " + note
             elif kind == "cycle_back":
                 self.sweep_busy = False
-                ok, note = data
-                self.sweep_note_text = note
-                self._trace("cycle_back", dict(ok=ok))
-                if ok:
-                    self.sweep_lobby()
-                elif self._auth_blame():
-                    self._session_lost_step(note)
-                elif not self._schedule_cycle_retry(note):
-                    self.cycle_waiting = False
-                    self.refresh()
+                self._on_cycle_back(*data)
             elif kind == "table_opened":
                 self.open_table_busy = False
                 ok, note, key = data
@@ -1923,7 +1984,9 @@ class BCRApp:
             self._save_state()
         if self.sim.cycle_done:
             self.sim.cycle_done = False
-            self.leave_table_for_lobby()
+            # Đủ lãi mới có cờ take_profit_done: rời bàn xong thì dừng hẳn,
+            # không quét hay mở bàn mới.
+            self.leave_table_for_lobby(take_profit=self.sim.take_profit_done)
         now = time.time()
         # Cầu từ extension trên profile thật: trộn vào bảng bàn trước khi đọc/đặt chip.
         self._pump_collector()
@@ -2054,11 +2117,17 @@ class BCRApp:
 
     def _resume_cycle_hunt(self, now):
         """Hết thời gian nghỉ: phục hồi phiên nếu đang văng, ngược lại quét-chọn-vào bàn."""
-        if not (self.cycle_waiting and self.auto_hunt_var.get() and self.cycle_retry_at
-                and now >= self.cycle_retry_at):
+        take_profit = bool(getattr(self.sim, "take_profit_done", False))
+        if not (self.cycle_waiting and (self.auto_hunt_var.get() or take_profit)
+                and self.cycle_retry_at and now >= self.cycle_retry_at):
             return
         self.cycle_retry_at = 0.0
         if self.exit_requested or self.sim.running or self.auto_start_table_key:
+            return
+        if take_profit:
+            # Đang chờ đóng bàn sau chốt lời: thử lại đúng việc rời bàn,
+            # không quét và không mở bàn mới.
+            self.leave_table_for_lobby(take_profit=True)
             return
         # Vẫn đang mất phiên: thử mở lại EVO thay vì quét trên trang đã bị đá.
         if self.session_lost:
@@ -2229,14 +2298,23 @@ class BCRApp:
 
     def _refresh_hunt_banner(self):
         """Hiện/ẩn banner chờ khi vòng tự quét tìm bàn đang chạy, kèm đếm ngược và lượt thử."""
-        waiting = bool(getattr(self, "cycle_waiting", False)) and bool(self.auto_hunt_var.get())
+        take_profit = bool(getattr(self.sim, "take_profit_done", False))
+        waiting = bool(getattr(self, "cycle_waiting", False)) and (
+            bool(self.auto_hunt_var.get()) or take_profit)
         if not waiting:
             self.hunt_banner.pack_forget()
             return
         self._hunt_frame = getattr(self, "_hunt_frame", 0) + 1
         spinner = "●○"[self._hunt_frame % 2]
         remaining = max(0.0, self.cycle_retry_at - time.time()) if self.cycle_retry_at else 0.0
-        if remaining > 0:
+        if take_profit:
+            # Đã chốt lời: banner chỉ nhắc việc đóng bàn, không phải săn bàn mới.
+            if remaining > 0:
+                text = "Đã chốt lời · thử đóng bàn lại sau %.0f giây (lượt %d)." % (
+                    remaining, self.cycle_attempts)
+            else:
+                text = "Đã chốt lời · đang đóng bàn để dừng phiên…"
+        elif remaining > 0:
             text = "Đang tự quét tìm bàn… nghỉ %.0f giây nữa rồi quét lại (đã thử %d lượt)." % (
                 remaining, self.cycle_attempts)
         else:
