@@ -11,10 +11,11 @@ import json
 import random
 import re
 import time
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 import browser as BR
 import human_mouse as HM
+import table_bets as TB
 
 HISTORY_TYPES = ("lobby.histories", "lobby.historyUpdated")
 SIDE_BY_COLOR = {"R": "B", "B": "P"}
@@ -27,6 +28,12 @@ MAX_TIES = 50
 SCROLL_STEP = 500
 SCROLL_SETTLE = 1.2
 MAX_SCROLL_STEPS = 40
+# Mỗi bước rời bàn (bấm nút X, đổi hash) có cửa sổ chờ riêng; bước cuối (mở lại URL
+# sảnh tổng) dùng trọn wait_seconds vì phải chờ trang tải lại và render danh sách.
+RETURN_STEP_WAIT = 8.0
+# Hash mặc định của danh sách bàn Baccarat khi hash đang ở màn hình bàn không còn
+# tham số nào khác ngoài table_id.
+LOBBY_LIST_FRAGMENT = "category=all_games&game=baccarat&see=baccarat"
 
 
 def decode_results(results):
@@ -279,16 +286,62 @@ LOBBY_HEALTH_JS = """(() => {
     };
 })()"""
 
-# Nút X đóng màn hình bàn của EVO. history.back() không đáng tin ở đây (có mục /entry
-# dùng một lần, và điều hướng phá context giữa lệnh), nên bấm đúng nút site bày ra.
+# Nút X đóng màn hình bàn của EVO. Chỉ ĐO vị trí chứ không bấm bằng JS: btn.click()
+# là sự kiện tổng hợp, site có thể phớt lờ (đúng lỗi "nút đóng bàn không click được").
+# Cú bấm thật do _click_close_table gửi qua chuột CDP — cùng đường đã bấm mở ô bàn.
+# Kèm frame_offset giống TARGETS_JS của table_bets: nút có thể nằm trong iframe, toạ
+# độ đo ở khung nào phải cộng lệch khung đó trước khi bấm theo khung gốc của tab.
 CLOSE_TABLE_JS = """(() => {
     const btn = document.querySelector('[data-role="close-button"]');
     if (!btn) return null;
     const r = btn.getBoundingClientRect();
     if (r.width <= 0 || r.height <= 0) return null;
-    btn.click();
-    return {x: r.x + r.width / 2, y: r.y + r.height / 2};
+    const x = r.x + r.width / 2, y = r.y + r.height / 2;
+    const hit = document.elementFromPoint(x, y);
+    if (!hit || !btn.contains(hit)) return {reason: 'close_button_blocked'};
+    const frameOffset = (() => {
+        let x = 0, y = 0, w = window, depth = 0;
+        while (w !== w.top) {
+            let el = null;
+            try { el = w.frameElement; } catch (e) { return null; }
+            if (!el) return null;
+            const rect = el.getBoundingClientRect();
+            const st = w.parent.getComputedStyle(el);
+            const num = (v) => { const n = parseFloat(v); return Number.isFinite(n) ? n : 0; };
+            x += rect.x + num(st.borderLeftWidth) + num(st.paddingLeft);
+            y += rect.y + num(st.borderTopWidth) + num(st.paddingTop);
+            w = w.parent;
+            depth += 1;
+            if (depth > 8) return null;
+        }
+        return {x: Math.round(x), y: Math.round(y), depth};
+    })();
+    return {x, y, frame_offset: frameOffset};
 })()"""
+
+# Đổi hash về danh sách là điều hướng CÙNG document: SPA sảnh tự route về danh sách
+# bàn mà không tải lại trang, nên không bao giờ đụng mục /entry dùng một lần trong
+# lịch sử tab (lùi tới đó bằng history.back() là EVO trả EV.7).
+LIST_HASH_JS = """(() => {
+    location.hash = %s;
+    return location.href;
+})()"""
+
+
+def lobby_list_url(url):
+    """URL sảnh tổng của chính tab đang mở bàn: giữ origin/path, bỏ table_id.
+
+    Giữ các tham số còn lại của hash/query (category, game, see…) để về đúng chế độ
+    xem sảnh người dùng đang dùng; không còn gì thì dùng hash danh sách mặc định.
+    """
+    parsed = urlsplit(url)
+
+    def keep(part):
+        return [p for p in part.split("&") if p and p.split("=", 1)[0] != "table_id"]
+
+    fragment = "&".join(keep(parsed.fragment)) or LOBBY_LIST_FRAGMENT
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path,
+                       "&".join(keep(parsed.query)), fragment))
 
 
 class LobbyStream:
@@ -301,6 +354,7 @@ class LobbyStream:
         self.diag = {}
         self.frames = 0
         self.contexts = []
+        self.context_frames = {}
         self.histories = {}
         self._seq = 0
         self.human_mouse = bool(human_mouse)
@@ -316,6 +370,7 @@ class LobbyStream:
 
     def _reset(self):
         self.contexts, self.histories, self._seq = [], {}, 0
+        self.context_frames = {}
         self.frames = 0
         self.diag = {}
         self.last_error = ""
@@ -341,12 +396,15 @@ class LobbyStream:
                 context = message.get("params", {}).get("context", {})
                 if (context.get("auxData") or {}).get("isDefault"):
                     self.contexts.append(context["id"])
+                    self.context_frames[context["id"]] = (context.get("auxData") or {}).get("frameId")
             if message.get("method") == "Runtime.executionContextDestroyed":
                 dead = (message.get("params") or {}).get("executionContextId")
                 if dead in self.contexts:
                     self.contexts.remove(dead)
+                    self.context_frames.pop(dead, None)
             if message.get("method") == "Runtime.executionContextsCleared":
                 self.contexts = []
+                self.context_frames = {}
             if message.get("method") == "Network.webSocketFrameReceived":
                 self._absorb(message.get("params", {}).get("response", {}))
             if message.get("id") == self._seq:
@@ -392,6 +450,7 @@ class LobbyStream:
         except Exception:
             if context_id in self.contexts:
                 self.contexts.remove(context_id)
+                self.context_frames.pop(context_id, None)
             return None
 
     def _dispatch_click(self, ws, x, y):
@@ -743,25 +802,82 @@ class LobbyStream:
                     pass
 
     def _click_close_table(self, ws):
-        """Bấm nút X đóng bàn ở bất kỳ khung nào đang vẽ màn hình bàn; True nếu đã bấm.
+        """Bấm nút X đóng bàn bằng chuột thật ở khung đang vẽ màn hình bàn; True nếu đã bấm.
 
-        Lỗi CDP ở đây cũng coi là đã bấm: cú bấm thường phá luôn context đang chạy lệnh.
-        Gửi thêm history.back() sau đó có thể lùi quá sảnh về mục /entry dùng một lần
-        (EV.7), nên thà để vòng chờ phía sau xác nhận bằng danh sách bàn thật.
+        Toạ độ đo trong khung nào phải cộng lệch khung đó (bàn có thể nằm trong iframe);
+        không đo được lệch thì không bấm liều, đường về URL sảnh tổng phía sau sẽ xử lý.
+        Lỗi CDP giữa cú bấm coi như đã bấm: điều hướng thường phá context đang chạy lệnh,
+        vòng chờ phía sau xác nhận lại bằng danh sách bàn thật.
         """
         clicked = False
         for context_id in list(self.contexts):
-            try:
-                value = self._value(ws, CLOSE_TABLE_JS, context_id)
-            except Exception:
-                clicked = True
+            box = self._try_value(ws, CLOSE_TABLE_JS, context_id)
+            if not isinstance(box, dict) or "x" not in box:
                 continue
-            if isinstance(value, dict):
+            offset = box.get("frame_offset")
+            if offset is None:
+                offset = TB.frame_offset_via_cdp(
+                    lambda method, params=None: self._command(ws, method, params),
+                    self.context_frames.get(context_id))
+            point = TB.page_point(box, offset)
+            if point is None:
+                continue
+            try:
+                self._click_at(ws, point["x"], point["y"])
+                clicked = True
+            except Exception:
                 clicked = True
         return clicked
 
+    def _assign_list_hash(self, ws, fragment):
+        """Đổi hash tab về danh sách bàn (cùng document, không tải lại trang).
+
+        Không truyền contextId: lệnh chạy trong khung gốc của tab — đúng chỗ SPA sảnh
+        giữ route. Context chết giữa lệnh (điều hướng phá) thì trả False để bước sau
+        mở thẳng URL sảnh tổng.
+        """
+        try:
+            self._command(ws, "Runtime.evaluate", {
+                "expression": LIST_HASH_JS % json.dumps(fragment),
+                "returnByValue": True, "silent": True, "timeout": BR.SCRIPT_TIMEOUT * 1000})
+            return True
+        except Exception:
+            return False
+
+    def _navigate_to_list(self, ws, list_url):
+        """Mở thẳng URL sảnh tổng khi đổi hash không đưa được tab về danh sách.
+
+        Lỗi CDP/errorText không phải án tử: điều hướng có thể phá context chạy lệnh,
+        việc thành bại quyết định bằng vòng chờ danh sách bàn render lại phía sau.
+        """
+        try:
+            self._command(ws, "Page.navigate", {"url": list_url})
+        except Exception:
+            pass
+
+    def _list_is_back(self, ws, wait_seconds):
+        """True khi tab hết màn hình bàn VÀ danh sách bàn render lại (thấy ô bàn thật)."""
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            page = self.session._cdp_page() or {}
+            now_url = page.get("url", "")
+            if "table_id" not in urlsplit(now_url).fragment and "table_id=" not in now_url:
+                if not self.contexts:
+                    self._wait_context(ws)
+                if self._lobby_context(ws)[0]:
+                    return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(1.5)
+
     def back_to_lobby(self, wait_seconds=25):
-        """Rời màn hình bàn bằng nút X của EVO (history.back() dự phòng), không sửa hash."""
+        """Rời màn hình bàn về URL sảnh tổng để chọn lại bàn.
+
+        Thứ tự: nút X của EVO (chuột thật) → đổi hash về danh sách (SPA tự route,
+        không tải lại trang) → mở thẳng URL sảnh tổng (bỏ table_id). Không dùng
+        history.back(): mục lịch sử đầu của tab launch là /entry dùng một lần, lùi
+        tới đó là EVO trả "User authentication failed (EV.7)".
+        """
         import websocket
 
         ws = None
@@ -773,44 +889,36 @@ class LobbyStream:
             ws = websocket.create_connection(BR.validated_endpoint(page), suppress_origin=True,
                                              timeout=BR.SCRIPT_TIMEOUT, redirect_limit=0,
                                              http_no_proxy=["127.0.0.1", "localhost", "::1"])
+            # Context của kết nối trước không dùng được trên kết nối mới; giữ lại chỉ
+            # tổ bấm nhầm vào id chết. Runtime.enable gửi lại đủ context thật.
+            self.contexts, self.context_frames = [], {}
             self._command(ws, "Runtime.enable")
             if not self._wait_context(ws):
                 return False, "Không lấy được ngữ cảnh trang sảnh để trở về danh sách bàn."
-            # history.back() chỉ dùng khi thật sự đang ở màn hình bàn. Tab sảnh mở từ launch
-            # có mục lịch sử đầu là /entry dùng một lần: quay lại mục đó là EVO trả
-            # "User authentication failed (EV.7)" dù tài khoản không đăng nhập nơi nào khác.
             fragment = urlsplit(url).fragment
             if "table_id" not in fragment and "table_id=" not in url:
                 self.note = "Đã ở danh sách bàn Baccarat sẵn."
                 return True, "Đã ở danh sách bàn · không cần rời bàn."
-            # Nút X đóng bàn là cách rời bàn đáng tin nhất của site; history.back() chỉ
-            # là dự phòng vì có mục /entry dùng một lần và điều hướng phá context giữa lệnh.
-            if not self._click_close_table(ws):
-                try:
-                    self._evaluate(ws, "history.back()", self.contexts[0])
-                except Exception:
-                    # Điều hướng có thể phá chính context đang chạy lệnh: CDP trả lỗi ngay
-                    # dù tab vẫn quay lại bình thường. Coi lỗi đó là thất bại thì app đứng
-                    # mãi ở màn hình bàn sau khi đủ tay khối (đúng lỗi "chưa out ra sảnh").
-                    pass
-            deadline = time.monotonic() + wait_seconds
-            while time.monotonic() < deadline:
-                time.sleep(1.5)
-                page = self.session._cdp_page() or {}
-                now_url = page.get("url", "")
-                fragment = urlsplit(now_url).fragment
-                if "table_id" not in fragment and "table_id=" not in now_url:
-                    if not self.contexts:
-                        self._wait_context(ws)
-                    if self._lobby_context(ws)[0]:
-                        self.note = "Đã về danh sách bàn Baccarat."
-                        return True, "Đã rời bàn · danh sách bàn Baccarat hiển thị trở lại."
+            list_url = lobby_list_url(url)
+            if self._click_close_table(ws) and self._list_is_back(
+                    ws, min(RETURN_STEP_WAIT, wait_seconds)):
+                self.note = "Đã về danh sách bàn Baccarat."
+                return True, "Đã rời bàn · danh sách bàn Baccarat hiển thị trở lại."
+            # Nút X không ăn (site đổi markup/chặn cú bấm): đưa tab về URL sảnh tổng.
+            if self._assign_list_hash(ws, urlsplit(list_url).fragment) and self._list_is_back(
+                    ws, min(RETURN_STEP_WAIT, wait_seconds)):
+                self.note = "Đã về danh sách bàn Baccarat."
+                return True, "Đã rời bàn · về URL sảnh tổng bằng đổi hash."
+            self._navigate_to_list(ws, list_url)
+            if self._list_is_back(ws, wait_seconds):
+                self.note = "Đã về danh sách bàn Baccarat."
+                return True, "Đã rời bàn · mở lại URL sảnh tổng."
             state = self._health(ws)
             if state.get("status") == "auth":
                 self.session_lost = True
             return False, (self._health_note(state) if state.get("status") == "auth" else
-                           "Đã bấm quay lại nhưng %d giây chưa thấy lại danh sách bàn; "
-                           "bấm nút quay lại sảnh của EVO hoặc “Nhận tab sảnh” để thử lại."
+                           "Đã thử nút X và về URL sảnh tổng nhưng %d giây chưa thấy lại danh sách "
+                           "bàn; bấm nút quay lại sảnh của EVO hoặc “Nhận tab sảnh” để thử lại."
                            % wait_seconds)
         except Exception as exc:
             return False, "Không về được danh sách bàn (%s)." % type(exc).__name__

@@ -1335,7 +1335,11 @@ class FavoriteFilterTests(unittest.TestCase):
 
 
 class LobbyListReturnTests(unittest.TestCase):
-    """Rời bàn bằng nút X của site, history.back() dự phòng; không sửa hash (CDP giả lập)."""
+    """Rời bàn: nút X bấm chuột thật → đổi hash về danh sách → mở URL sảnh tổng (CDP giả).
+
+    Không dùng history.back(): mục /entry dùng một lần đứng đầu lịch sử tab launch,
+    lùi tới đó là EV.7. Đồng hồ giả để các cửa sổ chờ chạy deterministik.
+    """
 
     TABLE = dict(id="table", type="page",
                  url="https://tmrw17k36as.evo-games.com/frontend/evo/r3/#category=all_games&table_id=t1",
@@ -1344,148 +1348,249 @@ class LobbyListReturnTests(unittest.TestCase):
                 webSocketDebuggerUrl="ws://127.0.0.1:9222/devtools/page/table")
     TILES = {"tiles": [{"id": "t2", "title": "Baccarat A", "top": 40}],
              "scroll": {"top": 0, "max": 900, "client": 600}}
+    LIST_URL = LOBBY_ORIGIN + BR.LOBBY_PATH + "/#category=all_games"
 
     def setUp(self):
         self.session = Mock()
         self.stream = LS.LobbyStream(self.session)
+        # Giữ đường bấm 3 sự kiện để transcript đếm đúng lệnh CDP; đường chuột người
+        # thật đã có test riêng ở LobbyEntryTests.
+        self.stream.human_mouse = False
         self.sockets = []
+        self.now = 1_000.0
 
         def connect(endpoint, **kwargs):
             socket = LobbyEntryTests.Socket(self.scripted[len(self.sockets)])
             self.sockets.append(socket)
             return socket
 
+        def nap(seconds):
+            self.now += seconds
+
         patcher = patch.dict(sys.modules, {"websocket": Mock(create_connection=connect)})
         patcher.start()
         self.addCleanup(patcher.stop)
-        sleep = patch("time.sleep")
-        sleep.start()
-        self.addCleanup(sleep.stop)
+        for target, side in (("time.monotonic", lambda: self.now), ("time.sleep", nap)):
+            clock = patch(target, side_effect=side)
+            clock.start()
+            self.addCleanup(clock.stop)
 
-    def transcript(self, tiles_seen=True):
-        # id2: khung không có nút X (JS trả null) nên phải dùng history.back() ở id3.
-        messages = [{"method": "Runtime.executionContextCreated",
-                     "params": {"context": {"id": 9, "auxData": {"isDefault": True}}}},
-                    {"id": 1, "result": {}}, {"id": 2, "result": {}},
-                    {"id": 3, "result": {}}]
-        value = self.TILES if tiles_seen else {"tiles": []}
-        messages.append({"id": 4, "result": {"result": {"value": value}}})
-        return [messages]
+    def context_event(self, context_id=9, frame_id=None):
+        aux = {"isDefault": True}
+        if frame_id:
+            aux["frameId"] = frame_id
+        return {"method": "Runtime.executionContextCreated",
+                "params": {"context": {"id": context_id, "auxData": aux}}}
 
-    def test_uses_history_back_and_waits_for_the_tiles_to_come_back(self):
-        self.scripted = self.transcript()
-        self.session._cdp_page.side_effect = [self.TABLE, self.LIST]
-        ok, note = self.stream.back_to_lobby()
-        self.assertTrue(ok, note)
-        self.assertIn("danh sách bàn Baccarat", note)
-        evaluate = [message for message in self.sockets[0].sent if message["method"] == "Runtime.evaluate"]
-        self.assertEqual(evaluate[0]["params"]["expression"], LS.CLOSE_TABLE_JS)
-        self.assertEqual(evaluate[1]["params"]["expression"], "history.back()")
-        self.assertEqual(evaluate[1]["params"]["contextId"], 9)
-        self.assertNotIn("location.hash", json.dumps(self.sockets[0].sent))
-        self.assertTrue(self.sockets[0].closed)
+    def sent(self, method):
+        return [message for message in self.sockets[0].sent if message["method"] == method]
 
-    def test_clicks_the_sites_close_button_and_never_sends_history_back(self):
-        # Nút X người dùng chỉ ra: data-role="close-button". Bấm nó thì không lùi lịch sử
-        # nữa, vì lùi tiếp từ sảnh sẽ tới mục /entry dùng một lần (EV.7).
-        self.scripted = [[{"method": "Runtime.executionContextCreated",
-                           "params": {"context": {"id": 9, "auxData": {"isDefault": True}}}},
+    def test_lobby_list_url_strips_table_id_and_keeps_the_rest_of_the_view(self):
+        base = LOBBY_ORIGIN + BR.LOBBY_PATH + "/"
+        self.assertEqual(LS.lobby_list_url(base + "#category=all_games&table_id=t1"),
+                         base + "#category=all_games")
+        self.assertEqual(LS.lobby_list_url(base + "#table_id=t1"),
+                         base + "#" + LS.LOBBY_LIST_FRAGMENT)
+        self.assertEqual(LS.lobby_list_url(base + "?table_id=t1#category=all_games&see=baccarat"),
+                         base + "#category=all_games&see=baccarat")
+        self.assertEqual(LS.lobby_list_url(
+                             base + "#category=all_games&game=baccarat&table_id=t1&see=baccarat"),
+                         base + "#category=all_games&game=baccarat&see=baccarat")
+        self.assertEqual(LS.lobby_list_url(base + "#table_id2=x&table_id=t1"),
+                         base + "#table_id2=x")
+
+    def test_missing_close_button_falls_back_to_the_lobby_hash(self):
+        # Khung không có nút X: không bấm gì, đổi hash về danh sách (cùng document).
+        # Context cũ của kết nối trước phải bị bỏ, không gửi lệnh vào id chết.
+        self.stream.contexts = [77]
+        self.stream.context_frames = {77: "old-frame"}
+        self.scripted = [[self.context_event(),
                           {"id": 1, "result": {}},
-                          {"id": 2, "result": {"result": {"value": {"x": 1180.0, "y": 42.0}}}},
-                          {"id": 3, "result": {"result": {"value": self.TILES}}}]]
-        self.session._cdp_page.side_effect = [self.TABLE, self.LIST]
-        ok, note = self.stream.back_to_lobby()
-        self.assertTrue(ok, note)
-        self.assertIn("danh sách bàn Baccarat", note)
-        sent = json.dumps(self.sockets[0].sent)
-        self.assertNotIn("history.back()", sent)
-        self.assertIn('[data-role=\\"close-button\\"]', sent)
-        self.assertIn("btn.click()", sent)
-
-    def test_finds_the_close_button_inside_the_table_frame(self):
-        # Màn hình bàn có thể nằm trong iframe: phải dò nút X ở mọi context, không chỉ khung gốc.
-        self.scripted = [[{"method": "Runtime.executionContextCreated",
-                           "params": {"context": {"id": 9, "auxData": {"isDefault": True}}}},
-                          {"method": "Runtime.executionContextCreated",
-                           "params": {"context": {"id": 11, "auxData": {
-                               "isDefault": True, "frameId": "frame-table"}}}},
-                          {"id": 1, "result": {}},
-                          {"id": 2, "result": {}},
-                          {"id": 3, "result": {"result": {"value": {"x": 900.0, "y": 30.0}}}},
+                          {"id": 2, "result": {"result": {"value": None}}},
+                          {"id": 3, "result": {"result": {"value": LOBBY_URL}}},
                           {"id": 4, "result": {"result": {"value": self.TILES}}}]]
         self.session._cdp_page.side_effect = [self.TABLE, self.LIST]
         ok, note = self.stream.back_to_lobby()
         self.assertTrue(ok, note)
-        evaluate = [message for message in self.sockets[0].sent if message["method"] == "Runtime.evaluate"]
-        self.assertEqual([message["params"]["contextId"] for message in evaluate[:2]], [9, 11])
+        self.assertIn("về URL sảnh tổng bằng đổi hash", note)
+        evaluate = self.sent("Runtime.evaluate")
+        self.assertEqual(evaluate[0]["params"]["expression"], LS.CLOSE_TABLE_JS)
+        self.assertEqual(evaluate[1]["params"]["expression"],
+                         LS.LIST_HASH_JS % json.dumps("category=all_games"))
+        self.assertEqual({message["params"].get("contextId") for message in evaluate}, {9, None})
+        self.assertEqual(self.sent("Page.navigate"), [])
+        self.assertEqual(self.sent("Input.dispatchMouseEvent"), [])
         self.assertNotIn("history.back()", json.dumps(self.sockets[0].sent))
+        self.assertTrue(self.sockets[0].closed)
 
-    def test_no_history_back_when_the_tab_is_already_on_the_list(self):
-        # Mục lịch sử đầu của tab sảnh là /entry dùng một lần: quay lại đó là EVO báo
-        # "User authentication failed (EV.7)" dù tài khoản không mở ở đâu khác.
-        self.scripted = self.transcript()
+    def test_clicks_the_close_button_with_a_real_mouse_and_never_navigates(self):
+        # Nút X người dùng chỉ ra: data-role="close-button". Bấm chuột thật (không phải
+        # btn.click() tổng hợp); về được danh sách thì không đổi hash, không navigate.
+        self.scripted = [[self.context_event(),
+                          {"id": 1, "result": {}},
+                          {"id": 2, "result": {"result": {"value": {
+                              "x": 1180.0, "y": 42.0,
+                              "frame_offset": {"x": 0, "y": 0, "depth": 0}}}}},
+                          {"id": 3, "result": {}}, {"id": 4, "result": {}},
+                          {"id": 5, "result": {}}, {"id": 6, "result": {}},
+                          {"id": 7, "result": {"result": {"value": self.TILES}}}]]
+        self.session._cdp_page.side_effect = [self.TABLE, self.LIST]
+        ok, note = self.stream.back_to_lobby()
+        self.assertTrue(ok, note)
+        self.assertIn("danh sách bàn Baccarat hiển thị trở lại", note)
+        clicks = [message["params"] for message in self.sent("Input.dispatchMouseEvent")
+                  if message["params"]["type"] == "mousePressed"]
+        self.assertEqual([(click["x"], click["y"]) for click in clicks], [(1180.0, 42.0)])
+        sent = json.dumps(self.sockets[0].sent)
+        self.assertNotIn("history.back()", sent)
+        self.assertNotIn("location.hash", sent)
+        self.assertEqual(self.sent("Page.navigate"), [])
+
+    def test_finds_the_close_button_inside_the_table_frame_and_adds_the_offset(self):
+        # Màn hình bàn có thể trong iframe: dò nút X ở mọi context, cộng lệch khung
+        # (đo bằng JS cùng origin) trước khi bấm theo khung gốc của tab.
+        self.scripted = [[self.context_event(),
+                          self.context_event(11, "frame-table"),
+                          {"id": 1, "result": {}},
+                          {"id": 2, "result": {"result": {"value": None}}},
+                          {"id": 3, "result": {"result": {"value": {
+                              "x": 900.0, "y": 30.0,
+                              "frame_offset": {"x": 10, "y": 20, "depth": 1}}}}},
+                          {"id": 4, "result": {}}, {"id": 5, "result": {}},
+                          {"id": 6, "result": {}}, {"id": 7, "result": {}},
+                          {"id": 8, "result": {"result": {"value": self.TILES}}}]]
+        self.session._cdp_page.side_effect = [self.TABLE, self.LIST]
+        ok, note = self.stream.back_to_lobby()
+        self.assertTrue(ok, note)
+        evaluate = self.sent("Runtime.evaluate")
+        self.assertEqual([message["params"]["contextId"] for message in evaluate[:2]], [9, 11])
+        clicks = [message["params"] for message in self.sent("Input.dispatchMouseEvent")
+                  if message["params"]["type"] == "mousePressed"]
+        self.assertEqual([(click["x"], click["y"]) for click in clicks], [(910.0, 50.0)])
+        self.assertEqual(self.sent("Page.navigate"), [])
+
+    def test_cross_origin_frame_offset_is_measured_via_cdp_before_clicking(self):
+        # JS không với tới iframe khác origin (frame_offset null): đo bằng
+        # Page.getFrameTree + DOM.getFrameOwner/getBoxModel như đường bấm chip.
+        tree = {"frameTree": {"frame": {"id": "root"},
+                              "childFrames": [{"frame": {"id": "game"}}]}}
+        self.scripted = [[self.context_event(9, "root"),
+                          self.context_event(11, "game"),
+                          {"id": 1, "result": {}},
+                          {"id": 2, "result": {"result": {"value": None}}},
+                          {"id": 3, "result": {"result": {"value": {
+                              "x": 100.0, "y": 50.0, "frame_offset": None}}}},
+                          {"id": 4, "result": {"root": {}}},
+                          {"id": 5, "result": tree},
+                          {"id": 6, "result": {"backendNodeId": 7}},
+                          {"id": 7, "result": {"model": {"content": [10.0, 20.0, 210.0, 20.0,
+                                                                       210.0, 420.0, 10.0, 420.0]}}},
+                          {"id": 8, "result": {}}, {"id": 9, "result": {}},
+                          {"id": 10, "result": {}}, {"id": 11, "result": {}},
+                          {"id": 12, "result": {"result": {"value": self.TILES}}}]]
+        self.session._cdp_page.side_effect = [self.TABLE, self.LIST]
+        ok, note = self.stream.back_to_lobby()
+        self.assertTrue(ok, note)
+        clicks = [message["params"] for message in self.sent("Input.dispatchMouseEvent")
+                  if message["params"]["type"] == "mousePressed"]
+        self.assertEqual([(click["x"], click["y"]) for click in clicks], [(110.0, 70.0)])
+
+    def test_no_navigation_when_the_tab_is_already_on_the_list(self):
+        self.scripted = [[self.context_event(), {"id": 1, "result": {}}]]
         self.session._cdp_page.return_value = self.LIST
         ok, note = self.stream.back_to_lobby()
         self.assertTrue(ok, note)
         self.assertIn("đã ở danh sách bàn", note.lower())
-        self.assertNotIn("history.back()", json.dumps([socket.sent for socket in self.sockets]))
-        self.assertNotIn("close-button", json.dumps([socket.sent for socket in self.sockets]))
+        self.assertEqual(self.sent("Runtime.evaluate"), [])
+        self.assertEqual(self.sent("Page.navigate"), [])
 
     def test_refuses_a_tab_that_is_not_the_lobby(self):
-        self.scripted = self.transcript()
+        self.scripted = [[]]
         self.session._cdp_page.return_value = LobbyEntryTests.PORTAL
         ok, note = self.stream.back_to_lobby()
         self.assertFalse(ok)
         self.assertIn("Không có tab sảnh", note)
         self.assertEqual(self.sockets, [], "Không nối CDP vào tab không phải sảnh")
 
-    def test_reports_when_the_list_never_renders(self):
-        self.scripted = self.transcript(tiles_seen=False)
-        self.session._cdp_page.side_effect = [self.TABLE, self.LIST]
+    def test_reports_when_no_way_back_ever_renders_the_list(self):
+        self.scripted = [[self.context_event(),
+                          {"id": 1, "result": {}},
+                          {"id": 2, "result": {"result": {"value": None}}},
+                          {"id": 3, "result": {}},
+                          {"id": 4, "result": {"frameId": "root"}},
+                          {"id": 5, "result": {"result": {"value": {"tiles": 0, "auth": False}}}}]]
+        self.session._cdp_page.side_effect = [self.TABLE, self.TABLE, self.TABLE]
         ok, note = self.stream.back_to_lobby(wait_seconds=0)
         self.assertFalse(ok)
         self.assertIn("chưa thấy lại danh sách bàn", note)
-
-    def test_a_context_killed_by_the_navigation_is_not_a_failed_return(self):
-        # Cú bấm nút X (hoặc history.back()) có thể phá chính context chạy lệnh: CDP trả
-        # lỗi ngay dù tab vẫn về sảnh. Coi lỗi đó là thất bại thì app đứng mãi ở màn hình bàn.
-        self.scripted = [[{"method": "Runtime.executionContextCreated",
-                           "params": {"context": {"id": 9, "auxData": {"isDefault": True}}}},
-                          {"id": 1, "result": {}},
-                          {"id": 2, "error": {"code": -32000, "message": "Cannot find context"}},
-                          {"id": 3, "result": {"result": {"value": self.TILES}}}]]
-        self.session._cdp_page.side_effect = [self.TABLE, self.LIST]
-        ok, note = self.stream.back_to_lobby()
-        self.assertTrue(ok, note)
-        self.assertIn("danh sách bàn Baccarat", note)
-        self.assertNotIn("history.back()", json.dumps(self.sockets[0].sent))
-
-    def test_contexts_cleared_by_the_return_are_probed_again(self):
-        self.scripted = [[{"method": "Runtime.executionContextCreated",
-                           "params": {"context": {"id": 9, "auxData": {"isDefault": True}}}},
-                          {"id": 1, "result": {}},
-                          {"id": 2, "error": {"code": -32000, "message": "Cannot find context"}},
-                          {"method": "Runtime.executionContextsCleared"},
-                          {"id": 3, "result": {}},
-                          {"method": "Runtime.executionContextCreated",
-                           "params": {"context": {"id": 10, "auxData": {"isDefault": True}}}},
-                          {"id": 4, "result": {}},
-                          {"id": 5, "result": {"result": {"value": self.TILES}}}]]
-        self.session._cdp_page.side_effect = [self.TABLE, self.LIST, self.LIST]
-        ok, note = self.stream.back_to_lobby()
-        self.assertTrue(ok, note)
-        self.assertEqual(self.stream.contexts, [10])
+        navigate = self.sent("Page.navigate")
+        self.assertEqual([message["params"]["url"] for message in navigate], [self.LIST_URL])
+        self.assertFalse(self.stream.session_lost)
 
     def test_reports_ev7_if_the_returned_page_lost_the_session(self):
-        self.scripted = [[{"method": "Runtime.executionContextCreated",
-                           "params": {"context": {"id": 9, "auxData": {"isDefault": True}}}},
-                          {"id": 1, "result": {}}, {"id": 2, "result": {}},
+        self.scripted = [[self.context_event(),
+                          {"id": 1, "result": {}},
+                          {"id": 2, "result": {"result": {"value": None}}},
                           {"id": 3, "result": {}},
-                          {"id": 4, "result": {"result": {"value": {"auth": True}}}}]]
-        self.session._cdp_page.side_effect = [self.TABLE, self.LIST]
+                          {"id": 4, "result": {"frameId": "root"}},
+                          {"id": 5, "result": {"result": {"value": {"auth": True}}}}]]
+        self.session._cdp_page.side_effect = [self.TABLE, self.TABLE, self.TABLE]
         ok, note = self.stream.back_to_lobby(wait_seconds=0)
         self.assertFalse(ok)
         self.assertIn("EV.7", note)
+        self.assertTrue(self.stream.session_lost)
+
+    def test_hash_without_tiles_falls_through_to_opening_the_lobby_url(self):
+        # Đổi hash xong SPA vẫn chưa render danh sách: mở thẳng URL sảnh tổng.
+        self.scripted = [[self.context_event(),
+                          {"id": 1, "result": {}},
+                          {"id": 2, "result": {"result": {"value": None}}},
+                          {"id": 3, "result": {}},
+                          {"id": 4, "result": {"frameId": "root"}},
+                          {"id": 5, "result": {"result": {"value": self.TILES}}}]]
+        self.session._cdp_page.side_effect = [self.TABLE, self.TABLE, self.TABLE,
+                                              self.TABLE, self.LIST]
+        ok, note = self.stream.back_to_lobby(wait_seconds=3)
+        self.assertTrue(ok, note)
+        self.assertIn("mở lại URL sảnh tổng", note)
+        navigate = self.sent("Page.navigate")
+        self.assertEqual([message["params"]["url"] for message in navigate], [self.LIST_URL])
+
+    def test_contexts_killed_before_the_hash_step_recover_via_the_lobby_url(self):
+        # Context chết ngay từ lệnh đo nút X: đổi hash cũng lỗi, nhưng Page.navigate
+        # không cần context — trang tải lại, context mới được dò và thấy ô bàn.
+        self.scripted = [[self.context_event(),
+                          {"id": 1, "result": {}},
+                          {"id": 2, "error": {"code": -32000, "message": "Cannot find context"}},
+                          {"id": 3, "error": {"code": -32000, "message": "Cannot find context"}},
+                          {"id": 4, "result": {"frameId": "root"}},
+                          self.context_event(10),
+                          {"id": 5, "result": {}},
+                          {"id": 6, "result": {"result": {"value": self.TILES}}}]]
+        self.session._cdp_page.side_effect = [self.TABLE, self.LIST]
+        ok, note = self.stream.back_to_lobby()
+        self.assertTrue(ok, note)
+        self.assertEqual(self.stream.contexts, [10])
+        self.assertEqual([message["params"]["url"] for message in self.sent("Page.navigate")],
+                         [self.LIST_URL])
+
+    def test_contexts_cleared_by_the_close_click_are_probed_again(self):
+        self.scripted = [[self.context_event(),
+                          {"id": 1, "result": {}},
+                          {"id": 2, "result": {"result": {"value": {
+                              "x": 1180.0, "y": 42.0,
+                              "frame_offset": {"x": 0, "y": 0, "depth": 0}}}}},
+                          {"id": 3, "result": {}},
+                          {"method": "Runtime.executionContextsCleared"},
+                          {"id": 4, "result": {}}, {"id": 5, "result": {}},
+                          {"id": 6, "result": {}},
+                          self.context_event(10),
+                          {"id": 7, "result": {}},
+                          {"id": 8, "result": {"result": {"value": self.TILES}}}]]
+        self.session._cdp_page.side_effect = [self.TABLE, self.LIST]
+        ok, note = self.stream.back_to_lobby()
+        self.assertTrue(ok, note)
+        self.assertEqual(self.stream.contexts, [10])
 
 
 class TableCycleTests(unittest.TestCase):
