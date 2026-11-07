@@ -395,7 +395,7 @@ class LiveSimulationTests(unittest.TestCase):
     def test_table_exits_after_a_live_road_exceeds_its_streak_filter(self):
         book = M.MoneyBook(capital=CAPITAL, unit=UNIT, take_profit_pct=100)
         ladder = [UNIT * m for m in (1, 3, 7, 15, 32, 64)]
-        sim = app.LiveSimulation(book, ladder=ladder, max_streak=6)
+        sim = app.LiveSimulation(book, ladder=ladder, max_streak=3, live_exit_streak=7)
         sim.bind(self.row(PLAYER_BASELINE))
         self.assertTrue(sim.start(self.row(PLAYER_BASELINE), verified=True, now=self.now))
 
@@ -689,7 +689,11 @@ class LiveSimulationTests(unittest.TestCase):
         for baseline, result in ((BASELINE, "P"), (PLAYER_BASELINE, "B")):
             with self.subTest(result=result):
                 sim = self.simulation(baseline)
-                for _ in range(ME.MAX_STREAK_ALLOWED + 1):
+                self.assertEqual(sim.max_streak, ME.MAX_STREAK_ALLOWED)  # lobby filter stays at 3
+                for _ in range(ME.DEFAULT_LIVE_EXIT_STREAK - 3):
+                    self.settle_next(sim, result)
+                self.assertTrue(sim.running, "in-table threshold is separate from the lobby threshold")
+                for _ in range(3):
                     self.settle_next(sim, result)
                 self.assertFalse(sim.running)
                 self.assertTrue(sim.cycle_done)
@@ -697,7 +701,7 @@ class LiveSimulationTests(unittest.TestCase):
                 self.assertFalse(sim.take_profit_done)
                 self.assertIn("bệt", sim.note)
                 self.assertIsNone(sim.pending)
-                self.assertEqual(sim.money.hands_played, ME.MAX_STREAK_ALLOWED + 1)
+                self.assertEqual(sim.money.hands_played, ME.DEFAULT_LIVE_EXIT_STREAK)
 
     def test_take_profit_ends_the_table_instead_of_starting_another_block(self):
         # Vốn nhỏ + mục tiêu 1%: chỉ một tay thắng là chạm mục tiêu.
@@ -2129,11 +2133,12 @@ class TableStreakFilterTests(unittest.TestCase):
 class RoadFilterConfigTests(unittest.TestCase):
     """Bộ lọc cầu nằm trong Cài đặt: khoảng tay đã đi + số tay bệt tối đa, lưu xuống state."""
 
-    def host(self, low="10", high="50", streak="3"):
+    def host(self, low="10", high="50", streak="3", live_exit_streak="7"):
         sim = app.LiveSimulation(M.MoneyBook(capital=CAPITAL, unit=UNIT))
         var = lambda value: Mock(get=lambda: value, set=Mock())
         return SimpleNamespace(sim=sim, hands_min_var=var(low), hands_max_var=var(high),
-                               streak_var=var(streak), hands_note=Mock(), root=Mock(),
+                               streak_var=var(streak), live_exit_streak_var=var(live_exit_streak),
+                               hands_note=Mock(), root=Mock(),
                                _save_state=Mock(), refresh=Mock(), apply_settings=Mock())
 
     def test_set_road_filter_clamps_both_ranges(self):
@@ -2157,6 +2162,7 @@ class RoadFilterConfigTests(unittest.TestCase):
         host.hands_min_var.set.assert_called_once_with(str(ME.HANDS_LOWER))
         host.hands_max_var.set.assert_called_once_with(str(ME.HANDS_UPPER))
         host.streak_var.set.assert_called_once_with(str(ME.STREAK_UPPER))
+        host.live_exit_streak_var.set.assert_called_once_with("7")
         self.assertIn("bệt tối đa %d tay" % ME.STREAK_UPPER, host.hands_note.config.call_args[1]["text"])
         host._save_state.assert_called_once_with()
         host.refresh.assert_called_once_with()
@@ -2166,6 +2172,7 @@ class RoadFilterConfigTests(unittest.TestCase):
         app.BCRApp.apply_road_filter(host)
         host.apply_settings.assert_not_called()
         self.assertEqual(host.sim.max_streak, 4)
+        self.assertEqual(host.sim.live_exit_streak, 7)
 
     def test_a_non_numeric_filter_is_refused_without_touching_the_simulation(self):
         host = self.host(streak="ba tay")

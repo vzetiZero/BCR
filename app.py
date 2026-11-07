@@ -141,12 +141,14 @@ class LiveSimulation:
     def __init__(self, book=None, profile=ME.DEFAULT_PROFILE, ladder=None,
                  min_hands=ME.MIN_HANDS, max_hands=ME.MAX_HANDS,
                  max_streak=ME.MAX_STREAK_ALLOWED,
+                 live_exit_streak=ME.DEFAULT_LIVE_EXIT_STREAK,
                  block_mode=ME.BLOCK_MODE_RECALCULATE):
         self.money = book or M.MoneyBook()
         self.profile = profile
         self.ladder = ME.ladder_stakes(profile, ladder)
         self.min_hands, self.max_hands = ME.normalize_hand_range(min_hands, max_hands)
         self.max_streak = ME.normalize_streak(max_streak)
+        self.live_exit_streak = ME.normalize_streak(live_exit_streak, ME.DEFAULT_LIVE_EXIT_STREAK)
         self.block_mode = (ME.BLOCK_MODE_REPEAT if block_mode == "alternate" else block_mode)
         self.block_mode = (self.block_mode if self.block_mode in
                            (ME.BLOCK_MODE_RECALCULATE, ME.BLOCK_MODE_REPEAT)
@@ -189,6 +191,10 @@ class LiveSimulation:
         self.min_hands, self.max_hands = ME.normalize_hand_range(min_hands, max_hands)
         self.max_streak = ME.normalize_streak(max_streak)
         return self.min_hands, self.max_hands, self.max_streak
+
+    def set_live_exit_streak(self, live_exit_streak):
+        self.live_exit_streak = ME.normalize_streak(live_exit_streak, ME.DEFAULT_LIVE_EXIT_STREAK)
+        return self.live_exit_streak
 
     def bind(self, row):
         self.pause()
@@ -317,7 +323,18 @@ class LiveSimulation:
 
     def _exit_if_table_filter_failed(self, letters):
         """Stop following a live table as soon as its entry filters no longer hold."""
-        info = ME.check_table(list(letters), self.min_hands, self.max_hands, self.max_streak)
+        info = ME.check_table(list(letters), self.min_hands, self.max_hands, ME.STREAK_UPPER)
+        runs = E.run_lengths(letters)
+        streak_side, streak_len = max(runs, key=lambda run: run[1], default=(None, 0))
+        streak_check = info["checks"][1]
+        streak_check["ok"] = streak_len < self.live_exit_streak
+        if not streak_check["ok"]:
+            streak_check["detail"] = "bệt %s %d tay (ngưỡng thoát %d tay)" % (
+                E.SIDE_NAME[streak_side], streak_len, self.live_exit_streak)
+        else:
+            streak_check["detail"] = "bệt hiện tại %d tay; thoát khi đạt %d tay" % (
+                streak_len, self.live_exit_streak)
+        info["eligible"] = all(check["ok"] for check in info["checks"])
         failure = next((check["detail"] for check in info["checks"] if not check["ok"]), "")
         if not failure:
             return False
@@ -489,6 +506,7 @@ class BCRApp:
         self.hands_min_var = tk.StringVar(value=str(ME.MIN_HANDS))
         self.hands_max_var = tk.StringVar(value=str(ME.MAX_HANDS))
         self.streak_var = tk.StringVar(value=str(ME.MAX_STREAK_ALLOWED))
+        self.live_exit_streak_var = tk.StringVar(value=str(ME.DEFAULT_LIVE_EXIT_STREAK))
         self.block_mode_var = tk.StringVar(value=ME.BLOCK_MODE_RECALCULATE)
         self._last_sweep_favorites = False
         self.chrome_fullscreen_var = tk.BooleanVar(value=BR.WIN_FULLSCREEN)
@@ -831,9 +849,15 @@ class BCRApp:
         self._label(hand_inputs, "–", 9, MUTED).pack(side="left", padx=4)
         tk.Entry(hand_inputs, textvariable=self.hands_max_var, width=4, font=("Segoe UI", 11),
                  relief="solid", bd=1).pack(side="left", ipady=3)
-        self._label(hand_inputs, "· bệt tối đa", 9, MUTED).pack(side="left", padx=(10, 6))
+        self._label(hand_inputs, "\u00b7 b\u1ec7t t\u1ed1i \u0111a \u1edf s\u1ea3nh", 9, MUTED).pack(side="left", padx=(10, 6))
         tk.Entry(hand_inputs, textvariable=self.streak_var, width=3, font=("Segoe UI", 11),
                  relief="solid", bd=1).pack(side="left", ipady=3)
+        live_exit_row = tk.Frame(hands_row, bg=PANEL)
+        live_exit_row.pack(anchor="w", pady=(6, 0))
+        self._label(live_exit_row, "Thoát bàn khi vệt bệt đạt", 9, MUTED).pack(side="left", padx=(0, 6))
+        tk.Entry(live_exit_row, textvariable=self.live_exit_streak_var, width=4,
+                 font=("Segoe UI", 11), relief="solid", bd=1).pack(side="left", ipady=3)
+        self._label(live_exit_row, "tay (ví dụ 7: thoát ở tay bệt thứ 7)", 9, MUTED).pack(side="left", padx=(4, 0))
         self._label(hand_inputs, "tay", 9, MUTED).pack(side="left", padx=(4, 0))
         self._button(hand_inputs, "Lưu bộ lọc", self.apply_road_filter).pack(side="left", padx=(10, 0))
         self.hands_note = self._label(hands_row, "", 9, MUTED, justify="left", wraplength=500)
@@ -1158,6 +1182,7 @@ class BCRApp:
             low = int(self.hands_min_var.get().strip())
             high = int(self.hands_max_var.get().strip())
             streak = int(self.streak_var.get().strip())
+            live_exit_streak = int(self.live_exit_streak_var.get().strip())
         except (ValueError, TypeError):
             messagebox.showerror("Bộ lọc cầu chưa hợp lệ",
                                  "Nhập số tay đã đi tối thiểu/tối đa (ví dụ 10 và 50) "
@@ -1165,13 +1190,15 @@ class BCRApp:
                                  parent=self.root)
             return
         low, high, streak = self.sim.set_road_filter(low, high, streak)
+        live_exit_streak = self.sim.set_live_exit_streak(live_exit_streak)
         self.hands_min_var.set(str(low))
         self.hands_max_var.set(str(high))
         self.streak_var.set(str(streak))
+        self.live_exit_streak_var.set(str(live_exit_streak))
         self._save_state()
         if hasattr(self, "hands_note"):
             self.hands_note.config(
-                text="Đang lọc bàn đã đi %d–%d tay · bệt tối đa %d tay." % (low, high, streak), fg=GREEN)
+                text="\u0110ang l\u1ecdc s\u1ea3nh %d?%d tay; b\u1ec7t t\u1ed1i \u0111a %d tay. Trong b\u00e0n: tho\u00e1t khi b\u1ec7t \u0111\u1ea1t %d tay." % (low, high, streak, live_exit_streak), fg=GREEN)
         self.refresh()
 
     def apply_mouse_setting(self):
@@ -2372,6 +2399,7 @@ class BCRApp:
         self.sim = LiveSimulation(book, profile=profile, ladder=stakes,
                                   min_hands=self.sim.min_hands, max_hands=self.sim.max_hands,
                                   max_streak=self.sim.max_streak,
+                                  live_exit_streak=self.sim.live_exit_streak,
                                   block_mode=self.block_mode_var.get())
         self.sim.on_arm = self.place_armed_bet
         self.tables_done = 0
@@ -2462,6 +2490,9 @@ class BCRApp:
             self.hands_min_var.set(str(low))
             self.hands_max_var.set(str(high))
             self.streak_var.set(str(streak))
+            live_exit_streak = self.sim.set_live_exit_streak(
+                settings.get("live_exit_streak", ME.DEFAULT_LIVE_EXIT_STREAK))
+            self.live_exit_streak_var.set(str(live_exit_streak))
             saved_window = settings.get("chrome_window")
             if isinstance(saved_window, dict):
                 loaded = BR.normalize_window((saved_window.get("width"), saved_window.get("height")),
@@ -2514,6 +2545,7 @@ class BCRApp:
                                    hands_min=self.sim.min_hands,
                                    hands_max=self.sim.max_hands,
                                    max_streak=self.sim.max_streak,
+                                   live_exit_streak=self.sim.live_exit_streak,
                                   chrome_window=dict(width=window["width"], height=window["height"],
                                                      percent=window["percent"],
                                                      fullscreen=window["fullscreen"]),

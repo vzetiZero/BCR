@@ -35,6 +35,7 @@ DEFAULT_LADDER = {
 MULTIPLIER_LADDER = (1, 3, 7, 15, 32, 64)
 PROFILE_LABEL = {"3-3": "3-3 · 6 tay (3 mạnh + 3 đổi)", "3-2": "3-2 · 5 tay (3 mạnh + 2 đổi)"}
 MAX_STREAK_ALLOWED = 3  # bệt tối đa 3 tay còn nhận; từ 4 tay liền loại bàn
+DEFAULT_LIVE_EXIT_STREAK = 7  # khi đang chơi: bệt chạm 7 tay thì rời bàn
 # Người dùng đổi số tay bệt tối đa trong Cài đặt; hai mốc dưới là biên hợp lệ.
 STREAK_LOWER = 1
 STREAK_UPPER = 12
@@ -45,12 +46,12 @@ HANDS_LOWER = 10
 HANDS_UPPER = 50
 
 
-def normalize_streak(value=MAX_STREAK_ALLOWED):
+def normalize_streak(value=MAX_STREAK_ALLOWED, fallback=MAX_STREAK_ALLOWED):
     """Kẹp số tay bệt tối đa vào biên hợp lệ; giá trị không phải số thì giữ mặc định."""
     try:
         number = int(value)
     except (TypeError, ValueError):
-        number = MAX_STREAK_ALLOWED
+        number = fallback
     return max(STREAK_LOWER, min(STREAK_UPPER, number))
 
 
