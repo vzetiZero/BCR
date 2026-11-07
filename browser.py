@@ -834,7 +834,7 @@ class BrowserSession:
                         if count >= best_count:
                             self.last_diag = dict(rep["diag"])
                             best_count = count
-                        if count:
+                        if count or rep["page"].get("wallet_balance"):
                             reports.append(rep)
                 # RPC cuối cũng nhận các sự kiện hủy context đang chờ trên socket.
                 root = command("Target.getTargetInfo").get("targetInfo", {})
@@ -942,7 +942,7 @@ class BrowserSession:
                         if count >= best_count:
                             self.last_diag = dict(rep["diag"])
                             best_count = count
-                        if count:
+                        if count or rep["page"].get("wallet_balance"):
                             reports.append(rep)
                 # Loại toàn bộ kết quả nếu root đã rời site trong lúc đang đọc.
                 driver.switch_to.default_content()

@@ -32,16 +32,48 @@ def fmt_amount(value):
 
 
 def fmt_input_money(value):
-    """Nhóm hàng nghìn bằng dấu phẩy cho ô nhập: 2,000,000 để nhìn rõ mốc triệu."""
-    return "{:,.0f}".format(value)
+    """Nhóm hàng nghìn bằng dấu phẩy và giữ tối đa hai số lẻ cho ô nhập."""
+    value = float(value or 0)
+    return "{:,.0f}".format(value) if value.is_integer() else "{:,.2f}".format(value)
 
 
 def parse_money(text):
-    """Đọc ô nhập tiền: 2,000,000 · 2.000.000 · 2000000 đều cho ra 2000000."""
-    digits = re.sub(r"[.,]", "", str(text).strip())
-    if not re.fullmatch(r"[-+]?\d+", digits):
+    """Đọc số tiền có phân nhóm hoặc phần thập phân kiểu Việt/Anh."""
+    raw = str(text).strip()
+    raw = raw.replace("\u00a0", " ").replace("\u202f", " ")
+    for mark in ("\u2066", "\u2067", "\u2068", "\u2069"):
+        raw = raw.replace(mark, "")
+    raw = re.sub(r"\s*VN2\s*$", "", raw, flags=re.IGNORECASE).strip()
+    if not re.fullmatch(r"[+-]?\d[\d.,]*", raw):
         raise ValueError(str(text))
-    return float(digits)
+
+    sign = -1 if raw.startswith("-") else 1
+    raw = raw.lstrip("+-")
+    if "." in raw and "," in raw:
+        decimal = "." if raw.rfind(".") > raw.rfind(",") else ","
+        grouping = "," if decimal == "." else "."
+        whole, fraction = raw.rsplit(decimal, 1)
+        if not 1 <= len(fraction) <= 2 or decimal in whole:
+            raise ValueError(str(text))
+        whole = whole.replace(grouping, "")
+        normalized = whole + "." + fraction
+    else:
+        separator = "." if "." in raw else "," if "," in raw else ""
+        if not separator:
+            normalized = raw
+        else:
+            pieces = raw.split(separator)
+            if len(pieces) > 2:
+                if not all(len(piece) == 3 for piece in pieces[1:]):
+                    raise ValueError(str(text))
+                normalized = "".join(pieces)
+            elif len(pieces[1]) == 3:
+                normalized = "".join(pieces)
+            elif 1 <= len(pieces[1]) <= 2:
+                normalized = pieces[0] + "." + pieces[1]
+            else:
+                raise ValueError(str(text))
+    return sign * float(normalized)
 
 
 class MoneyBook:

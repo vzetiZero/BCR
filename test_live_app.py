@@ -53,6 +53,11 @@ class MoneyInputTests(unittest.TestCase):
             self.assertEqual(M.parse_money(text), 2_000_000.0)
         self.assertEqual(M.parse_money("100,000"), UNIT)
 
+    def test_reads_decimal_wallet_amounts_from_evolution(self):
+        self.assertEqual(M.parse_money("⁦3.882,74 ⁦VN2 ⁩⁩"), 3882.74)
+        self.assertEqual(M.parse_money("3,882.74"), 3882.74)
+        self.assertEqual(M.parse_money(M.fmt_input_money(3882.74)), 3882.74)
+
     def test_rejects_text_that_is_not_a_money_amount(self):
         for text in ("", "invalid", "1 000 000", "2e6", "12abc", "2.000đ"):
             with self.subTest(text=text):
@@ -2371,8 +2376,8 @@ class BrowserUrlRegressionTests(unittest.TestCase):
         session = BR.BrowserSession()
         script = session._reader_script()
         self.assertIn("'/frontend/evo/r3'", script)
-        self.assertNotIn("location.hash", script)
-        # Không còn helper đổi hash: URL launch của EVO phải được giữ nguyên.
+        self.assertNotRegex(script, r"location\.hash\s*=")
+        # Đọc hash để nhận diện lobby không điều hướng hay đổi URL launch của EVO.
         self.assertFalse(hasattr(BR, "lobby_url_with_route"))
         self.assertFalse(hasattr(BR, "lobby_list_url"))
 
@@ -2816,7 +2821,7 @@ class BrowserCdpRegressionTests(unittest.TestCase):
                 safe_url = self.origin + "/frontend/evo/r3/"
                 diag = dict(kind="road", scanned=15, roads=1, frame=safe_url, auth_required=False)
                 self.assertEqual(reports, [dict(page=dict(url=safe_url, title=raw["page"]["title"][:80],
-                                                         table_id="table_01:2"),
+                                                         table_id="table_01:2", wallet_balance=""),
                                                tables=raw["tables"], diag=diag)])
                 self.assertEqual(raw, before)
                 for secret in ("QUERY_SECRET", "HASH_SECRET", "user:password", "PAGE_SECRET",
@@ -3914,11 +3919,12 @@ class AutoPlaceReportingTests(unittest.TestCase):
         threads.assert_not_called()
         self.assertEqual(plan["placed"], "failed")
 
-    def test_auto_place_off_leaves_the_plan_untracked(self):
+    def test_auto_place_off_marks_the_plan_not_placed(self):
         host = self.host(self.simulation(), auto_place_var=Mock(get=Mock(return_value=False)))
         plan = host.sim.pending
         self.run_placement(host, threads=False)
-        self.assertNotIn("placed", plan)
+        self.assertEqual(plan["placed"], "failed")
+        self.assertIn("bật", plan["place_note"])
 
     def test_a_result_for_another_plan_does_not_touch_the_current_one(self):
         host = self.host(self.simulation())

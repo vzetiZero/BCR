@@ -61,12 +61,35 @@ def signed(value):
 
 def group_money_input(raw, caret):
     """Nhóm lại ô nhập tiền theo dấu phẩy hàng nghìn và giữ vị trí con trỏ tương ứng."""
-    digits = re.sub(r"\D", "", raw)
-    grouped = M.fmt_input_money(int(digits)) if digits else ""
+    raw = str(raw)
+    separators = [char for char in raw if char in ",."]
+    decimal = ""
+    if "," in raw and "." in raw:
+        decimal = "." if raw.rfind(".") > raw.rfind(",") else ","
+    elif separators:
+        sep = separators[0]
+        pieces = raw.split(sep)
+        if len(pieces) == 2 and (1 <= len(pieces[1]) <= 2):
+            decimal = sep
+        elif len(pieces) > 2 and len(pieces[-1]) <= 2 and all(len(p) == 3 for p in pieces[1:-1]):
+            decimal = sep
+    if decimal:
+        whole, fraction = raw.rsplit(decimal, 1)
+        whole_digits = re.sub(r"\D", "", whole)
+        fraction = re.sub(r"\D", "", fraction)
+        grouped_whole = M.fmt_input_money(int(whole_digits)) if whole_digits else "0"
+        grouped = grouped_whole + "." + fraction
+    else:
+        whole_digits = re.sub(r"\D", "", raw)
+        fraction = ""
+        grouped = M.fmt_input_money(int(whole_digits)) if whole_digits else ""
     if grouped == raw:
         return raw, caret
     kept = len(re.sub(r"\D", "", raw[:caret]))
-    if kept >= len(digits):
+    if decimal and raw.rfind(decimal) < caret and kept >= len(whole_digits):
+        return grouped, min(len(grouped), len(M.fmt_input_money(int(whole_digits)) if whole_digits else "0")
+                            + 1 + max(0, kept - len(whole_digits)))
+    if kept >= len(whole_digits) + len(fraction):
         return grouped, len(grouped)
     seen = 0
     for index, char in enumerate(grouped):
@@ -451,6 +474,7 @@ class BCRApp:
         self.only_eligible = tk.BooleanVar(value=False)
         self.search = tk.StringVar()
         self.connection_text = "Chưa kết nối Chrome."
+        self.wallet_balance_text = "Số dư ví trên web: chưa đọc được"
         self._load_state()
         self.stream.human_mouse = self.human_mouse_var.get()
         self.base_tk_scaling = float(root.tk.call("tk", "scaling"))
@@ -545,6 +569,8 @@ class BCRApp:
         self.disconnect_button.pack(side="left", padx=4)
         self.connection_note = self._label(connect, size=9, color=MUTED, anchor="w", justify="left", wraplength=500)
         self.connection_note.pack(fill="x", padx=10, pady=(0, 6))
+        self.wallet_balance_label = self._label(connect, self.wallet_balance_text, 10, bold=True, anchor="w")
+        self.wallet_balance_label.pack(fill="x", padx=10, pady=(0, 6))
         sweep_row = tk.Frame(connect, bg=PANEL)
         sweep_row.pack(fill="x", padx=10, pady=(0, 6))
         self.enter_lobby_button = self._button(sweep_row, "Nhận tab sảnh", self.enter_lobby)
@@ -1649,6 +1675,7 @@ class BCRApp:
                     self.sim.pause("Mất kết nối/đọc cầu lỗi. Hãy đối chiếu lại trước khi tiếp tục.")
                 else:
                     self.session_lost = False
+                    self._sync_wallet_from_reports(reports)
                     self._ingest_reports(reports, observed_at)
                     n = sum(len(rep.get("tables", [])) for rep in reports)
                     self.connection_text = ("Đang đọc %d bàn." % n if n else "Chưa thấy bàn Baccarat.")
@@ -1904,6 +1931,37 @@ class BCRApp:
         self.sweep_note_text = "Đang tự quét tìm bàn đạt chuẩn (lượt %d)…" % (self.cycle_attempts + 1)
         self._trace("hunt_retry", dict(attempt=self.cycle_attempts + 1))
         self.sweep_lobby()
+
+    def _sync_wallet_from_reports(self, reports):
+        """Show the live lobby wallet and use it as starting capital before a run."""
+        text = next((str((report.get("page") or {}).get("wallet_balance") or "").strip()
+                     for report in reports
+                     if (report.get("page") or {}).get("wallet_balance")), "")
+        if not text:
+            return
+        try:
+            value = M.parse_money(text)
+        except (TypeError, ValueError):
+            self.wallet_balance_text = "Số dư ví trên web: không đọc được giá trị"
+            if hasattr(self, "wallet_balance_label"):
+                self.wallet_balance_label.config(text=self.wallet_balance_text, fg=RED)
+            return
+
+        self.wallet_balance_text = "Số dư ví trên web: %s VN2" % M.fmt_amount(value)
+        book = self.sim.money
+        if not self.sim.running and not book.hands_played and not getattr(self, "state_read_error", False):
+            changed = abs(book.start_capital - value) >= 0.005
+            ok, _note = book.sync_capital(value)
+            if ok:
+                self.wallet_balance_text += " · vốn phiên đã đồng bộ"
+                if hasattr(self, "entries") and "capital" in self.entries:
+                    self.entries["capital"].set(M.fmt_input_money(value))
+                if changed and hasattr(self, "_save_state"):
+                    self._save_state()
+        else:
+            self.wallet_balance_text += " · vốn phiên đang giữ nguyên"
+        if hasattr(self, "wallet_balance_label"):
+            self.wallet_balance_label.config(text=self.wallet_balance_text, fg=ACCENT)
 
     def _ingest_reports(self, reports, now=None):
         now = time.time() if now is None else now
