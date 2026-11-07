@@ -304,6 +304,7 @@ class LiveSimulation:
         self.results = list(letters)
         self.place_skips += 1
         self.log.append(dict(time=time.time(), armed_at=plan.get("armed_at"), table=self.table_name,
+                             table_key=self.table_key,
                              hand=len(letters), result=letters[-1], bet=plan["side"], stake=0,
                              delta=0.0, outcome="not_placed", balance_after=self.money.balance,
                              block_pos=plan.get("block_pos"), ladder=plan.get("ladder_step"),
@@ -411,6 +412,7 @@ class LiveSimulation:
         self.letters = letters
         self.results = list(letters)
         self.log.append(dict(time=time.time(), armed_at=plan["armed_at"], table=self.table_name,
+                             table_key=self.table_key,
                              hand=len(letters), result=result, bet=plan["side"], stake=plan["stake"],
                              delta=settled["delta"], outcome=settled["outcome"],
                              balance_after=self.money.balance, block_pos=plan["block_pos"],
@@ -770,6 +772,10 @@ class BCRApp:
         self.history_tree = self._tree(card, (("time", "GIỜ", 55), ("table", "BÀN", 90),
                         ("hand", "TAY", 40), ("bet", "CƯỢC", 45), ("result", "KQ", 40),
                         ("stake", "TIỀN", 70), ("delta", "LÃI/LỖ", 70), ("balance", "VỐN", 85)))
+        self.history_tree.configure(show="tree headings")
+        self.history_tree.heading("#0", text="")
+        self.history_tree.column("#0", width=20, minwidth=20, stretch=False)
+        self.history_tree.tag_configure("table_group", font=("Segoe UI", 9, "bold"), background="#edf2f8")
         self.history_tree.tag_configure("win", foreground=GREEN)
         self.history_tree.tag_configure("loss", foreground=RED)
         self.history_size = -1
@@ -2268,10 +2274,24 @@ class BCRApp:
         if self.history_size != len(self.sim.log):
             for item in self.history_tree.get_children():
                 self.history_tree.delete(item)
+            groups = {}
             for row in self.sim.log:
-                self.history_tree.insert("", "end", tags=(row["outcome"],), values=(
-                    time.strftime("%H:%M:%S", time.localtime(row["time"])), row["table"], row["hand"],
-                    row["bet"], row["result"], M.fmt_money(row["stake"]), signed(row["delta"]), M.fmt_money(row["balance_after"])))
+                group_key = row.get("table_key") or row.get("table") or "(B\u00e0n kh\u00f4ng r\u00f5)"
+                groups.setdefault(group_key, []).append(row)
+            for group_key, rows in groups.items():
+                name = rows[-1].get("table") or str(group_key)
+                wins = sum(row.get("outcome") == "win" for row in rows)
+                losses = sum(row.get("outcome") == "loss" for row in rows)
+                pushes = sum(row.get("outcome") == "push" for row in rows)
+                profit = sum(float(row.get("delta", 0) or 0) for row in rows)
+                parent = self.history_tree.insert("", "end", tags=("table_group",), values=(
+                    "", "%s \u00b7 %d l\u01b0\u1ee3t" % (name, len(rows)), "", "%dT/%dB/%dH" % (wins, losses, pushes),
+                    "", "", signed(profit), M.fmt_money(rows[-1].get("balance_after", 0))))
+                for row in rows:
+                    self.history_tree.insert(parent, "end", tags=(row.get("outcome", ""),), values=(
+                        time.strftime("%H:%M:%S", time.localtime(row["time"])), "", row.get("hand", ""),
+                        row.get("bet", ""), row.get("result", ""), M.fmt_money(row.get("stake", 0)),
+                        signed(row.get("delta", 0)), M.fmt_money(row.get("balance_after", 0))))
             self.history_size = len(self.sim.log)
 
     def _draw_canvas(self, key):
