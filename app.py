@@ -16,6 +16,7 @@ import engine as E
 import lobby_stream as LS
 import method as ME
 import money as M
+import race
 import table_bets as TB
 
 HERE = Path(__file__).resolve().parent
@@ -49,6 +50,16 @@ COLORS = {"B": RED, "P": BLUE, "T": GREEN}
 MONEY_FIELDS = ("balance", "hands_played", "wins", "losses", "pushes", "ties_bet",
                 "total_staked", "total_returned", "peak", "max_drawdown", "loss_streak", "blocked")
 DEFAULT_UI_SCALE = 80
+# Bàn Siêu Tốc Độ (Super Speed) có cửa sổ đặt cược quá ngắn: chờ khay chip render,
+# đọc mệnh giá, lướt chuột và xác nhận đã vượt cửa sổ nên tay luôn bị bỏ (not_placed).
+# Không tự vào các bàn này khi săn bàn để khỏi đốt tay; người dùng vẫn tự mở được.
+FAST_TABLE_MARKERS = ("siêu tốc", "super speed", "superspeed")
+
+
+def is_fast_table(label):
+    """True với bàn có nhịp cược quá nhanh để bấm chip kịp (Siêu Tốc Độ/Super Speed)."""
+    text = str(label or "").casefold()
+    return any(marker in text for marker in FAST_TABLE_MARKERS)
 
 
 def fresh_method():
@@ -142,6 +153,7 @@ class LiveSimulation:
                  min_hands=ME.MIN_HANDS, max_hands=ME.MAX_HANDS,
                  max_streak=ME.MAX_STREAK_ALLOWED,
                  live_exit_streak=ME.DEFAULT_LIVE_EXIT_STREAK,
+                 min_lead=ME.DEFAULT_MIN_LEAD,
                  block_mode=ME.BLOCK_MODE_RECALCULATE):
         self.money = book or M.MoneyBook()
         self.profile = profile
@@ -149,6 +161,7 @@ class LiveSimulation:
         self.min_hands, self.max_hands = ME.normalize_hand_range(min_hands, max_hands)
         self.max_streak = ME.normalize_streak(max_streak)
         self.live_exit_streak = ME.normalize_streak(live_exit_streak, ME.DEFAULT_LIVE_EXIT_STREAK)
+        self.min_lead = ME.normalize_min_lead(min_lead)
         self.block_mode = (ME.BLOCK_MODE_REPEAT if block_mode == "alternate" else block_mode)
         self.block_mode = (self.block_mode if self.block_mode in
                            (ME.BLOCK_MODE_RECALCULATE, ME.BLOCK_MODE_REPEAT)
@@ -185,13 +198,15 @@ class LiveSimulation:
         s = self.method_state
         return ME.plan(self.results, self.ladder, s["ladder_step"], s["hands_in_block"],
                        s["started"], s["strong"], self.profile,
-                       self.min_hands, self.max_hands, self.max_streak, self.block_mode)
+                       self.min_hands, self.max_hands, self.max_streak, self.block_mode,
+                       self.min_lead)
 
-    def set_road_filter(self, min_hands, max_hands, max_streak):
+    def set_road_filter(self, min_hands, max_hands, max_streak, min_lead=ME.DEFAULT_MIN_LEAD):
         """Đổi bộ lọc cầu (khoảng tay đã đi + số tay bệt tối đa); kẹp trong biên của method."""
         self.min_hands, self.max_hands = ME.normalize_hand_range(min_hands, max_hands)
         self.max_streak = ME.normalize_streak(max_streak)
-        return self.min_hands, self.max_hands, self.max_streak
+        self.min_lead = ME.normalize_min_lead(min_lead)
+        return self.min_hands, self.max_hands, self.max_streak, self.min_lead
 
     def set_live_exit_streak(self, live_exit_streak):
         self.live_exit_streak = ME.normalize_streak(live_exit_streak, ME.DEFAULT_LIVE_EXIT_STREAK)
@@ -337,25 +352,24 @@ class LiveSimulation:
         return False
 
     def _exit_if_table_filter_failed(self, letters):
-        """Stop following a live table as soon as its entry filters no longer hold."""
-        info = ME.check_table(list(letters), self.min_hands, self.max_hands, ME.STREAK_UPPER)
+        """Rời bàn đang chơi CHỈ khi bệt hiện tại chạm ngưỡng thoát trong bàn.
+
+        Khoảng 10-50 tay và luật "chưa từng có 3-3" là bộ lọc CHỌN bàn ở sảnh, không
+        phải điều kiện sống trong bàn. Áp lại chúng lên cầu live làm app bỏ một bàn
+        đang chơi bình thường ngay khi vượt quá ``max_hands`` hoặc vừa xuất hiện cầu
+        3-3 — đúng hiện tượng "vào bàn vài giây rồi bị đá" trong bcr_trace.jsonl.
+        Trong bàn chỉ còn ngưỡng thoát riêng (mặc định 7 tay bệt), khớp dòng cài đặt
+        "Trong bàn: thoát khi bệt đạt N tay".
+        """
         runs = E.run_lengths(letters)
         streak_side, streak_len = max(runs, key=lambda run: run[1], default=(None, 0))
-        streak_check = info["checks"][1]
-        streak_check["ok"] = streak_len < self.live_exit_streak
-        if not streak_check["ok"]:
-            streak_check["detail"] = "bệt %s %d tay (ngưỡng thoát %d tay)" % (
-                E.SIDE_NAME[streak_side], streak_len, self.live_exit_streak)
-        else:
-            streak_check["detail"] = "bệt hiện tại %d tay; thoát khi đạt %d tay" % (
-                streak_len, self.live_exit_streak)
-        info["eligible"] = all(check["ok"] for check in info["checks"])
-        failure = next((check["detail"] for check in info["checks"] if not check["ok"]), "")
-        if not failure:
+        if streak_len < self.live_exit_streak:
             return False
         self.filter_exit_done = True
         self.cycle_done = True
-        self.pause("Bàn không còn đạt điều kiện lọc (%s) · rời bàn và quét bàn khác." % failure)
+        self.pause("Bàn không còn đạt điều kiện lọc (bệt %s %d tay, ngưỡng thoát %d tay) · "
+                   "rời bàn và quét bàn khác." % (
+                       E.SIDE_NAME[streak_side], streak_len, self.live_exit_streak))
         return True
 
     def process(self, row, now=None):
@@ -532,6 +546,8 @@ class BCRApp:
         self.tables_var = tk.StringVar(value="1")
         self.favorites_only = tk.BooleanVar(value=True)
         self.human_mouse_var = tk.BooleanVar(value=True)
+        self.game_mode = "baccarat"
+        self._race_saved = None
         self.auto_place_var = tk.BooleanVar(value=True)
         self.auto_recover_var = tk.BooleanVar(value=True)
         self.ladder_mode_var = tk.StringVar(value="manual")
@@ -540,6 +556,7 @@ class BCRApp:
         self.hands_max_var = tk.StringVar(value=str(ME.MAX_HANDS))
         self.streak_var = tk.StringVar(value=str(ME.MAX_STREAK_ALLOWED))
         self.live_exit_streak_var = tk.StringVar(value=str(ME.DEFAULT_LIVE_EXIT_STREAK))
+        self.min_lead_var = tk.StringVar(value=str(ME.DEFAULT_MIN_LEAD))
         self.block_mode_var = tk.StringVar(value=ME.BLOCK_MODE_RECALCULATE)
         self._last_sweep_favorites = False
         self.chrome_fullscreen_var = tk.BooleanVar(value=BR.WIN_FULLSCREEN)
@@ -588,9 +605,34 @@ class BCRApp:
         style.configure("Treeview.Heading", background=BG, foreground=MUTED,
                         relief="flat", font=("Segoe UI", 9, "bold"), padding=(8, 7))
         style.map("Treeview", background=[("selected", PALE)], foreground=[("selected", ACCENT)])
+        # Menu tổng chọn trò: mỗi trò có khung UI riêng xếp chồng trong game_host,
+        # chỉ khung của trò đang chọn được tkraise(). Nhờ vậy Baccarat và Đua ngựa
+        # không dùng chung widget/state và không giẫm lên nhau.
+        game_bar = tk.Frame(self.root, bg="#0f1722")
+        game_bar.pack(side="top", fill="x")
+        self.game_buttons = {}
+        for key, title in (("baccarat", "Baccarat"), ("horse", "Đua ngựa")):
+            button = tk.Button(game_bar, text=title, relief="flat", bd=0,
+                               bg="#0f1722", fg="#8aa0ba", activebackground="#25364e",
+                               activeforeground="white", font=("Segoe UI", 11, "bold"),
+                               padx=18, pady=9, cursor="hand2",
+                               command=lambda k=key: self.select_game(k))
+            button.pack(side="left", padx=(4 if key != "baccarat" else 8, 0), pady=4)
+            self.game_buttons[key] = button
+        self.game_host = tk.Frame(self.root, bg=BG)
+        self.game_host.pack(side="top", fill="both", expand=True)
+        self.game_host.rowconfigure(0, weight=1)
+        self.game_host.columnconfigure(0, weight=1)
+        self.game_frames = {}
+        self.baccarat_frame = tk.Frame(self.game_host, bg=BG)
+        self.baccarat_frame.grid(row=0, column=0, sticky="nsew")
+        self.game_frames["baccarat"] = self.baccarat_frame
+        self.horse_frame = tk.Frame(self.game_host, bg=BG)
+        self.horse_frame.grid(row=0, column=0, sticky="nsew")
+        self.game_frames["horse"] = self.horse_frame
         # Thanh điều hướng ngang thay cho cột trái 170px: cửa sổ app chỉ còn ~600px
         # bề ngang để đặt cạnh Chrome trên cùng màn hình.
-        nav = tk.Frame(self.root, bg=NAV)
+        nav = tk.Frame(self.baccarat_frame, bg=NAV)
         nav.pack(side="top", fill="x")
         self._label(nav, "BCR", 15, "white", True).pack(side="left", padx=(12, 6), pady=6)
         self.brand_method = self._label(nav, "", 15, "#63d6bc", True)
@@ -603,7 +645,7 @@ class BCRApp:
                                command=lambda k=key: self.show_page(k))
             button.pack(side="left", padx=2, pady=4)
             self.nav_buttons[key] = button
-        main = tk.Frame(self.root, bg=BG)
+        main = tk.Frame(self.baccarat_frame, bg=BG)
         main.pack(side="top", fill="both", expand=True, padx=10, pady=10)
         header = tk.Frame(main, bg=BG)
         header.pack(fill="x", pady=(0, 8))
@@ -694,8 +736,226 @@ class BCRApp:
         self._build_overview(self.pages["overview"])
         self._build_history(self.pages["history"])
         self._build_settings(self.pages["settings"])
+        self._build_horse_panel(self.horse_frame)
         self.root.bind("<MouseWheel>", self._scroll_page, add="+")
         self.show_page("overview")
+        self.select_game(getattr(self, "game_mode", "baccarat"))
+
+    def _build_horse_panel(self, parent):
+        """Khung UI riêng cho Đua ngựa (cửa 1/2/3, chiến thuật chờ cửa 1 + gấp thếp).
+
+        Tách hẳn khỏi widget/state của Baccarat. Chiến thuật nằm trong ``race.py``
+        (thuần trạng thái), UI chỉ hiển thị và nhập kết quả tay để chạy thử/đánh.
+        """
+        bar = tk.Frame(parent, bg=NAV)
+        bar.pack(side="top", fill="x")
+        self._label(bar, "ĐUA NGỰA", 15, "white", True).pack(side="left", padx=(12, 6), pady=6)
+        self.horse_brand = self._label(bar, "RNG Race Track", 15, "#63d6bc", True)
+        self.horse_brand.pack(side="left", padx=(0, 10))
+        body = tk.Frame(parent, bg=BG)
+        body.pack(side="top", fill="both", expand=True, padx=10, pady=10)
+
+        strategy = self._card(body)
+        strategy.pack(fill="x")
+        self._label(strategy, "Chiến thuật: chờ cửa 1 → đánh cửa 1 (gấp thếp)", 13,
+                    bold=True, anchor="w").pack(fill="x", padx=12, pady=(12, 2))
+        self._label(strategy,
+                    "Chỉ đặt cửa 1 khi tay ngay trước đó ra cửa 1. Thắng về bậc 1, "
+                    "thua lên bậc kế tiếp theo thang bên dưới.",
+                    9, MUTED, anchor="w", justify="left", wraplength=520).pack(
+                        fill="x", padx=12, pady=(0, 8))
+
+        ladder_card = self._card(body)
+        ladder_card.pack(fill="x", pady=(10, 0))
+        self._label(ladder_card, "Thang cược (12 bậc · đơn vị sảnh: 20 = 20.000đ)", 12,
+                    bold=True, anchor="w").pack(fill="x", padx=12, pady=(10, 4))
+        auto_row = tk.Frame(ladder_card, bg=PANEL)
+        auto_row.pack(fill="x", padx=12, pady=(0, 6))
+        self._label(auto_row, "Mức gốc", 9, MUTED).pack(side="left", padx=(0, 6))
+        self.race_base_var = tk.StringVar(value=str(race.DEFAULT_BASE))
+        tk.Entry(auto_row, textvariable=self.race_base_var, width=7,
+                 font=("Segoe UI", 11), relief="solid", bd=1).pack(side="left", ipady=3)
+        self._button(auto_row, "Tự động ×2", self.race_autofill, True).pack(side="left", padx=8)
+        self._label(auto_row, "nhập 20 → 20, 40, 80 … (chip sảnh)", 9, MUTED).pack(side="left")
+        grid = tk.Frame(ladder_card, bg=PANEL)
+        grid.pack(fill="x", padx=12)
+        self.race_ladder_vars = []
+        for i, stake in enumerate(race.DEFAULT_LADDER):
+            row, col = divmod(i, 3)
+            cell = tk.Frame(grid, bg=PANEL)
+            cell.grid(row=row, column=col, sticky="we", padx=(0, 8), pady=2)
+            grid.columnconfigure(col, weight=1)
+            self._label(cell, "Tay %d" % (i + 1), 8, MUTED).pack(side="left")
+            var = tk.StringVar(value=str(stake))
+            self.race_ladder_vars.append(var)
+            tk.Entry(cell, textvariable=var, width=9, font=("Segoe UI", 10),
+                     relief="solid", bd=1).pack(side="right", ipady=2)
+        self.race_ladder_note = self._label(ladder_card, "", 9, MUTED, anchor="w")
+        self.race_ladder_note.pack(fill="x", padx=12, pady=(6, 10))
+        self._apply_saved_race_ladder()
+
+        play = self._card(body)
+        play.pack(fill="x", pady=(10, 0))
+        self._label(play, "Nhập kết quả tay (1 / 2 / 3)", 12, bold=True, anchor="w").pack(
+            fill="x", padx=12, pady=(10, 4))
+        entry_row = tk.Frame(play, bg=PANEL)
+        entry_row.pack(fill="x", padx=12)
+        self.race_result_var = tk.StringVar(value="")
+        tk.Entry(entry_row, textvariable=self.race_result_var, width=4,
+                 font=("Segoe UI", 12), relief="solid", bd=1).pack(side="left", ipady=4)
+        self._button(entry_row, "Ghi tay", self.race_observe, True).pack(side="left", padx=6)
+        self._button(entry_row, "Đặt theo kế hoạch", self.race_arm).pack(side="left", padx=4)
+        self._button(entry_row, "Reset phiên", self.race_reset).pack(side="left", padx=4)
+        self._button(entry_row, "Đọc kết quả từ trang", self.race_read_live).pack(side="left", padx=4)
+        self.race_next = self._label(play, "", 11, ACCENT, True, anchor="w", justify="left",
+                                     wraplength=520)
+        self.race_next.pack(fill="x", padx=12, pady=(8, 0))
+        self.race_state = self._label(play, "", 10, TEXT, anchor="w", justify="left",
+                                      wraplength=520)
+        self.race_state.pack(fill="x", padx=12, pady=(2, 0))
+        self.race_profit = self._label(play, "", 10, MUTED, True, anchor="w")
+        self.race_profit.pack(fill="x", padx=12, pady=(2, 10))
+
+        history = self._card(body)
+        history.pack(fill="both", expand=True, pady=(10, 0))
+        self._label(history, "Lịch sử cược", 12, bold=True, anchor="w").pack(
+            fill="x", padx=12, pady=(10, 4))
+        self.race_log = self._label(history, "Chưa có tay nào.", 9, MUTED, anchor="nw",
+                                    justify="left", wraplength=520)
+        self.race_log.pack(fill="x", padx=12, pady=(0, 10))
+        self._race_refresh()
+
+    def _apply_saved_race_ladder(self):
+        """Nạp thang đã lưu; giá trị cũ tính theo đồng (>=1000) tự chia 1000 về đơn vị sảnh."""
+        saved = getattr(self, "_race_saved", None) or {}
+        ladder = saved.get("ladder")
+        base = saved.get("base")
+        if isinstance(base, str) and base.strip():
+            self.race_base_var.set(base.strip())
+        if not isinstance(ladder, list) or not ladder:
+            return
+        values = []
+        for stake in ladder:
+            try:
+                number = float(str(stake).replace(".", "").replace(",", "").strip())
+            except (TypeError, ValueError):
+                values = []
+                break
+            # Thang cũ ghi bằng đồng (2.000, 4.000...): hạ 1000 lần cho khớp chip sảnh.
+            if number >= 1000:
+                number = number / 1000.0
+            values.append(int(round(number)))
+        if values and all(v > 0 for v in values):
+            for var, stake in zip(self.race_ladder_vars, values):
+                var.set(str(stake))
+
+    def race_autofill(self):
+        """Sinh lại 12 bậc gấp thếp từ mức gốc theo đơn vị sảnh (20 → 20, 40, 80...)."""
+        stakes = race.multiply_ladder(self.race_base_var.get(), len(self.race_ladder_vars))
+        for var, stake in zip(self.race_ladder_vars, stakes):
+            var.set(str(stake))
+        self.race_sim = race.RaceSimulation(stakes)
+        self.race = self.race_sim.strategy
+        self.race.note = "Đã sinh thang %s … theo đơn vị sảnh." % (
+            "{:,}".format(stakes[0]).replace(",", "."))
+        self._race_refresh()
+
+    def _race_build(self):
+        """Dựng lại chiến thuật + sổ vốn Đua ngựa từ thang cược đang nhập."""
+        stakes = []
+        for index, var in enumerate(self.race_ladder_vars, start=1):
+            text = str(var.get()).replace(".", "").replace(",", "").strip()
+            stakes.append(text)
+        self.race_sim = race.RaceSimulation(stakes)
+        self.race = self.race_sim.strategy
+        self.race.note = "Đã nạp thang cược; chờ tay ra cửa 1."
+        return self.race
+
+    def _race_strategy(self):
+        if not getattr(self, "race", None):
+            self._race_build()
+        return self.race
+
+    def _race_sim(self):
+        if not getattr(self, "race_sim", None):
+            self._race_build()
+        return self.race_sim
+
+    def race_observe(self):
+        value = str(self.race_result_var.get()).strip()
+        if race.normalize_result(value) is None:
+            messagebox.showerror("Kết quả chưa hợp lệ",
+                                 "Nhập một cửa: 1, 2 hoặc 3.", parent=self.root)
+            return
+        self._race_strategy().settle(value)
+        self.race_result_var.set("")
+        self._race_refresh()
+
+    def race_read_live(self):
+        """Đọc kết quả Đua ngựa thật từ tab Chrome (chỉ đọc, không bấm cược)."""
+        stream = LS.LobbyStream(self.browser, human_mouse=False, game="race")
+        letters, error = stream.read_race_results("")
+
+        def apply():
+            if error or not letters:
+                self.race_state.config(text="Chưa đọc được kết quả: %s" % (error or "trống"))
+                return
+            sim = self._race_sim()
+            added = sim.ingest(letters)
+            self._race_refresh()
+            self.race_state.config(text="Đã nạp %d tay mới từ trang · %s" % (added, sim.note))
+        self.root.after(0, apply)
+
+    def race_arm(self):
+        plan = self._race_strategy().arm()
+        if plan is None:
+            self._race_refresh()
+            return
+        self._race_refresh()
+
+    def race_reset(self):
+        self._race_sim().reset()
+        self._race_refresh()
+
+    def _race_refresh(self):
+        if not hasattr(self, "race_next"):
+            return
+        s = self._race_strategy()
+        plan = s.plan()
+        display = "{:,}".format(plan.get("stake") or 0).replace(",", ".")
+        if plan["action"] == "bet":
+            self.race_next.config(text="Tay kế tiếp: ĐẶT CỬA %s · %s đv (bậc %d)" % (
+                plan["side"], display, plan.get("step", 0) + 1), fg=ACCENT)
+        else:
+            self.race_next.config(text="Tay kế tiếp: CHỜ · %s" % plan["reason"], fg=MUTED)
+        self.race_state.config(text=s.note)
+        sim = self._race_sim()
+        profit = sim.profit
+        self.race_profit.config(text="Lãi/lỗ phiên: %s%s đv · %d tay đã cược" % (
+            "+" if profit >= 0 else "-",
+            "{:,}".format(abs(int(profit / 1000.0))).replace(",", "."), len(sim.log)),
+            fg=GREEN if profit >= 0 else RED)
+        rows = s.log[-8:]
+        if not rows:
+            self.race_log.config(text="Chưa có tay nào.")
+        else:
+            lines = ["Tay %d: cửa %s · cược %s vào %s · %s" % (
+                index + 1, row["result"],
+                "{:,}".format(row["stake"]).replace(",", "."), row["bet"],
+                ("THẮNG +" if row["won"] else "THUA -") + "{:,}".format(abs(row["delta"])).replace(",", "."))
+                for index, row in enumerate(s.log[-8:], start=max(1, len(s.log) - 7))]
+            self.race_log.config(text="\n".join(lines))
+
+    def select_game(self, mode):
+        """Đổi trò đang hiển thị. Chỉ raise đúng khung, không chạy chéo logic."""
+        if mode not in self.game_frames:
+            mode = "baccarat"
+        self.game_mode = mode
+        self.game_frames[mode].tkraise()
+        for name, button in self.game_buttons.items():
+            active = name == mode
+            button.config(bg="#1d2f45" if active else "#0f1722",
+                          fg="white" if active else "#8aa0ba")
 
     def _build_overview(self, parent):
         kpis = tk.Frame(parent, bg=BG)
@@ -882,6 +1142,12 @@ class BCRApp:
         tk.Entry(live_exit_row, textvariable=self.live_exit_streak_var, width=4,
                  font=("Segoe UI", 11), relief="solid", bd=1).pack(side="left", ipady=3)
         self._label(live_exit_row, "tay (ví dụ 7: thoát ở tay bệt thứ 7)", 9, MUTED).pack(side="left", padx=(4, 0))
+        lead_row = tk.Frame(hands_row, bg=PANEL)
+        lead_row.pack(anchor="w", pady=(6, 0))
+        self._label(lead_row, "Chênh lệch tay B/P tối thiểu", 9, MUTED).pack(side="left", padx=(0, 6))
+        tk.Entry(lead_row, textvariable=self.min_lead_var, width=4,
+                 font=("Segoe UI", 11), relief="solid", bd=1).pack(side="left", ipady=3)
+        self._label(lead_row, "tay (3: P 10 vs B 13 OK · 12 vs 13 thì chờ)", 9, MUTED).pack(side="left", padx=(4, 0))
         self._label(hand_inputs, "tay", 9, MUTED).pack(side="left", padx=(4, 0))
         self._button(hand_inputs, "Lưu bộ lọc", self.apply_road_filter).pack(side="left", padx=(10, 0))
         self.hands_note = self._label(hands_row, "", 9, MUTED, justify="left", wraplength=500)
@@ -1207,22 +1473,24 @@ class BCRApp:
             high = int(self.hands_max_var.get().strip())
             streak = int(self.streak_var.get().strip())
             live_exit_streak = int(self.live_exit_streak_var.get().strip())
+            min_lead = int(self.min_lead_var.get().strip())
         except (ValueError, TypeError):
             messagebox.showerror("Bộ lọc cầu chưa hợp lệ",
-                                 "Nhập số tay đã đi tối thiểu/tối đa (ví dụ 10 và 50) "
-                                 "và số tay bệt tối đa (ví dụ 3).",
+                                 "Nhập số tay đã đi tối thiểu/tối đa (ví dụ 10 và 50), "
+                                 "số tay bệt tối đa (ví dụ 3) và chênh lệch B/P tối thiểu (ví dụ 3).",
                                  parent=self.root)
             return
-        low, high, streak = self.sim.set_road_filter(low, high, streak)
+        low, high, streak, min_lead = self.sim.set_road_filter(low, high, streak, min_lead)
         live_exit_streak = self.sim.set_live_exit_streak(live_exit_streak)
         self.hands_min_var.set(str(low))
         self.hands_max_var.set(str(high))
         self.streak_var.set(str(streak))
         self.live_exit_streak_var.set(str(live_exit_streak))
+        self.min_lead_var.set(str(min_lead))
         self._save_state()
         if hasattr(self, "hands_note"):
             self.hands_note.config(
-                text="\u0110ang l\u1ecdc s\u1ea3nh %d?%d tay; b\u1ec7t t\u1ed1i \u0111a %d tay. Trong b\u00e0n: tho\u00e1t khi b\u1ec7t \u0111\u1ea1t %d tay." % (low, high, streak, live_exit_streak), fg=GREEN)
+                text="\u0110ang l\u1ecdc s\u1ea3nh %d?%d tay; b\u1ec7t t\u1ed1i \u0111a %d tay; ch\u00eanh B/P \u2265 %d tay. Trong b\u00e0n: tho\u00e1t khi b\u1ec7t \u0111\u1ea1t %d tay." % (low, high, streak, min_lead, live_exit_streak), fg=GREEN)
         self.refresh()
 
     def apply_mouse_setting(self):
@@ -1367,13 +1635,19 @@ class BCRApp:
             self.refresh()
             return
         candidates = []
+        skipped_fast = 0
         for row in self.tables.values():
             if not row.get("table_id") or row["key"] == exclude_key or row_problem(row):
                 continue
             if not road_is_current(row):
                 continue
+            # Không săn vào bàn Siêu Tốc Độ: cửa sổ đặt cược ngắn hơn thời gian chờ
+            # khay chip + lướt chuột + xác nhận, nên mọi tay đều rơi vào not_placed.
+            if is_fast_table(row.get("label")):
+                skipped_fast += 1
+                continue
             info = ME.check_table(list(row["letters"]), self.sim.min_hands, self.sim.max_hands,
-                                  self.sim.max_streak)
+                                  self.sim.max_streak, self.sim.min_lead)
             if info["eligible"]:
                 candidates.append((info["hands"], row, info))
         if not candidates:
@@ -1384,7 +1658,10 @@ class BCRApp:
                 self.cycle_waiting = True
                 self.cycle_attempts = 0
                 self.cycle_table_key = exclude_key
-            if self._schedule_cycle_retry("Chưa có bàn đạt 3 điều kiện"):
+            reason = "Chưa có bàn đạt 3 điều kiện"
+            if skipped_fast:
+                reason += " · bỏ qua %d bàn Siêu Tốc Độ (cửa sổ cược quá ngắn)" % skipped_fast
+            if self._schedule_cycle_retry(reason):
                 return
             if self.cycle_waiting or not allow_sweep:
                 self.sweep_note_text = ("Chưa có bàn đạt 3 điều kiện · bấm “Quét toàn sảnh” để thử lại, "
@@ -2201,7 +2478,7 @@ class BCRApp:
             if time.time() - row["ts"] > LIVE_STALE:
                 continue
             info = ME.check_table(list(row["letters"]), self.sim.min_hands, self.sim.max_hands,
-                                  self.sim.max_streak)
+                                  self.sim.max_streak, self.sim.min_lead)
             ready = info["eligible"] and not row_problem(row) and road_is_current(row)
             if self.search.get().casefold() not in row["label"].casefold() or (self.only_eligible.get() and not ready):
                 continue
@@ -2526,6 +2803,10 @@ class BCRApp:
                 self.tables_var.set(str(int(saved_tables)))
             self.favorites_only.set(bool(settings.get("favorites_only", True)))
             self.human_mouse_var.set(bool(settings.get("human_mouse", True)))
+            saved_game = settings.get("game_mode", "baccarat")
+            self.game_mode = saved_game if saved_game in ("baccarat", "horse") else "baccarat"
+            self._race_saved = {"base": settings.get("race_base"),
+                                "ladder": settings.get("race_ladder")}
             self.auto_place_var.set(bool(settings.get("auto_place", True)))
             self.auto_recover_var.set(bool(settings.get("auto_recover", True)))
             saved_mode = settings.get("ladder_mode", "manual")
@@ -2533,12 +2814,15 @@ class BCRApp:
             saved_base = settings.get("ladder_base")
             if isinstance(saved_base, str) and saved_base.strip():
                 self.ladder_base_var.set(saved_base)
-            low, high, streak = self.sim.set_road_filter(settings.get("hands_min", ME.MIN_HANDS),
-                                                         settings.get("hands_max", ME.MAX_HANDS),
-                                                         settings.get("max_streak", ME.MAX_STREAK_ALLOWED))
+            low, high, streak, min_lead = self.sim.set_road_filter(
+                settings.get("hands_min", ME.MIN_HANDS),
+                settings.get("hands_max", ME.MAX_HANDS),
+                settings.get("max_streak", ME.MAX_STREAK_ALLOWED),
+                settings.get("min_lead", ME.DEFAULT_MIN_LEAD))
             self.hands_min_var.set(str(low))
             self.hands_max_var.set(str(high))
             self.streak_var.set(str(streak))
+            self.min_lead_var.set(str(min_lead))
             live_exit_streak = self.sim.set_live_exit_streak(
                 settings.get("live_exit_streak", ME.DEFAULT_LIVE_EXIT_STREAK))
             self.live_exit_streak_var.set(str(live_exit_streak))
@@ -2594,11 +2878,15 @@ class BCRApp:
                                    hands_min=self.sim.min_hands,
                                    hands_max=self.sim.max_hands,
                                    max_streak=self.sim.max_streak,
+                                   min_lead=self.sim.min_lead,
                                    live_exit_streak=self.sim.live_exit_streak,
                                   chrome_window=dict(width=window["width"], height=window["height"],
                                                      percent=window["percent"],
                                                      fullscreen=window["fullscreen"]),
-                                  chrome_url=BR.START_URL, ui_scale=self.ui_scale),
+                                   chrome_url=BR.START_URL, ui_scale=self.ui_scale,
+                                   game_mode=self.game_mode,
+                                   race_base=self.race_base_var.get(),
+                                   race_ladder=[var.get() for var in self.race_ladder_vars]),
                     money={key: getattr(book, key) for key in MONEY_FIELDS})
         try:
             temporary = self.state_file.with_suffix(".tmp")

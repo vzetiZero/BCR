@@ -42,6 +42,11 @@ STREAK_LOWER = 1
 STREAK_UPPER = 12
 MIN_HANDS = 10
 MAX_HANDS = 50
+# Chênh lệch tối thiểu giữa bên mạnh và bên yếu (B vs P). Ví dụ: P=10, B=13 (lệch 3)
+# là hợp lý; P=12, B=13 (lệch 1) quá sát, cầu dễ đổi nên không vào.
+DEFAULT_MIN_LEAD = 3
+LEAD_LOWER = 1
+LEAD_UPPER = 20
 # Người dùng chỉnh khoảng tay đã đi trong Cài đặt; hai mốc dưới là biên hợp lệ.
 HANDS_LOWER = 10
 HANDS_UPPER = 50
@@ -54,6 +59,15 @@ def normalize_streak(value=MAX_STREAK_ALLOWED, fallback=MAX_STREAK_ALLOWED):
     except (TypeError, ValueError):
         number = fallback
     return max(STREAK_LOWER, min(STREAK_UPPER, number))
+
+
+def normalize_min_lead(value=DEFAULT_MIN_LEAD, fallback=DEFAULT_MIN_LEAD):
+    """Kẹp mức chênh lệch tay tối thiểu giữa bên mạnh/yếu vào biên hợp lệ."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = fallback
+    return max(LEAD_LOWER, min(LEAD_UPPER, number))
 
 
 def normalize_hand_range(min_hands=MIN_HANDS, max_hands=MAX_HANDS):
@@ -153,10 +167,11 @@ def strong_side(results, lookback=None):
 
 
 def check_table(results, min_hands=MIN_HANDS, max_hands=MAX_HANDS,
-                max_streak=MAX_STREAK_ALLOWED):
+                max_streak=MAX_STREAK_ALLOWED, min_lead=DEFAULT_MIN_LEAD):
     """Kết luận bàn này có đủ điều kiện để vào theo nguyên tắc 1 hay không."""
     min_hands, max_hands = normalize_hand_range(min_hands, max_hands)
     max_streak = normalize_streak(max_streak)
+    min_lead = normalize_min_lead(min_lead)
     hands = len(results)
     streak_side, streak_len = has_long_streak(results, max_streak)
     already_33, pair = has_3_3(results)
@@ -179,6 +194,17 @@ def check_table(results, min_hands=MIN_HANDS, max_hands=MAX_HANDS,
         {"name": "Chưa từng có cầu 3-3", "ok": not already_33, "detail": three3_detail},
     ]
     side, detail = strong_side(results)
+    dec = E.decisions_only(results)
+    banker, player = dec.count(E.BANKER), dec.count(E.PLAYER)
+    lead = abs(banker - player)
+    # Hai bên quá sát nhau (ví dụ 12-13) thì cầu dễ đổi khi vừa vào; chỉ nhận khi
+    # bên mạnh đã bỏ xa bên yếu ít nhất ``min_lead`` tay.
+    checks.append({
+        "name": "Chênh lệch B/P tối thiểu %d tay" % min_lead,
+        "ok": lead >= min_lead,
+        "detail": "Banker %d · Player %d (lệch %d tay, cần ≥ %d)" % (
+            banker, player, lead, min_lead),
+    })
     runs = E.run_lengths(results)
     return {
         "eligible": all(c["ok"] for c in checks),
@@ -193,12 +219,13 @@ def check_table(results, min_hands=MIN_HANDS, max_hands=MAX_HANDS,
 
 def plan(results, stakes, ladder_step=0, hands_in_block=0, started=False,
          strong=None, profile=DEFAULT_PROFILE, min_hands=MIN_HANDS, max_hands=MAX_HANDS,
-         max_streak=MAX_STREAK_ALLOWED, block_mode=BLOCK_MODE_RECALCULATE):
+         max_streak=MAX_STREAK_ALLOWED, block_mode=BLOCK_MODE_RECALCULATE,
+         min_lead=DEFAULT_MIN_LEAD):
     """Bàn tay tiếp theo nên làm gì. Trả về cửa, số tiền, vị trí trong khối theo phương pháp đã chọn."""
     stakes = ladder_stakes(profile, stakes)
     cycle = strong_hands(profile)
     block = block_hands(profile)
-    info = check_table(results, min_hands, max_hands, max_streak)
+    info = check_table(results, min_hands, max_hands, max_streak, min_lead)
 
     if not started:
         if not info["eligible"]:

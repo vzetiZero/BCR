@@ -27,7 +27,7 @@ import money as M
 import table_bets as TB
 
 
-BASELINE = "BPBPBPBPBPBPBPB"
+BASELINE = "BBBPBPBPBPBPBPB"
 PLAYER_BASELINE = BASELINE.translate(str.maketrans("BP", "PB"))
 UNIT = 100_000
 CAPITAL = 100_000_000
@@ -395,7 +395,7 @@ class LiveSimulationTests(unittest.TestCase):
 
     def test_changed_history_must_be_rebound_and_reverified(self):
         sim = self.simulation(start=False)
-        changed = self.row(BASELINE + "P")
+        changed = self.row(BASELINE + "B")
         self.assertTrue(ME.check_table(list(changed["letters"]))["eligible"])
         self.assertFalse(sim.start(changed, verified=True, now=self.now))
         self.assertEqual(sim.letters, changed["letters"])
@@ -437,6 +437,30 @@ class LiveSimulationTests(unittest.TestCase):
         self.assertEqual(sim.money.hands_played, 6)
         self.assertIn("bệt Player 7 tay", sim.note)
         self.assertIsNone(sim.pending)
+
+    def test_crossing_the_lobby_hand_window_does_not_exit_a_live_table(self):
+        # 10-50 tay là bộ lọc CHỌN bàn ở sảnh; đang chơi mà vượt max_hands thì không
+        # được tự rời bàn (đúng lỗi "vào bàn vài giây rồi bị đá" trong trace).
+        book = M.MoneyBook(capital=CAPITAL, unit=UNIT, take_profit_pct=100)
+        ladder = [UNIT * m for m in (1, 3, 7, 15, 32, 64)]
+        sim = app.LiveSimulation(book, ladder=ladder, min_hands=10, max_hands=16)
+        sim.bind(self.row(BASELINE))
+        self.assertTrue(sim.start(self.row(BASELINE), verified=True, now=self.now))
+        for result in "BPBP":
+            self.settle_next(sim, result)
+            self.assertTrue(sim.running, "bệt chưa chạm ngưỡng thoát thì vẫn chơi")
+        self.assertGreater(len(sim.letters), sim.max_hands)
+        self.assertFalse(sim.filter_exit_done)
+        self.assertFalse(sim.cycle_done)
+
+    def test_a_new_3_3_shape_after_entry_does_not_exit_the_table(self):
+        sim = self.simulation()
+        letters = sim.letters + "PPPBBB"
+        self.assertTrue(ME.has_3_3(list(letters))[0])
+        self.assertFalse(sim._exit_if_table_filter_failed(letters))
+        self.assertTrue(sim.running, "3-3 chỉ là bộ lọc chọn bàn, không phải lý do rời bàn")
+        self.assertFalse(sim.filter_exit_done)
+        self.assertFalse(sim.cycle_done)
 
     def test_blocked_book_cannot_start(self):
         sim = self.simulation(start=False)
@@ -1411,6 +1435,24 @@ class FavoriteFilterTests(unittest.TestCase):
         self.assertNotIn("WebSocket", stream.last_error)
         self.assertIn("đăng nhập lại ở trang gốc", stream.last_error)
 
+    def test_find_tile_box_scrolls_until_the_tile_is_rendered(self):
+        # Lượt quét trả con trỏ về đầu danh sách nên ô bàn vừa chọn có thể chưa render.
+        # Phải lăn danh sách rồi đo lại, không được báo tile_not_found ngay.
+        stream = LS.LobbyStream(Mock(), human_mouse=False)
+        stream._try_value = Mock(side_effect=[
+            {"reason": "tile_not_found"},
+            {"tiles": [], "scroll": {"top": 0, "max": 1200, "client": 600}},
+            {"x": 10.0, "y": 20.0, "width": 300.0, "height": 400.0},
+            {"reason": "tile_not_found"},
+            {"x": 120.0, "y": 340.0, "title": "Baccarat 07"},
+        ])
+        stream._wheel_scroll_to = Mock()
+        with patch("lobby_stream.time.sleep"):
+            box = stream._find_tile_box(Mock(), 9, "t7", timeout=30)
+        self.assertEqual(box["x"], 120.0)
+        self.assertEqual(box["title"], "Baccarat 07")
+        self.assertGreaterEqual(stream._wheel_scroll_to.call_count, 1)
+
     def test_no_reader_script_asks_querySelector_for_a_namespaced_attribute(self):
         """Selector dạng [xlink:href=…] ném SyntaxError trong JS: cả đoạn đọc bàn chết,
         nên sảnh đang đầy bàn vẫn báo "chưa hiển thị danh sách bàn"."""
@@ -1829,6 +1871,31 @@ class TableCycleTests(unittest.TestCase):
             app.BCRApp.auto_open_table(host, allow_sweep=True, exclude_key="id:t1")
         self.assertTrue(host.open_table_busy)
         host.stream.open_table.assert_called_once_with("t2")
+
+    def test_fast_table_detection_keeps_regular_speed_tables(self):
+        self.assertTrue(app.is_fast_table("Siêu Tốc Độ Baccarat A"))
+        self.assertTrue(app.is_fast_table("Super Speed Baccarat"))
+        self.assertTrue(app.is_fast_table("SuperSpeed Baccarat A"))
+        self.assertFalse(app.is_fast_table("Baccarat Tốc Độ 3"))
+
+    def test_super_speed_tables_are_skipped_when_hunting(self):
+        fast = self.row("s1")
+        fast["label"] = "Siêu Tốc Độ Baccarat A"
+        host = self.host(tables={"id:s1": fast, "id:t2": self.row("t2")})
+        captured, patcher = self.started_thread()
+        with patcher:
+            app.BCRApp.auto_open_table(host, allow_sweep=True)
+        self.assertTrue(host.open_table_busy)
+        host.stream.open_table.assert_called_once_with("t2")
+
+    def test_fast_only_lobby_reports_the_skip_instead_of_opening(self):
+        fast = self.row("s1")
+        fast["label"] = "Siêu Tốc Độ Baccarat A"
+        host = self.host(tables={"id:s1": fast}, cycle_waiting=True, cycle_attempts=1)
+        app.BCRApp.auto_open_table(host, allow_sweep=True)
+        host.stream.open_table.assert_not_called()
+        self.assertIn("Siêu Tốc Độ", host.sweep_note_text)
+        self.assertEqual(host.cycle_retry_at, self.now + app.CYCLE_RETRY_SECONDS)
 
     def test_search_never_gives_up_hopes_after_the_sweeps(self):
         for attempt in range(1, 40):
@@ -2296,25 +2363,51 @@ class TableStreakFilterTests(unittest.TestCase):
         self.assertEqual(plan["action"], "bet")
         self.assertNotIn("bệt", plan["reason"])
 
+    def lead_check(self, results):
+        checks = ME.check_table(list(results))["checks"]
+        return next(c for c in checks if c["name"].startswith("Chênh lệch"))
+
+    def test_default_lead_requires_three_more_hands_on_the_strong_side(self):
+        self.assertEqual(ME.DEFAULT_MIN_LEAD, 3)
+        # P 10 · B 13 -> lệch 3, hợp lệ.
+        roomy = "BBBBBBBBBBBBB" + "PPPPPPPPPP"
+        self.assertTrue(self.lead_check(roomy)["ok"])
+        # B 13 · P 12 -> lệch 1, phải đợi cầu tách xa hơn.
+        close = "BBBBBBBBBBBBB" + "PPPPPPPPPPPP"
+        self.assertFalse(self.lead_check(close)["ok"])
+        self.assertFalse(ME.check_table(list(close))["eligible"])
+
+    def test_configured_lead_changes_the_eligibility(self):
+        close = list("BP" * 12 + "B")  # 13 B · 12 P, cầu so le nên không có bệt
+        self.assertFalse(ME.check_table(close, min_lead=3)["eligible"])
+        self.assertTrue(ME.check_table(close, min_lead=1)["eligible"])
+
+    def test_lead_is_clamped_into_its_valid_range(self):
+        self.assertEqual(ME.normalize_min_lead(0), ME.LEAD_LOWER)
+        self.assertEqual(ME.normalize_min_lead(999), ME.LEAD_UPPER)
+        self.assertEqual(ME.normalize_min_lead("x"), ME.DEFAULT_MIN_LEAD)
+
 
 class RoadFilterConfigTests(unittest.TestCase):
     """Bộ lọc cầu nằm trong Cài đặt: khoảng tay đã đi + số tay bệt tối đa, lưu xuống state."""
 
-    def host(self, low="10", high="50", streak="3", live_exit_streak="7"):
+    def host(self, low="10", high="50", streak="3", live_exit_streak="7", min_lead="3"):
         sim = app.LiveSimulation(M.MoneyBook(capital=CAPITAL, unit=UNIT))
         var = lambda value: Mock(get=lambda: value, set=Mock())
         return SimpleNamespace(sim=sim, hands_min_var=var(low), hands_max_var=var(high),
                                streak_var=var(streak), live_exit_streak_var=var(live_exit_streak),
+                               min_lead_var=var(min_lead),
                                hands_note=Mock(), root=Mock(),
                                _save_state=Mock(), refresh=Mock(), apply_settings=Mock())
 
     def test_set_road_filter_clamps_both_ranges(self):
         sim = app.LiveSimulation(M.MoneyBook(capital=CAPITAL, unit=UNIT))
-        self.assertEqual(sim.set_road_filter(12, 40, 5), (12, 40, 5))
-        self.assertEqual(sim.set_road_filter(3, 900, 99), (ME.HANDS_LOWER, ME.HANDS_UPPER,
-                                                          ME.STREAK_UPPER))
-        self.assertEqual(sim.set_road_filter(40, 12, 0), (12, 40, ME.STREAK_LOWER))
-        self.assertEqual((sim.min_hands, sim.max_hands, sim.max_streak), (12, 40, ME.STREAK_LOWER))
+        self.assertEqual(sim.set_road_filter(12, 40, 5, 4), (12, 40, 5, 4))
+        self.assertEqual(sim.set_road_filter(3, 900, 99, 99), (ME.HANDS_LOWER, ME.HANDS_UPPER,
+                                                              ME.STREAK_UPPER, ME.LEAD_UPPER))
+        self.assertEqual(sim.set_road_filter(40, 12, 0, 0), (12, 40, ME.STREAK_LOWER, ME.LEAD_LOWER))
+        self.assertEqual((sim.min_hands, sim.max_hands, sim.max_streak, sim.min_lead),
+                         (12, 40, ME.STREAK_LOWER, ME.LEAD_LOWER))
 
     def test_filter_reaches_the_plan_of_the_running_simulation(self):
         host = self.host()
@@ -2330,6 +2423,7 @@ class RoadFilterConfigTests(unittest.TestCase):
         host.hands_max_var.set.assert_called_once_with(str(ME.HANDS_UPPER))
         host.streak_var.set.assert_called_once_with(str(ME.STREAK_UPPER))
         host.live_exit_streak_var.set.assert_called_once_with("7")
+        host.min_lead_var.set.assert_called_once_with(str(ME.DEFAULT_MIN_LEAD))
         self.assertIn("bệt tối đa %d tay" % ME.STREAK_UPPER, host.hands_note.config.call_args[1]["text"])
         host._save_state.assert_called_once_with()
         host.refresh.assert_called_once_with()
@@ -3047,7 +3141,7 @@ class BrowserCdpRegressionTests(unittest.TestCase):
                 diag = dict(kind="road", scanned=15, roads=1, frame=safe_url, auth_required=False)
                 self.assertEqual(reports, [dict(page=dict(url=safe_url, title=raw["page"]["title"][:80],
                                                          table_id="table_01:2", wallet_balance=""),
-                                               tables=raw["tables"], diag=diag)])
+                                               tables=raw["tables"], race=[], diag=diag)])
                 self.assertEqual(raw, before)
                 for secret in ("QUERY_SECRET", "HASH_SECRET", "user:password", "PAGE_SECRET",
                                "DIAG_SECRET", "REPORT_SECRET"):
@@ -3919,7 +4013,7 @@ class PlacementGatedHandCountingTests(unittest.TestCase):
             plan = sim.pending
             sim.mark_placing(plan)
             sim.mark_placed(False, "chưa bấm được chip", plan)
-            road += "P" if expected % 2 else "B"
+            road += "B"
             self.assertFalse(self.next_hand(sim, road))
             self.assertEqual(sim.place_skips, expected)
         self.assertFalse(sim.running)

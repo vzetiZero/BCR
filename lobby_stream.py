@@ -35,6 +35,25 @@ RETURN_STEP_WAIT = 8.0
 # tham số nào khác ngoài table_id.
 LOBBY_LIST_FRAGMENT = "category=all_games&game=baccarat&see=baccarat"
 
+# Hồ sơ sảnh theo từng trò. Baccarat giữ nguyên hành vi cũ (mặc định). Đua ngựa dùng
+# hash riêng và chỉ đọc ô bàn game rng-racetrack; không đụng logic đọc cầu Baccarat.
+GAME_BACCARAT = {
+    "key": "baccarat",
+    "fragment": LOBBY_LIST_FRAGMENT,
+    "game_types": ("baccarat", "luckybaccarat"),
+}
+GAME_RACE = {
+    "key": "race",
+    "fragment": "category=instant_games&game=rng-racetrack",
+    "game_types": ("rng-racetrack", "racetrack", "horseracing"),
+}
+
+
+def game_profile(key="baccarat"):
+    """Trả hồ sơ sảnh theo tên trò; lạ thì về Baccarat để hành vi cũ không đổi."""
+    return GAME_RACE if str(key or "").lower() in ("race", "horse", "horse_racing") else GAME_BACCARAT
+
+
 
 def decode_results(results):
     """Trả về (letters, read_error); không suy đoán khi định dạng lạ."""
@@ -60,6 +79,38 @@ def decode_results(results):
         if isinstance(first, dict) and first.get("ties"):
             return letters, "Ô đầu có hòa: Big Road không cho biết hòa trước hay sau tay đầu."
     return letters, ""
+
+
+def decode_race_results(grids):
+    """Ghép các dãy kết quả Đua ngựa thành chuỗi '1'/'2'/'3'… (mới nhất cuối).
+
+    Chỉ nhận số 1..9 cho mỗi ván; dãy nào có giá trị lạ thì bỏ dãy đó và báo lỗi thay
+    vì đoán kết quả. Nhiều grid (sảnh + bàn) thì dùng dãy DÀI NHẤT làm chuẩn.
+    """
+    best = ""
+    if not isinstance(grids, list):
+        return "", "Không đọc được lịch sử Đua ngựa."
+    for grid in grids:
+        if not isinstance(grid, list):
+            continue
+        clean = []
+        for value in grid:
+            text = str(value or "").strip()
+            if not re.fullmatch(r"[1-9]", text):
+                clean = []
+                break
+            clean.append(text)
+        text = "".join(clean)
+        if len(text) > len(best):
+            best = text
+    if not best:
+        return "", "Chưa đọc được kết quả Đua ngựa từ lịch sử ô bàn."
+    return best, ""
+
+
+def single_grid_results(values):
+    """Chuẩn hoá kết quả một dãy lịch sử Đua ngựa (dùng cho lượt đọc trong bàn)."""
+    return decode_race_results([values])
 
 
 def is_special(table):
@@ -121,6 +172,29 @@ TILES_JS = """(() => {
     }).filter((r) => r.id), scroll: (() => { const sc = pick(); return {top: sc.scrollTop, max: sc.scrollHeight, client: sc.clientHeight}; })()};
 })()"""
 
+# Đọc lịch sử Đua ngựa: mỗi ô [data-role="history-grid"] là một dãy kết quả ván gần
+# nhất (chuỗi số 1..N). Trong ô bàn sảnh và trên màn hình bàn đều dùng cùng role nên
+# một hàm đọc được cả hai chỗ; trả về chuỗi số theo thứ tự cũ -> mới.
+RACE_HISTORY_JS = """(() => {
+    const id = %s;
+    const out = [];
+    for (const grid of document.querySelectorAll('[data-role="history-grid"]')) {
+        if (id) {
+            const tile = grid.closest('[data-role="table-tile"]');
+            const key = tile && Object.keys(tile).find((n) => n.startsWith('__reactFiber$'));
+            let f = key ? tile[key] : null;
+            while (f && !(f.memoizedProps && f.memoizedProps.table && f.memoizedProps.table.id === id)) f = f.return;
+            if (!f) continue;
+        }
+        const values = [...grid.querySelectorAll('*')]
+            .filter((n) => n.children.length === 0)
+            .map((n) => (n.textContent || '').trim())
+            .filter((t) => /^[0-9]{1,2}$/.test(t));
+        if (values.length) out.push(values);
+    }
+    return {grids: out};
+})()"""
+
 SCROLL_JS = """(() => {
     let n = document.querySelector('[data-role="table-tile"]');
     while (n) {
@@ -153,20 +227,26 @@ SCROLL_BOX_JS = """(() => {
 
 TILE_BOX_JS = """(() => {
     const id = %s;
+    const found = [];
     for (const tile of document.querySelectorAll('[data-role="table-tile"]')) {
-        if (tile.getAttribute('data-open') !== 'true') continue;
         const key = Object.keys(tile).find((n) => n.startsWith('__reactFiber$'));
         let f = key ? tile[key] : null;
         while (f && !(f.memoizedProps && f.memoizedProps.table && f.memoizedProps.table.gameDetails)) f = f.return;
         if (!f || f.memoizedProps.table.id !== id) continue;
-        tile.scrollIntoView({block: 'center'});
-        const rect = tile.getBoundingClientRect();
-        if (rect.width < 20 || rect.height < 20 || rect.top < 0 || rect.bottom > innerHeight
-                || rect.left < 0 || rect.right > innerWidth) return {reason: 'tile_offscreen'};
-        return {x: rect.x + rect.width / 2, y: rect.y + rect.height / 2,
-                title: f.memoizedProps.table.title || id};
+        found.push({tile, title: f.memoizedProps.table.title || id});
     }
-    return {reason: 'tile_not_found'};
+    // Sảnh có thể chưa gắn data-open (markup đổi) hoặc render một bản sao mờ của ô:
+    // ưu tiên ô mở được, nhưng vẫn dùng ô khớp id thay vì báo tile_not_found oan.
+    if (!found.length) return {reason: 'tile_not_found'};
+    const chosen = found.find((m) => m.tile.getAttribute('data-open') === 'true') || found[0];
+    const tile = chosen.tile;
+    tile.scrollIntoView({block: 'center'});
+    const rect = tile.getBoundingClientRect();
+    if (rect.width < 20 || rect.height < 20) return {reason: 'tile_hidden'};
+    if (rect.top < 0 || rect.bottom > innerHeight || rect.left < 0 || rect.right > innerWidth) {
+        return {reason: 'tile_offscreen'};
+    }
+    return {x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, title: chosen.title};
 })()"""
 
 
@@ -328,27 +408,32 @@ LIST_HASH_JS = """(() => {
 })()"""
 
 
-def lobby_list_url(url):
+def lobby_list_url(url, fragment=None):
     """URL sảnh tổng của chính tab đang mở bàn: giữ origin/path, bỏ table_id.
 
     Giữ các tham số còn lại của hash/query (category, game, see…) để về đúng chế độ
-    xem sảnh người dùng đang dùng; không còn gì thì dùng hash danh sách mặc định.
+    xem sảnh người dùng đang dùng; không còn gì thì dùng hash danh sách mặc định
+    (``fragment`` truyền vào cho từng trò; mặc định Baccarat).
     """
     parsed = urlsplit(url)
 
     def keep(part):
         return [p for p in part.split("&") if p and p.split("=", 1)[0] != "table_id"]
 
-    fragment = "&".join(keep(parsed.fragment)) or LOBBY_LIST_FRAGMENT
+    default_fragment = fragment or LOBBY_LIST_FRAGMENT
+    kept = keep(parsed.fragment)
+    fragment_part = "&".join(kept) or default_fragment
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path,
-                       "&".join(keep(parsed.query)), fragment))
+                       "&".join(keep(parsed.query)), fragment_part))
 
 
 class LobbyStream:
     """Đọc luồng message sảnh qua CDP chỉ đọc trên Chrome đang mở."""
 
-    def __init__(self, session=None, human_mouse=True):
+    def __init__(self, session=None, human_mouse=True, game="baccarat"):
         self.session = session or BR.BrowserSession()
+        self.profile = game_profile(game)
+        self.game = self.profile["key"]
         self.note = ""
         self.last_error = ""
         self.diag = {}
@@ -608,6 +693,53 @@ class LobbyStream:
                 return context_id, snapshot
             time.sleep(1.5)
 
+    def read_race_results(self, table_id=""):
+        """Đọc kết quả Đua ngựa từ lịch sử ô bàn/màn hình bàn hiện tại.
+
+        Trả về (chuỗi '1'/'2'/'3'…, lỗi). Không cần WebSocket vì game đua ngựa vẽ
+        lịch sử trực tiếp trong ``[data-role="history-grid"]``. Chỉ đọc, không bấm.
+        """
+        ws = None
+        self.last_error = ""
+        try:
+            page = self.session._cdp_page()
+            if page is None:
+                self.last_error = "Không có tab sảnh Đua ngựa trong Chrome CDP 9222."
+                return "", self.last_error
+            import websocket
+            ws = websocket.create_connection(BR.validated_endpoint(page), suppress_origin=True,
+                                             timeout=BR.SCRIPT_TIMEOUT, redirect_limit=0,
+                                             http_no_proxy=["127.0.0.1", "localhost", "::1"])
+            self._command(ws, "Runtime.enable")
+            context_id = None
+            for candidate in list(self.contexts) or [None]:
+                if candidate is None and len(self.contexts) != 0:
+                    continue
+                value = self._try_value(ws, RACE_HISTORY_JS % json.dumps(table_id or ""),
+                                        candidate)
+                if isinstance(value, dict) and value.get("grids"):
+                    context_id = candidate
+                    grids = value.get("grids")
+                    break
+            if context_id is None and not self.contexts:
+                # Chưa kịp nhận executionContextCreated: thử context mặc định 1.
+                value = self._try_value(ws, RACE_HISTORY_JS % json.dumps(table_id or ""), 1)
+                grids = value.get("grids") if isinstance(value, dict) else None
+            if not isinstance(grids, list) or not grids:
+                self.last_error = "Chưa thấy lịch sử Đua ngựa trên trang."
+                return "", self.last_error
+            return decode_race_results(grids)
+        except Exception as exc:
+            self.last_error = (BR.CDP_CLOSED_NOTE if BR.cdp_port_closed(exc) else
+                               "Không đọc được kết quả Đua ngựa (%s)." % type(exc).__name__)
+            return "", self.last_error
+        finally:
+            if ws is not None:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+
     def sweep(self, max_seconds=75, favorites_only=False):
         """Cuộn hết danh sách để sảnh gửi lịch sử mọi bàn, rồi trả về danh sách bàn.
 
@@ -761,8 +893,103 @@ class LobbyStream:
                 except Exception:
                     pass
 
+    def sweep_race(self, max_seconds=45):
+        """Liệt kê bàn Đua ngựa từ DOM sảnh: mã bàn, tên, dãy kết quả đọc từ history-grid."""
+        self._reset()
+        self.note = ""
+        ws = None
+        try:
+            page = self.session._cdp_page()
+            if page is None:
+                self.last_error = "Không có tab sảnh Đua ngựa trong Chrome CDP 9222."
+                return []
+            import websocket
+            ws = websocket.create_connection(BR.validated_endpoint(page), suppress_origin=True,
+                                             timeout=BR.SCRIPT_TIMEOUT, redirect_limit=0,
+                                             http_no_proxy=["127.0.0.1", "localhost", "::1"])
+            self._command(ws, "Runtime.enable")
+            deadline = time.monotonic() + max(1.0, float(max_seconds))
+            snapshot, context_id = None, None
+            while time.monotonic() < deadline:
+                context_id, snapshot = self._lobby_context(ws)
+                if context_id is not None:
+                    break
+                time.sleep(1.5)
+            if context_id is None or not isinstance(snapshot, dict):
+                self.last_error = "Sảnh chưa hiển thị danh sách bàn Đua ngựa."
+                return []
+            tiles = snapshot.get("tiles") or []
+            rows = []
+            for tile in tiles:
+                game_type = (tile.get("game_type") or "").lower()
+                if game_type and game_type not in self.profile["game_types"] and not any(
+                        marker in game_type for marker in ("race", "horse")):
+                    continue
+                table_id = tile.get("id") or ""
+                value = self._try_value(ws, RACE_HISTORY_JS % json.dumps(table_id), context_id)
+                grids = value.get("grids") if isinstance(value, dict) else []
+                letters, error = decode_race_results(grids)
+                rows.append({
+                    "table_id": table_id,
+                    "label": tile.get("title") or table_id,
+                    "letters": letters,
+                    "game_type": tile.get("game_type") or "",
+                    "read_error": error,
+                    "source": "evo-race-grid",
+                })
+            self.note = "Đọc %d bàn Đua ngựa." % len(rows)
+            return rows
+        except Exception as exc:
+            self.last_error = (BR.CDP_CLOSED_NOTE if BR.cdp_port_closed(exc) else
+                               "Không quét được sảnh Đua ngựa (%s)." % type(exc).__name__)
+            return []
+        finally:
+            if ws is not None:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+
+    def _find_tile_box(self, ws, context_id, table_id, timeout=15.0):
+        """Tìm toạ độ ô bàn, cuộn danh sách nếu ô chưa được render.
+
+        Sảnh chỉ render các ô đang nằm trong khung nhìn; lượt quét gom ô ở mọi vị trí
+        cuộn rồi trả con trỏ về đầu danh sách. Vì vậy bàn vừa chọn có thể không còn
+        trong DOM lúc mở — phải lăn tới đúng chỗ rồi mới đo, thay vì báo tile_not_found
+        rồi bỏ bàn oan (4 lần liên tiếp trong bcr_trace.jsonl).
+        """
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        box = self._try_value(ws, TILE_BOX_JS % json.dumps(table_id), context_id)
+        if isinstance(box, dict) and "x" in box:
+            return box
+        snapshot = self._try_value(ws, TILES_JS, context_id)
+        if not isinstance(snapshot, dict):
+            return box
+        scroll = snapshot.get("scroll") or {}
+        try:
+            bottom = max(int(scroll.get("max") or 0) - int(scroll.get("client") or 0), 0)
+        except (TypeError, ValueError):
+            bottom = 0
+        scroll_box = self._try_value(ws, SCROLL_BOX_JS, context_id)
+        scroll_box = scroll_box if isinstance(scroll_box, dict) else None
+        position, steps = 0, 0
+        while time.monotonic() < deadline and steps < MAX_SCROLL_STEPS:
+            try:
+                self._wheel_scroll_to(ws, context_id, position, scroll_box)
+                time.sleep(SCROLL_SETTLE)
+                box = self._try_value(ws, TILE_BOX_JS % json.dumps(table_id), context_id)
+            except Exception:
+                break
+            if isinstance(box, dict) and "x" in box:
+                return box
+            if position >= bottom:
+                break
+            position = min(position + SCROLL_STEP, bottom)
+            steps += 1
+        return box
+
     def open_table(self, table_id, wait_seconds=25):
-        """Mở bàn bằng pointer event thật trên đúng ô data-open của sảnh; không chạm khu vực cược."""
+        """Mở bàn bằng pointer event thật trên ô bàn của sảnh; không chạm khu vực cược."""
         if not BR.valid_table_id(table_id):
             return False, "Mã bàn không hợp lệ."
         ws = None
@@ -781,11 +1008,14 @@ class LobbyStream:
                 if self._lost_session(ws):
                     return False, self.last_error
                 return False, "Sảnh chưa hiển thị danh sách bàn; hãy mở lại trang Baccarat."
-            box = self._value(ws, TILE_BOX_JS % json.dumps(table_id), context_id)
+            # Ô bàn ngoài khung nhìn chưa chắc đã render: dành riêng một cửa sổ để lăn
+            # danh sách tìm ô, rồi vẫn giữ trọn thời gian chờ điều hướng sau cú bấm.
+            find_timeout = min(15.0, max(3.0, float(wait_seconds) - 8.0))
+            box = self._find_tile_box(ws, context_id, table_id, timeout=find_timeout)
             if not isinstance(box, dict) or "x" not in box:
                 return False, "Không tìm thấy ô bàn để mở (%s)." % (box or {}).get("reason", "tile_missing")
             self._click_at(ws, box["x"], box["y"])
-            deadline = time.monotonic() + wait_seconds
+            deadline = time.monotonic() + max(5.0, float(wait_seconds))
             pattern = re.compile(r"[?&#]table_id=%s(?=&|$)" % re.escape(table_id))
             while time.monotonic() < deadline:
                 time.sleep(1.5)
