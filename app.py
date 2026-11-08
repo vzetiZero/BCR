@@ -712,20 +712,7 @@ class BCRApp:
             note.pack(anchor="w", padx=8, pady=(2, 8))
             self.kpi_values.append(value)
             self.kpi_notes.append(note)
-        # Cầu (B/P/T, Big Road) không hiển thị ở app nữa — xem trực tiếp trong Chrome.
-        # Khối này chỉ còn đường vốn để theo dõi tiền; tên bàn hiện nhỏ ở góc làm ngữ cảnh.
-        equity = self._card(parent)
-        equity.pack(fill="x", pady=(0, 10))
-        equity_head = tk.Frame(equity, bg=PANEL)
-        equity_head.pack(fill="x", padx=10, pady=(10, 2))
-        self._label(equity_head, "ĐƯỜNG VỐN", 8, MUTED, True).pack(side="left")
-        self.road_title = self._label(equity_head, "Chưa chọn bàn", 9, MUTED, anchor="e")
-        self.road_title.pack(side="right", fill="x", expand=True)
-        self.canvases = {}
-        canvas = tk.Canvas(equity, bg=PANEL, height=150, width=200, highlightthickness=0)
-        canvas.pack(fill="both", expand=True, padx=10, pady=(2, 10))
-        self.canvases["equity"] = canvas
-        canvas.bind("<Configure>", lambda _e: self._draw_canvas("equity"))
+        # Cầu và đường vốn không hiển thị ở app — xem trực tiếp trong Chrome.
         plan = self._card(parent)
         plan.pack(fill="x", pady=(0, 10))
         self._label(plan, "KẾ HOẠCH TAY TIẾP THEO", 8, MUTED, True).pack(anchor="w", padx=10, pady=(10, 2))
@@ -2338,7 +2325,6 @@ class BCRApp:
         if hasattr(self, "tables_note"):
             self.tables_note.config(text="Số bàn muốn chơi: %d · đã xong %d bàn trong phiên." % (
                 self._tables_target(), self.tables_done), fg=MUTED)
-        self.road_title.config(text=self.sim.table_name)
         plan = self.sim.pending or self.sim.plan()
         side = plan["side"]
         self.plan_side.config(text=E.SIDE_NAME.get(side, "CHỜ BÀN").upper(), fg=COLORS.get(side, MUTED))
@@ -2355,8 +2341,6 @@ class BCRApp:
         self.checks_label.config(text="\n".join(("Đạt · " if c["ok"] else "Chờ · ") + c["name"] for c in plan["checks"]))
         self._update_chip_status()
         self.sim_note.config(text=self.sim.note, fg=ACCENT if self.sim.running else MUTED)
-        for key in self.canvases:
-            self._draw_canvas(key)
         self._render_tables()
         self.history_note.config(text="%d tay · %d thắng / %d thua / %d hòa · Lãi/lỗ %s VN2\nSụt vốn lớn nhất: %s đ" % (
             book.hands_played, book.wins, book.losses, book.pushes, signed(book.profit), M.fmt_money(book.max_drawdown)))
@@ -2382,24 +2366,6 @@ class BCRApp:
                         row.get("bet", ""), row.get("result", ""), M.fmt_money(row.get("stake", 0)),
                         signed(row.get("delta", 0)), M.fmt_money(row.get("balance_after", 0))))
             self.history_size = len(self.sim.log)
-
-    def _draw_canvas(self, key):
-        canvas = self.canvases[key]
-        w, h = canvas.winfo_width(), canvas.winfo_height()
-        if w < 20 or h < 20:
-            return
-        canvas.delete("all")
-        if not self.sim.log:
-            canvas.create_text(w / 2, h / 2, text="Chưa có dữ liệu đối chiếu từ site", fill=MUTED, font=("Segoe UI", 11))
-            return
-        values = [self.sim.money.start_capital] + [r["balance_after"] for r in self.sim.log]
-        low, high = min(values), max(values)
-        span = max(high - low, self.sim.money.unit)
-        coords = []
-        for i, v in enumerate(values):
-            coords.extend((18 + i / (len(values) - 1) * (w - 36), h - 30 - (v - low) / span * (h - 52)))
-        canvas.create_line(*coords, fill=ACCENT, width=3)
-        canvas.create_text(18, 12, anchor="w", text="Vốn · " + M.fmt_money(values[-1]) + " VN2", fill=MUTED)
 
     def export_csv(self):
         if not self.sim.log:
