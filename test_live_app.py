@@ -1930,14 +1930,15 @@ class TableCycleTests(unittest.TestCase):
         host.sweep_lobby.assert_not_called()
         self.assertIn("tự quét lại sau %d giây" % app.CYCLE_RETRY_SECONDS, host.sweep_note_text)
 
-    def test_first_scan_without_eligible_table_starts_auto_hunt_countdown(self):
+    def test_first_scan_without_eligible_table_rescans_immediately(self):
         host = self.host()
         app.BCRApp.auto_open_table(host, allow_sweep=True)
         self.assertTrue(host.cycle_waiting)
         self.assertEqual(host.cycle_attempts, 1)
-        self.assertEqual(host.cycle_retry_at, self.now + app.CYCLE_RETRY_SECONDS)
+        # Lượt đầu tiên phải quét lại NGAY, không nghỉ 15 giây.
+        self.assertEqual(host.cycle_retry_at, self.now)
         host.sweep_lobby.assert_not_called()
-        self.assertIn("tự quét lại sau %d giây" % app.CYCLE_RETRY_SECONDS, host.sweep_note_text)
+        self.assertIn("quét lại ngay", host.sweep_note_text)
 
     def test_a_single_manual_sweep_button_still_sweeps_once(self):
         host = self.host(auto_hunt_var=Mock(get=lambda: False))
@@ -1954,13 +1955,29 @@ class TableCycleTests(unittest.TestCase):
         self.assertIn("Tự quét tìm bàn", host.sweep_note_text)
 
     def test_failed_join_rearms_the_hunt_on_the_next_table(self):
-        host = self.host(cycle_waiting=True, cycle_table_key="id:t1")
+        host = self.host(cycle_waiting=True, cycle_table_key="id:t1", cycle_attempts=1)
         app.BCRApp._schedule_cycle_retry(host, "Không mở được bàn (RuntimeError).", exclude_key="id:t9")
         self.assertEqual((host.cycle_table_key, host.cycle_retry_at),
                          ("id:t9", self.now + app.CYCLE_RETRY_SECONDS))
         self.assertTrue(host.cycle_waiting)
 
-    def test_back_to_lobby_failure_without_hunt_ends_the_cycle(self):
+    def test_enabling_auto_hunt_scans_immediately(self):
+        host = self.host()
+        host._save_state = Mock()
+        host._on_hunt_toggle = MethodType(app.BCRApp._on_hunt_toggle, host)
+        app.BCRApp._on_hunt_toggle(host)
+        self.assertTrue(host.cycle_waiting)
+        self.assertEqual(host.cycle_retry_at, 0.0)
+        host.sweep_lobby.assert_called_once_with()
+
+    def test_sweep_note_colors_signal_state(self):
+        host = self.host()
+        color = lambda text: app.BCRApp._sweep_note_color(host, text)
+        self.assertEqual(color("Đang quét sảnh…"), app.GREEN)
+        self.assertEqual(color("Đã vào bàn và bắt đầu theo dõi"), app.GREEN)
+        self.assertEqual(color("Gắn Chrome đang mở trước."), app.RED)
+        self.assertEqual(color("Chưa có bàn đạt 3 điều kiện"), app.RED)
+        self.assertEqual(color("Một dòng trung tính"), app.ACCENT)
         host = self.host(cycle_waiting=True, auto_hunt_var=Mock(get=lambda: False))
         note = "Không về được sảnh (RuntimeError)."
         if not app.BCRApp._schedule_cycle_retry(host, note):

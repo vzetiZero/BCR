@@ -1169,7 +1169,7 @@ class BCRApp:
                                           activebackground=PANEL, font=("Segoe UI", 10))
         self.cycle_check.pack(anchor="w")
         self.hunt_check = tk.Checkbutton(cycle, text="Tự quét tìm bàn tới khi vào được (nghỉ %d giây)" % CYCLE_RETRY_SECONDS,
-                                         variable=self.auto_hunt_var, command=self._save_state,
+                                         variable=self.auto_hunt_var, command=self._on_hunt_toggle,
                                          bg=PANEL, fg=TEXT, selectcolor=PALE, activebackground=PANEL,
                                          font=("Segoe UI", 10))
         self.hunt_check.pack(anchor="w")
@@ -1698,6 +1698,24 @@ class BCRApp:
         threading.Thread(target=work, daemon=True).start()
         self.refresh()
 
+    def _on_hunt_toggle(self):
+        """Bật “Tự quét” thì quét NGAY lần đầu, không chờ hết chu kỳ nghỉ."""
+        self._save_state()
+        if not self.auto_hunt_var.get():
+            return
+        if self.sim.running or self.cycle_waiting or self.sweep_busy:
+            return
+        if not self._cdp_available():
+            self.sweep_note_text = "Gắn Chrome đang mở trước rồi bật “Tự quét”."
+            self.refresh()
+            return
+        # Vào vòng săn và kích hoạt lượt quét đầu tiên ngay lập tức.
+        self.cycle_waiting = True
+        self.cycle_attempts = 0
+        self.cycle_table_key = None
+        self.cycle_retry_at = 0.0
+        self.sweep_lobby()
+
     def cancel_auto_hunt(self):
         """Người dùng chủ động dừng vòng tự quét tìm bàn."""
         self.cycle_waiting = False
@@ -1718,10 +1736,18 @@ class BCRApp:
             return False
         if exclude_key:
             self.cycle_table_key = exclude_key
+        # Lượt đầu tiên của vòng tự quét phải chạy NGAY: trước đây luôn nghỉ 15 giây
+        # nên lần bấm “Tự quét” đầu tiên trông như bị treo. Chỉ áp dụng cho việc SĂN BÀN;
+        # chốt lời/sai bộ lọc vẫn nghỉ để tránh đóng bàn liên tục.
+        hunting = not (getattr(self.sim, "take_profit_done", False)
+                       or getattr(self.sim, "filter_exit_done", False))
+        first_attempt = hunting and self.cycle_attempts == 0
         self.cycle_attempts += 1
-        self.cycle_retry_at = time.time() + CYCLE_RETRY_SECONDS
-        self.sweep_note_text = ("%s · tự quét lại sau %d giây (đã thử %d lượt)." % (
-            reason, CYCLE_RETRY_SECONDS, self.cycle_attempts))
+        wait = 0 if first_attempt else CYCLE_RETRY_SECONDS
+        self.cycle_retry_at = time.time() + wait
+        self.sweep_note_text = ("%s · quét lại ngay…" % reason if first_attempt else
+                                "%s · tự quét lại sau %d giây (đã thử %d lượt)." % (
+                                    reason, CYCLE_RETRY_SECONDS, self.cycle_attempts))
         self.refresh()
         return True
 
@@ -2584,6 +2610,22 @@ class BCRApp:
         else:
             self.hunt_banner.pack(fill="x", pady=(0, 12))
 
+    def _sweep_note_color(self, text):
+        """Màu dòng trạng thái quét để người dùng nhận biết nhanh trạng thái.
+
+        Lỗi/không đạt → đỏ; đang quét/đang mở/mở thành công → xanh lá; còn lại trung tính.
+        """
+        text = str(text or "")
+        bad = ("Chưa", "không", "Không", "Gắn Chrome", "Tạm dừng", "Dừng", "lỗi", "Lỗi",
+               "thất bại", "mất phiên", "Chưa bật")
+        good = ("Đang quét", "Đang mở", "Đã vào bàn", "Đã nhận", "Đã bật", "Đã lưu",
+                "đang quét lại", "quét lại ngay")
+        if any(word in text for word in bad):
+            return RED
+        if any(word in text for word in good):
+            return GREEN
+        return ACCENT
+
     def refresh(self):
         book = self.sim.money
         decisive = book.wins + book.losses
@@ -2608,7 +2650,8 @@ class BCRApp:
         self.sweep_button.config(state="disabled" if self.chrome_busy or self.sweep_busy else "normal")
         self.auto_open_button.config(state="disabled" if self.chrome_busy or self.sweep_busy
                                      or self.open_table_busy else "normal")
-        self.sweep_note.config(text=self.sweep_note_text)
+        self.sweep_note.config(text=self.sweep_note_text,
+                               fg=self._sweep_note_color(self.sweep_note_text))
         self._refresh_hunt_banner()
         if hasattr(self, "tables_note"):
             self.tables_note.config(text="Số bàn muốn chơi: %d · đã xong %d bàn trong phiên." % (
