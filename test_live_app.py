@@ -223,22 +223,15 @@ class LiveSimulationTests(unittest.TestCase):
     def test_repeat_block_mode_keeps_first_opening_side_each_six_hands(self):
         sim = self.simulation()
         sim.block_mode = ME.BLOCK_MODE_REPEAT
-        # Initial strong side is Banker for this baseline. Ties advance the block
-        # without changing the eligible road or ladder step; each block retains
-        # the same Banker-first, then Player sequence.
-        for _ in range(6):
-            self.settle_next(sim, E.TIE)
-        self.assertEqual(sim.pending["side"], E.BANKER)
-        self.assertEqual(sim.pending["block_pos"], 0)
-        for _ in range(6):
-            self.settle_next(sim, E.TIE)
-        self.assertEqual(sim.pending["side"], E.BANKER)
-        self.assertEqual(sim.pending["block_pos"], 0)
+        # Initial strong side is Banker for this baseline. Only decisive hands
+        # advance the block; each block retains the same Banker-first, then
+        # Player sequence. Alternating results keep the road eligible.
+        for index in range(12):
+            self.settle_next(sim, "B" if index % 2 == 0 else "P")
+            if index % 6 == 5:
+                self.assertEqual(sim.pending["side"], E.BANKER)
+                self.assertEqual(sim.pending["block_pos"], 0)
         self.assertEqual([row["bet"] for row in sim.log], list("BBBPPPBBBPPP"))
-        for _ in range(6):
-            self.settle_next(sim, E.TIE)
-        self.assertEqual(sim.pending["side"], E.BANKER)
-        self.assertEqual(sim.pending["block_pos"], 0)
 
 
     def snapshot(self, sim):
@@ -489,28 +482,44 @@ class LiveSimulationTests(unittest.TestCase):
                 self.assertEqual(sim.method_state["ladder_step"], 1)
                 self.assertEqual(sim.pending["stake"], 3 * UNIT)
 
-    def test_ties_count_cycle_hands_but_hold_ladder_and_refund_stake(self):
+    def test_ties_do_not_count_cycle_hands_hold_ladder_and_refund_stake(self):
         sim = self.simulation()
         self.settle_next(sim, "P")
-        for index, side in enumerate("BBPPP", start=1):
-            self.assertEqual(sim.pending["side"], side)
+        # Hoà liên tiếp: tiền hoàn, bậc giữ nguyên, khối vẫn đứng ở tay 2/6 cửa B.
+        for _ in range(5):
+            self.assertEqual(sim.pending["side"], "B")
             self.assertEqual(sim.pending["stake"], 3 * UNIT)
-            self.assertEqual(sim.pending["block_pos"], index)
+            self.assertEqual(sim.pending["block_pos"], 1)
             entry = self.settle_next(sim, "T")
             self.assertEqual((entry["delta"], entry["outcome"]), (0, "push"))
-            self.assertEqual(sim.money.profit, -UNIT)
             self.assertEqual(sim.method_state["ladder_step"], 1)
-            self.assertEqual(sim.method_state["hands_in_block"], (index + 1) % 6)
-        # Hết 6 tay vẫn ở lại bàn: khối kế tiếp được chốt ngay, không rời bàn.
+            self.assertEqual(sim.method_state["hands_in_block"], 1)
+        self.assertEqual(sim.money.profit, -UNIT)
+        # Tay phân thắng bại mới đẩy khối: thắng B -> về bậc 1, tay 3/6 vẫn cửa B.
+        entry = self.settle_next(sim, "B")
+        self.assertEqual(entry["outcome"], "win")
+        self.assertEqual(sim.method_state["ladder_step"], 0)
+        self.assertEqual(sim.method_state["hands_in_block"], 2)
+        self.assertEqual(sim.pending["side"], "B")
+        self.assertEqual(sim.pending["block_pos"], 2)
         self.assertTrue(sim.running)
         self.assertFalse(sim.cycle_done)
         self.assertFalse(sim.take_profit_done)
-        self.assertEqual(sim.pending["block_pos"], 0)
-        self.assertEqual(sim.pending["side"], sim.pending["strong"])
-        self.assertEqual((sim.money.hands_played, sim.money.pushes, sim.money.loss_streak), (6, 5, 1))
-        self.assertEqual(sim.money.total_staked, 16 * UNIT)
-        self.assertEqual(sim.money.total_returned, 15 * UNIT)
+        self.assertEqual((sim.money.hands_played, sim.money.pushes, sim.money.loss_streak), (7, 5, 0))
+        self.assertEqual(sim.money.total_staked, 19 * UNIT)
         self.assertEqual(sim.money.ties_bet, 0)
+
+    def test_tie_between_player_hands_keeps_the_next_hand_on_player(self):
+        sim = self.simulation(PLAYER_BASELINE)
+        self.assertEqual(sim.pending["side"], "P")
+        self.settle_next(sim, "P")
+        self.settle_next(sim, "T")
+        self.assertEqual(sim.pending["side"], "P")
+        self.assertEqual(sim.pending["block_pos"], 1)
+        self.settle_next(sim, "P")
+        self.assertEqual(sim.pending["side"], "P")
+        self.assertEqual(sim.pending["block_pos"], 2)
+        self.assertEqual([row["bet"] for row in sim.log], ["P", "P", "P"])
 
     def test_cycle_bets_three_strong_then_three_opposite_for_either_side(self):
         for baseline, expected in ((BASELINE, "BBBPPP"), (PLAYER_BASELINE, "PPPBBB")):
@@ -519,8 +528,8 @@ class LiveSimulationTests(unittest.TestCase):
                 for position, side in enumerate(expected):
                     self.assertEqual(sim.pending["side"], side)
                     self.assertEqual(sim.pending["block_pos"], position)
-                    self.assertEqual(sim.pending["stake"], UNIT)
-                    self.settle_next(sim, "T")
+                    # Kết quả xen kẽ để cầu vẫn hợp lệ; chỉ tay phân thắng bại đẩy khối.
+                    self.settle_next(sim, expected[0] if position % 2 == 0 else expected[-1])
                 self.assertEqual("".join(entry["bet"] for entry in sim.log), expected)
                 # Hết khối thì lặp lại tại chỗ: tay kế tiếp mở khối mới cùng bàn.
                 self.assertTrue(sim.running)

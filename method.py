@@ -8,7 +8,8 @@ Quy tắc của người dùng:
 2. Cầu đang mạnh bên nào -> đánh mấy tay đầu khối bên đó, rồi đổi sang bên kia mấy tay còn lại.
    Khối 3-3 đi 6 tay, khối 3-2 đi 5 tay.
 3. Thắng thì quay về bậc 1. Thua thì sang bậc kế tiếp trong danh sách mức cược người dùng nhập.
-4. Cầu hoà (Tie) vẫn tính là 1 tay của chu kỳ; tiền được hoàn lại nên không lên bậc.
+4. Cầu hoà (Tie) không tính là tay của chu kỳ: tiền được hoàn lại, không lên bậc,
+   vị trí trong khối giữ nguyên nên tay kế tiếp vẫn đánh cửa cũ cho đủ số tay.
 """
 
 import math
@@ -330,11 +331,15 @@ def settle(bet_side, result, stake, commission=0.95):
 
 
 def advance(state, result, bet_side, stake, profile=DEFAULT_PROFILE):
-    """Cập nhật trạng thái sau một tay. state: dict(ladder_step, hands_in_block, started, strong)."""
+    """Cập nhật trạng thái sau một tay. state: dict(ladder_step, hands_in_block, started, strong).
+
+    Tay hoà không đẩy vị trí trong khối: tay kế tiếp vẫn đánh cửa cũ cho đủ số tay.
+    """
     delta, outcome, step_action = settle(bet_side, result, stake)
     state = dict(state)
-    state["hands_in_block"] = 0 if state.get("hands_in_block", 0) + 1 >= block_hands(profile) \
-        else state["hands_in_block"] + 1
+    if result != E.TIE:
+        state["hands_in_block"] = 0 if state.get("hands_in_block", 0) + 1 >= block_hands(profile) \
+            else state["hands_in_block"] + 1
     if step_action == "up":
         state["ladder_step"] = state.get("ladder_step", 0) + 1
     elif step_action == "reset":

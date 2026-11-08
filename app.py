@@ -447,7 +447,8 @@ class LiveSimulation:
                              delta=settled["delta"], outcome=settled["outcome"],
                              balance_after=self.money.balance, block_pos=plan["block_pos"],
                              ladder=plan["ladder_step"], source="live-driver"))
-        self.block_hands += 1
+        if result != E.TIE:
+            self.block_hands += 1
         if self.money.blocked:
             self.pause(self.money.blocked[1])
             if self.money.blocked[0] == "TAKE_PROFIT":
@@ -873,7 +874,7 @@ class BCRApp:
         self.ladder_frame.pack(fill="x", pady=(10, 0))
         self.ladder_vars = []
         self._rebuild_ladder_inputs()
-        self._label(method, "Thắng về bậc 1 · hoà giữ bậc và hoàn tiền · mỗi ô là một tay trong khối.",
+        self._label(method, "Thắng về bậc 1 · hoà giữ bậc, hoàn tiền và không tính tay · mỗi ô là một tay trong khối.",
                     9, MUTED, justify="left", wraplength=500).pack(anchor="w", pady=(6, 0))
         hands_row = tk.Frame(method, bg=PANEL)
         hands_row.pack(fill="x", pady=(12, 0))
