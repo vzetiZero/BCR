@@ -3525,6 +3525,31 @@ class FakeTableCdp:
             self.on_spot += float(self.selected or 0)
 
 
+class DroppingSpotCdp(FakeTableCdp):
+    """Ô cược 'nuốt' cú bấm chip 20 (site/mạng trễ); chip 100 và cú bấm khay vẫn ăn.
+
+    ``drop_limit`` giới hạn số cú bấm chip 20 bị nuốt: 1 = trễ một lần rồi bấm bù ăn,
+    lớn = trễ mãi nên bấm bù vẫn trượt.
+    """
+
+    def __init__(self, tray_snapshots, drop_limit=1, offset=None):
+        super().__init__(tray_snapshots, offset=offset)
+        self.drop_limit = drop_limit
+        self.dropped = 0
+
+    def _mouse(self, params):
+        offset = self.offset or {}
+        local = (params.get("x") - (offset.get("x") or 0),
+                 params.get("y") - (offset.get("y") or 0))
+        if (params.get("type") == "mouseReleased" and self.selected == 20
+                and local == (self.spot["x"], self.spot["y"])
+                and self.dropped < self.drop_limit):
+            self.dropped += 1
+            self.clicks.append(dict(params))
+            return
+        super()._mouse(params)
+
+
 class PlaceBetLiveTrayTests(unittest.TestCase):
     """Mệnh giá phải chốt theo khay THẬT lúc bấm, không theo bản đọc lúc chốt kế hoạch."""
 
@@ -3618,6 +3643,46 @@ class PlaceBetLiveTrayTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("không đo được", note.lower())
         self.assertEqual(fake.clicks, [])
+
+    def fast_place(self, fake, chips, amount=None):
+        # Đồng hồ nhảy nhanh để cửa sổ xác nhận 2s không bắt test chờ thật; khay đã đủ
+        # ngay từ bản đọc đầu nên các vòng chờ targets vẫn chốt bình thường.
+        clock = iter(range(100000))
+        with patch.object(TB.time, "monotonic", side_effect=lambda: float(next(clock))):
+            return self.place(fake, chips, amount=amount)
+
+    def test_a_partial_spot_shortfall_is_topped_up_once(self):
+        fake = DroppingSpotCdp([self.tray(20, 100)], drop_limit=1)
+        ok, note, placed = self.fast_place(fake, [], amount=120)
+        self.assertTrue(ok, note)
+        self.assertEqual(fake.on_spot, 120)
+        self.assertEqual(placed, {100: 1, 20: 2})
+        self.assertIn("bấm bù", note)
+        self.assertEqual(fake.dropped, 1)
+
+    def test_a_persistent_shortfall_fails_after_exactly_one_retry(self):
+        fake = DroppingSpotCdp([self.tray(20, 100)], drop_limit=99)
+        ok, note, placed = self.fast_place(fake, [], amount=120)
+        self.assertFalse(ok)
+        self.assertEqual(fake.on_spot, 100)
+        self.assertIn("chỉ nhận 100", note)
+        # Lượt đầu: khay100 + ô + khay20 + ô = 4 cú; bấm bù đúng một lần: khay20 + ô = 2 cú.
+        released = [c for c in fake.clicks if c["type"] == "mouseReleased"]
+        self.assertEqual(len(released), 6)
+
+    def test_a_dead_read_after_clicks_is_not_retried_blindly(self):
+        class DeadReadCdp(FakeTableCdp):
+            def _evaluate(self, expression):
+                if "amount += v" in expression and self.clicks:
+                    return None
+                return super()._evaluate(expression)
+
+        fake = DeadReadCdp([self.tray(20, 100)])
+        ok, note, placed = self.fast_place(fake, [], amount=120)
+        self.assertFalse(ok)
+        # Mất đọc sau khi bấm thì không bấm bù mù: chỉ đúng 4 cú của lượt đầu.
+        released = [c for c in fake.clicks if c["type"] == "mouseReleased"]
+        self.assertEqual(len(released), 4)
 
 
 class BetGateTests(unittest.TestCase):

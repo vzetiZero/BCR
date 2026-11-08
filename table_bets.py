@@ -720,65 +720,91 @@ def place_bet(session, side, chips, unit=DEFAULT_CHIP_UNIT, human_mouse=True,
         mouse = HM.HumanMouse(lambda method, params: command(method, params),
                               enabled=bool(human_mouse), glide_seconds=glide_seconds)
 
-        # Gộp chip cùng mệnh giá để bấm ô cược đúng số lần.
-        counts = {}
-        for denom in chips:
-            counts[denom] = counts.get(denom, 0) + 1
+        def place_denoms(denoms):
+            """Bấm từng mệnh giá lên ô cược, cộng dồn vào ``placed``; trả (ok, note)."""
+            nonlocal tray_chips, spot, offset
+            # Gộp chip cùng mệnh giá để bấm ô cược đúng số lần.
+            counts = {}
+            for denom in denoms:
+                counts[denom] = counts.get(denom, 0) + 1
 
-        for denom in sorted(counts, reverse=True):
-            # Đọc lại vị trí ngay trước khi bấm: khay re-render và đổi cỡ chip đang chọn,
-            # toạ độ chụp từ đầu lượt có thể đã lệch vài chục pixel.
-            fresh = read_targets()
-            if fresh is not None:
-                tray_chips = tray_points(fresh) or tray_chips
-                if fresh.get("spot"):
-                    spot = fresh["spot"]
-                if fresh.get("frame_offset") is not None:
-                    offset = fresh["frame_offset"]
-            pos = page_point(tray_chips.get(denom), offset)
-            if pos is None:
-                continue
-            bet_point = page_point(spot, offset)
-            if bet_point is None:
-                return False, "Không xác định được ô cược %s để bấm chip." % role, placed
-            mouse.click(pos["x"], pos["y"])
-            time.sleep(click_delay)
-            # Xác nhận đúng mệnh giá đã được chọn trước khi bấm tiền thật vào ô cược,
-            # bằng nhiều lần đọc trong một cửa sổ ngắn (DOM đổi chậm hơn một nhịp click).
-            ok, confirmed = confirm_selected_chip(denom, read_selected_chip)
-            if not ok:
-                # Bấm khay chip chỉ đổi mệnh giá, KHÔNG đặt tiền, nên thử lại đúng một
-                # lần với vị trí vừa đọc lại là an toàn. Vẫn sai thì dừng, không đoán
-                # toạ độ khác để tránh đặt nhầm cửa/nhầm tiền.
-                again = read_targets()
-                pos = page_point((tray_points(again) or tray_chips).get(denom), offset)
-                if pos is not None:
-                    mouse.click(pos["x"], pos["y"])
-                    time.sleep(click_delay)
-                    ok, confirmed = confirm_selected_chip(denom, read_selected_chip)
-            if not ok:
-                return False, ("Bấm chọn chip %d nhưng khay đang chọn %s — dừng lại để "
-                               "không đặt nhầm tiền. Kiểm tra lại vị trí chip trên bàn."
-                               % (denom, "?" if confirmed is None else confirmed)), placed
-            for _ in range(counts[denom]):
-                mouse.click(bet_point["x"], bet_point["y"])
-                if on_bet_click is not None:
-                    on_bet_click()
+            for denom in sorted(counts, reverse=True):
+                # Đọc lại vị trí ngay trước khi bấm: khay re-render và đổi cỡ chip đang chọn,
+                # toạ độ chụp từ đầu lượt có thể đã lệch vài chục pixel.
+                fresh = read_targets()
+                if fresh is not None:
+                    tray_chips = tray_points(fresh) or tray_chips
+                    if fresh.get("spot"):
+                        spot = fresh["spot"]
+                    if fresh.get("frame_offset") is not None:
+                        offset = fresh["frame_offset"]
+                pos = page_point(tray_chips.get(denom), offset)
+                if pos is None:
+                    continue
+                bet_point = page_point(spot, offset)
+                if bet_point is None:
+                    return False, "Không xác định được ô cược %s để bấm chip." % role
+                mouse.click(pos["x"], pos["y"])
                 time.sleep(click_delay)
-            placed[denom] = counts[denom]
+                # Xác nhận đúng mệnh giá đã được chọn trước khi bấm tiền thật vào ô cược,
+                # bằng nhiều lần đọc trong một cửa sổ ngắn (DOM đổi chậm hơn một nhịp click).
+                ok, confirmed = confirm_selected_chip(denom, read_selected_chip)
+                if not ok:
+                    # Bấm khay chip chỉ đổi mệnh giá, KHÔNG đặt tiền, nên thử lại đúng một
+                    # lần với vị trí vừa đọc lại là an toàn. Vẫn sai thì dừng, không đoán
+                    # toạ độ khác để tránh đặt nhầm cửa/nhầm tiền.
+                    again = read_targets()
+                    pos = page_point((tray_points(again) or tray_chips).get(denom), offset)
+                    if pos is not None:
+                        mouse.click(pos["x"], pos["y"])
+                        time.sleep(click_delay)
+                        ok, confirmed = confirm_selected_chip(denom, read_selected_chip)
+                if not ok:
+                    return False, ("Bấm chọn chip %d nhưng khay đang chọn %s — dừng lại để "
+                                   "không đặt nhầm tiền. Kiểm tra lại vị trí chip trên bàn."
+                                   % (denom, "?" if confirmed is None else confirmed))
+                for _ in range(counts[denom]):
+                    mouse.click(bet_point["x"], bet_point["y"])
+                    if on_bet_click is not None:
+                        on_bet_click()
+                    time.sleep(click_delay)
+                placed[denom] = placed.get(denom, 0) + counts[denom]
+            return True, ""
 
+        ok_click, click_note = place_denoms(chips)
+        if not ok_click:
+            return False, click_note, placed
         if not placed:
             return False, "Không bấm được chip nào (mệnh giá cần không có trên khay).", placed
-        total_units = sum(k * v for k, v in placed.items())
-        detail = ", ".join("%d×%d" % (v, k) for k, v in sorted(placed.items()))
-        ok_amount, actual = confirm_spot_amount(start_amount, total_units, read_spot_amount)
+        target_units = sum(k * v for k, v in placed.items())
+        ok_amount, actual = confirm_spot_amount(start_amount, target_units, read_spot_amount)
         gained = None if actual is None else actual - start_amount
+        retried = False
+        if not ok_amount and gained is not None and 0 < gained < target_units:
+            # Thiếu chip nhưng bàn vẫn đọc được: bấm bù đúng phần thiếu MỘT lần. Chỉ bù khi
+            # bản đọc ngay trước đó vẫn đúng mức thiếu cũ — chip về muộn hơn cửa sổ xác nhận
+            # thì không bấm chồng thêm tiền; mất kết nối (không đọc được) cũng không bấm mù.
+            fresh = read_targets()
+            current = read_spot_amount()
+            if (fresh is not None and current is not None
+                    and current - start_amount == gained):
+                tray_chips = tray_points(fresh) or tray_chips
+                split = decompose(target_units - gained, unit, sorted(tray_chips))
+                if split["exact"] and place_denoms(split["chips"])[0]:
+                    retried = True
+                    ok_amount, actual = confirm_spot_amount(start_amount, target_units, read_spot_amount)
+                    gained = None if actual is None else actual - start_amount
+        clicked_units = sum(k * v for k, v in placed.items())
+        detail = ", ".join("%d×%d" % (v, k) for k, v in sorted(placed.items()))
         if not ok_amount:
             return False, ("Đã bấm %d đơn vị chip vào %s nhưng ô cược chỉ nhận %s đơn vị — "
                            "chip chưa lên bàn đúng số tiền, tay này không được tính là đã đặt."
-                           % (total_units, role, "?" if gained is None else int(gained))), placed
-        return True, ("Đã đặt %d đơn vị chip vào %s (%s) · ô cược xác nhận +%d." % (
-            total_units, role, detail, int(gained))), placed
+                           % (clicked_units, role, "?" if gained is None else int(gained))), placed
+        note = ("Đã đặt %d đơn vị chip vào %s (%s) · ô cược xác nhận +%d." % (
+            target_units, role, detail, int(gained)))
+        if retried:
+            note += " Đã bấm bù phần thiếu."
+        return True, note, placed
     except Exception as exc:
         return False, "Không đặt được chip (%s)." % type(exc).__name__, placed
     finally:
