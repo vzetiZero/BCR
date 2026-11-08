@@ -588,9 +588,6 @@ class BCRApp:
         style.configure("Treeview.Heading", background=BG, foreground=MUTED,
                         relief="flat", font=("Segoe UI", 9, "bold"), padding=(8, 7))
         style.map("Treeview", background=[("selected", PALE)], foreground=[("selected", ACCENT)])
-        style.configure("TNotebook", background=PANEL, borderwidth=0)
-        style.configure("TNotebook.Tab", padding=(14, 7), font=("Segoe UI", 9))
-        style.map("TNotebook.Tab", background=[("selected", PALE)], foreground=[("selected", ACCENT)])
         # Thanh điều hướng ngang thay cho cột trái 170px: cửa sổ app chỉ còn ~600px
         # bề ngang để đặt cạnh Chrome trên cùng màn hình.
         nav = tk.Frame(self.root, bg=NAV)
@@ -715,23 +712,20 @@ class BCRApp:
             note.pack(anchor="w", padx=8, pady=(2, 8))
             self.kpi_values.append(value)
             self.kpi_notes.append(note)
-        # Một cột dọc: cửa sổ ~600px không đủ chỗ cho cầu và kế hoạch nằm ngang nhau.
-        road = self._card(parent)
-        road.pack(fill="x", pady=(0, 10))
-        self.road_title = self._label(road, "Chưa chọn bàn", 12, bold=True, anchor="w")
-        self.road_title.pack(fill="x", padx=10, pady=(10, 2))
-        self.road_count = self._label(road, "", 9, MUTED, anchor="w")
-        self.road_count.pack(fill="x", padx=10, pady=(0, 6))
-        tabs = ttk.Notebook(road)
-        tabs.pack(fill="both", expand=True, padx=10)
+        # Cầu (B/P/T, Big Road) không hiển thị ở app nữa — xem trực tiếp trong Chrome.
+        # Khối này chỉ còn đường vốn để theo dõi tiền; tên bàn hiện nhỏ ở góc làm ngữ cảnh.
+        equity = self._card(parent)
+        equity.pack(fill="x", pady=(0, 10))
+        equity_head = tk.Frame(equity, bg=PANEL)
+        equity_head.pack(fill="x", padx=10, pady=(10, 2))
+        self._label(equity_head, "ĐƯỜNG VỐN", 8, MUTED, True).pack(side="left")
+        self.road_title = self._label(equity_head, "Chưa chọn bàn", 9, MUTED, anchor="e")
+        self.road_title.pack(side="right", fill="x", expand=True)
         self.canvases = {}
-        for key, title in (("bead", "Cầu B/P/T"), ("big", "Big Road"), ("equity", "Đường vốn")):
-            canvas = tk.Canvas(tabs, bg=PANEL, height=150, width=200, highlightthickness=0)
-            tabs.add(canvas, text=title)
-            self.canvases[key] = canvas
-            canvas.bind("<Configure>", lambda _e, k=key: self._draw_canvas(k))
-        self.road_letters = self._label(road, "Chưa có kết quả từ site", 9, MUTED, anchor="w", wraplength=500)
-        self.road_letters.pack(fill="x", padx=10, pady=(6, 10))
+        canvas = tk.Canvas(equity, bg=PANEL, height=150, width=200, highlightthickness=0)
+        canvas.pack(fill="both", expand=True, padx=10, pady=(2, 10))
+        self.canvases["equity"] = canvas
+        canvas.bind("<Configure>", lambda _e: self._draw_canvas("equity"))
         plan = self._card(parent)
         plan.pack(fill="x", pady=(0, 10))
         self._label(plan, "KẾ HOẠCH TAY TIẾP THEO", 8, MUTED, True).pack(anchor="w", padx=10, pady=(10, 2))
@@ -2345,10 +2339,6 @@ class BCRApp:
             self.tables_note.config(text="Số bàn muốn chơi: %d · đã xong %d bàn trong phiên." % (
                 self._tables_target(), self.tables_done), fg=MUTED)
         self.road_title.config(text=self.sim.table_name)
-        road = self.sim.results
-        self.road_count.config(text="%d tay · Banker %d  /  Player %d  /  Hòa %d" % (
-            len(road), road.count("B"), road.count("P"), road.count("T")))
-        self.road_letters.config(text=" ".join(road[-40:]) if road else "Cầu thật sẽ xuất hiện sau khi bạn chọn bàn.")
         plan = self.sim.pending or self.sim.plan()
         side = plan["side"]
         self.plan_side.config(text=E.SIDE_NAME.get(side, "CHỜ BÀN").upper(), fg=COLORS.get(side, MUTED))
@@ -2399,43 +2389,17 @@ class BCRApp:
         if w < 20 or h < 20:
             return
         canvas.delete("all")
-        if key == "equity":
-            if not self.sim.log:
-                canvas.create_text(w / 2, h / 2, text="Chưa có dữ liệu đối chiếu từ site", fill=MUTED, font=("Segoe UI", 11))
-                return
-            values = [self.sim.money.start_capital] + [r["balance_after"] for r in self.sim.log]
-            low, high = min(values), max(values)
-            span = max(high - low, self.sim.money.unit)
-            coords = []
-            for i, v in enumerate(values):
-                coords.extend((18 + i / (len(values) - 1) * (w - 36), h - 30 - (v - low) / span * (h - 52)))
-            canvas.create_line(*coords, fill=ACCENT, width=3)
-            canvas.create_text(18, 12, anchor="w", text="Vốn · " + M.fmt_money(values[-1]) + " VN2", fill=MUTED)
+        if not self.sim.log:
+            canvas.create_text(w / 2, h / 2, text="Chưa có dữ liệu đối chiếu từ site", fill=MUTED, font=("Segoe UI", 11))
             return
-        cell = max(18, min(25, (h - 12) // 6))
-        cols = max(1, (w - 12) // cell)
-        for c in range(cols + 1):
-            canvas.create_line(6 + c * cell, 6, 6 + c * cell, 6 + 6 * cell, fill=LINE)
-        for r in range(7):
-            canvas.create_line(6, 6 + r * cell, 6 + cols * cell, 6 + r * cell, fill=LINE)
-        if key == "bead":
-            total = (len(self.sim.results) + 5) // 6
-            cells = [dict(col=i // 6, row=i % 6, side=s, ties=0) for i, s in enumerate(self.sim.results)]
-        else:
-            road = E.build_big_road(self.sim.results)
-            total, cells = road["cols"], road["cells"]
-        start = max(0, total - cols)
-        for item in cells:
-            if item["col"] < start:
-                continue
-            x, y = 6 + (item["col"] - start) * cell, 6 + item["row"] * cell
-            color = COLORS[item["side"]]
-            canvas.create_oval(x + 3, y + 3, x + cell - 3, y + cell - 3,
-                               fill=color if key == "bead" else PANEL, outline=color, width=2)
-            if key == "bead":
-                canvas.create_text(x + cell / 2, y + cell / 2, text=item["side"], fill="white", font=("Segoe UI", 8, "bold"))
-            elif item["ties"]:
-                canvas.create_text(x + cell / 2, y + cell / 2, text=str(item["ties"]), fill=GREEN, font=("Segoe UI", 8))
+        values = [self.sim.money.start_capital] + [r["balance_after"] for r in self.sim.log]
+        low, high = min(values), max(values)
+        span = max(high - low, self.sim.money.unit)
+        coords = []
+        for i, v in enumerate(values):
+            coords.extend((18 + i / (len(values) - 1) * (w - 36), h - 30 - (v - low) / span * (h - 52)))
+        canvas.create_line(*coords, fill=ACCENT, width=3)
+        canvas.create_text(18, 12, anchor="w", text="Vốn · " + M.fmt_money(values[-1]) + " VN2", fill=MUTED)
 
     def export_csv(self):
         if not self.sim.log:
