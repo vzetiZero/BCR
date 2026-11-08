@@ -2080,6 +2080,61 @@ class WalletStartupSyncTests(unittest.TestCase):
         host.entries["capital"].set.assert_called_once_with(M.fmt_input_money(2500.5))
 
 
+class WalletManualSyncTests(unittest.TestCase):
+    """Nút "Cập nhật số dư": đọc lại ví rồi dời vốn phiên theo số dư thật, kể cả giữa phiên."""
+
+    def test_button_requests_a_fresh_scan_and_marks_pending(self):
+        host = SimpleNamespace(
+            browser=SimpleNamespace(connected=True), _wallet_manual_sync_pending=False,
+            wallet_balance_text="", wallet_balance_label=Mock(), request_scan=Mock())
+        app.BCRApp.request_wallet_sync(host)
+        self.assertTrue(host._wallet_manual_sync_pending)
+        host.request_scan.assert_called_once_with()
+        host.wallet_balance_label.config.assert_called()
+
+    def test_button_without_chrome_does_not_scan(self):
+        host = SimpleNamespace(
+            browser=SimpleNamespace(connected=False), _wallet_manual_sync_pending=False,
+            wallet_balance_text="", wallet_balance_label=Mock(), request_scan=Mock())
+        app.BCRApp.request_wallet_sync(host)
+        self.assertFalse(host._wallet_manual_sync_pending)
+        host.request_scan.assert_not_called()
+        host.wallet_balance_label.config.assert_called_once()
+        self.assertEqual(host.wallet_balance_label.config.call_args.kwargs.get("fg"), app.RED)
+
+    def test_manual_sync_rebases_capital_even_mid_session(self):
+        book = M.MoneyBook(capital=1000, unit=40, take_profit_pct=15)
+        book.settle(E.BANKER, E.PLAYER, 40, E.PAYOUT)
+        sim = app.LiveSimulation(book)
+        sim.running = True
+        host = SimpleNamespace(
+            sim=sim, _wallet_manual_sync_pending=True, _wallet_startup_sync_pending=False,
+            state_read_error=False, entries={"capital": Mock()}, wallet_balance_text="",
+            wallet_balance_label=Mock(), _save_state=Mock())
+
+        app.BCRApp._sync_wallet_from_reports(
+            host, [{"page": {"wallet_balance": "2.500,50 VN2"}}])
+
+        self.assertFalse(host._wallet_manual_sync_pending)
+        self.assertEqual(host.sim.money.balance, 2500.5)
+        self.assertEqual(host.sim.money.start_capital, 2500.5)
+        self.assertEqual(host.sim.money.profit, 0)
+        self.assertEqual(host.sim.money.hands_played, 1, "giữ thống kê tay, chỉ dời mốc vốn")
+        host.entries["capital"].set.assert_called_once_with(M.fmt_input_money(2500.5))
+        host._save_state.assert_called_once_with()
+        self.assertIn("đã cập nhật vốn phiên", host.wallet_balance_text)
+
+    def test_manual_sync_without_a_wallet_value_keeps_pending_for_next_read(self):
+        book = M.MoneyBook(capital=1000, unit=40)
+        host = SimpleNamespace(
+            sim=app.LiveSimulation(book), _wallet_manual_sync_pending=True,
+            wallet_balance_text="", wallet_balance_label=Mock())
+        app.BCRApp._sync_wallet_from_reports(host, [{"page": {"wallet_balance": ""}}])
+        self.assertTrue(host._wallet_manual_sync_pending)
+        self.assertEqual(host.sim.money.balance, 1000)
+        host.wallet_balance_label.config.assert_called_once()
+
+
 class CapitalRebaseTests(unittest.TestCase):
     """Đồng bộ vốn sau mỗi bàn: mốc vốn dời theo số dư để % chốt lời bàn sau tính trên tiền mới."""
 
@@ -2106,6 +2161,37 @@ class CapitalRebaseTests(unittest.TestCase):
         book.balance = 1210
         book.check_limits()
         self.assertEqual(book.blocked[0], "TAKE_PROFIT", "đúng 10% của 1100 thì chốt lời")
+
+    def test_rebase_to_wallet_moves_baseline_mid_session_and_keeps_hand_stats(self):
+        book = M.MoneyBook(capital=1000, unit=10, take_profit_pct=10)
+        book.settle(E.BANKER, E.PLAYER, 10, E.PAYOUT)
+        book.hands_played = 6
+        book.wins, book.losses = 4, 2
+        ok, note = book.rebase_to_wallet(2500.5)
+        self.assertTrue(ok, note)
+        self.assertEqual((book.start_capital, book.capital, book.balance), (2500.5, 2500.5, 2500.5))
+        self.assertEqual(book.profit, 0)
+        self.assertEqual(book.peak, 2500.5)
+        self.assertEqual(book.max_drawdown, 0.0)
+        self.assertEqual(book.hands_played, 6, "giữ thống kê tay cumulative")
+        self.assertEqual((book.wins, book.losses), (4, 2))
+
+    def test_rebase_to_wallet_rejects_non_positive_or_invalid(self):
+        book = M.MoneyBook(capital=1000, unit=10)
+        for bad in (0, -5, float("nan"), "abc", None):
+            with self.subTest(bad=bad):
+                ok, _note = book.rebase_to_wallet(bad)
+                self.assertFalse(ok)
+                self.assertEqual(book.balance, 1000, "số dư lỗi không được đổi vốn")
+
+    def test_rebase_to_wallet_reopens_take_profit_limit(self):
+        book = M.MoneyBook(capital=1000, unit=10, take_profit_pct=10)
+        book.balance = 1200
+        book.check_limits()
+        self.assertEqual(book.blocked[0], "TAKE_PROFIT")
+        ok, _note = book.rebase_to_wallet(1200)
+        self.assertTrue(ok)
+        self.assertIsNone(book.blocked, "mốc vốn mới = số dư nên lãi 0%, mở lại ngưỡng")
 
 
 class TableStreakFilterTests(unittest.TestCase):

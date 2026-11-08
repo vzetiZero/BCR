@@ -190,6 +190,28 @@ class MoneyBook:
         self.check_limits()
         return self.balance
 
+    def rebase_to_wallet(self, balance):
+        """Đồng bộ thủ công vốn + số dư phiên theo số dư THẬT của ví trên web.
+
+        Khác ``sync_capital``: cho phép đổi cả giữa phiên (kể khi đã có tay) theo yêu
+        cầu người dùng, dời mốc vốn để % chốt lời tính trên số tiền thật mới nhất và
+        số dư phiên khớp ví web. Giữ thống kê tay cumulative; chỉ đặt lại vốn/số dư/peak
+        và mở lại ngưỡng dừng. Trả ``(ok, note)``.
+        """
+        try:
+            value = float(balance)
+        except (TypeError, ValueError):
+            return False, "Số dư không hợp lệ."
+        if value <= 0 or value != value:
+            return False, "Số dư phải lớn hơn 0."
+        self.capital = value
+        self.start_capital = value
+        self.balance = value
+        self.peak = value
+        self.max_drawdown = 0.0
+        self.check_limits()
+        return True, "Đã cập nhật vốn theo số dư ví: %s đ." % fmt_money(value)
+
     def check_limits(self):
         won_pct = (self.balance - self.start_capital) / self.start_capital * 100 if self.start_capital else 0
         if won_pct >= self.take_profit_pct:

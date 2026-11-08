@@ -551,6 +551,7 @@ class BCRApp:
         self.connection_text = "Chưa kết nối Chrome."
         self.wallet_balance_text = "Số dư ví trên web: chưa đọc được"
         self._wallet_startup_sync_pending = True
+        self._wallet_manual_sync_pending = False
         self._load_state()
         self.stream.human_mouse = self.human_mouse_var.get()
         self.base_tk_scaling = float(root.tk.call("tk", "scaling"))
@@ -645,8 +646,12 @@ class BCRApp:
         self.disconnect_button.pack(side="left", padx=4)
         self.connection_note = self._label(connect, size=9, color=MUTED, anchor="w", justify="left", wraplength=500)
         self.connection_note.pack(fill="x", padx=10, pady=(0, 6))
-        self.wallet_balance_label = self._label(connect, self.wallet_balance_text, 10, bold=True, anchor="w")
-        self.wallet_balance_label.pack(fill="x", padx=10, pady=(0, 6))
+        wallet_row = tk.Frame(connect, bg=PANEL)
+        wallet_row.pack(fill="x", padx=10, pady=(0, 6))
+        self.wallet_balance_label = self._label(wallet_row, self.wallet_balance_text, 10, bold=True, anchor="w")
+        self.wallet_balance_label.pack(side="left", fill="x", expand=True)
+        self.wallet_sync_button = self._button(wallet_row, "Cập nhật số dư", self.request_wallet_sync)
+        self.wallet_sync_button.pack(side="right", padx=(8, 0))
         sweep_row = tk.Frame(connect, bg=PANEL)
         sweep_row.pack(fill="x", padx=10, pady=(0, 6))
         self.enter_lobby_button = self._button(sweep_row, "Nhận tab sảnh", self.enter_lobby)
@@ -2040,12 +2045,32 @@ class BCRApp:
         self._trace("hunt_retry", dict(attempt=self.cycle_attempts + 1))
         self.sweep_lobby()
 
+    def request_wallet_sync(self):
+        """Nút "Cập nhật số dư": đọc lại ví web rồi dời vốn phiên theo số dư thật mới nhất.
+
+        Nhãn số dư vẫn tự cập nhật mỗi lần đọc, nhưng vốn phiên (số dư dùng để đặt cược
+        và tính % chốt lời) chỉ đổi khi người dùng bấm nút này — tránh tự reset lãi/lỗ
+        giữa phiên. Đọc tươi qua một lượt scan rồi áp dụng trong ``_sync_wallet_from_reports``.
+        """
+        if not self.browser.connected:
+            self.wallet_balance_text = "Số dư ví trên web: chưa đọc được · hãy gắn Chrome trước."
+            self.wallet_balance_label.config(text=self.wallet_balance_text, fg=RED)
+            return
+        self._wallet_manual_sync_pending = True
+        self.wallet_balance_text = "Số dư ví trên web: đang đọc lại để cập nhật vốn…"
+        self.wallet_balance_label.config(text=self.wallet_balance_text, fg=ACCENT)
+        self.request_scan()
+
     def _sync_wallet_from_reports(self, reports):
         """Show the live lobby wallet and use it as starting capital before a run."""
         text = next((str((report.get("page") or {}).get("wallet_balance") or "").strip()
                      for report in reports
                      if (report.get("page") or {}).get("wallet_balance")), "")
         if not text:
+            if getattr(self, "_wallet_manual_sync_pending", False):
+                self.wallet_balance_text = "Số dư ví trên web: chưa đọc được giá trị để cập nhật."
+                if hasattr(self, "wallet_balance_label"):
+                    self.wallet_balance_label.config(text=self.wallet_balance_text, fg=RED)
             return
         try:
             value = M.parse_money(text)
@@ -2059,7 +2084,21 @@ class BCRApp:
         book = self.sim.money
         startup_reset = (getattr(self, "_wallet_startup_sync_pending", False)
                          and not getattr(self, "state_read_error", False))
-        if startup_reset:
+        if getattr(self, "_wallet_manual_sync_pending", False):
+            # Người dùng bấm "Cập nhật số dư": dời vốn phiên theo ví thật ngay cả giữa
+            # phiên. Giữ thống kê tay; chỉ đặt lại mốc vốn/số dư và mở lại ngưỡng dừng.
+            self._wallet_manual_sync_pending = False
+            self._wallet_startup_sync_pending = False
+            ok, note = book.rebase_to_wallet(value)
+            if ok:
+                self.wallet_balance_text += " · đã cập nhật vốn phiên theo số dư ví"
+                if hasattr(self, "entries") and "capital" in self.entries:
+                    self.entries["capital"].set(M.fmt_input_money(value))
+                if hasattr(self, "_save_state"):
+                    self._save_state()
+            else:
+                self.wallet_balance_text += " · " + note
+        elif startup_reset:
             # A reopened app starts a fresh ledger from the live wallet. Archive
             # the previous session first, then clear its P/L and hand counters.
             try:
