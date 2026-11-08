@@ -462,6 +462,22 @@ class LiveSimulationTests(unittest.TestCase):
         self.assertFalse(sim.filter_exit_done)
         self.assertFalse(sim.cycle_done)
 
+    def test_an_old_long_streak_does_not_exit_when_the_current_run_is_short(self):
+        # Trace thật: shoe từng có bệt ≥7 tay từ lâu, nhưng vệt ĐANG CHẠY chỉ 2 tay.
+        # Dùng vệt dài nhất lịch sử làm app đá bàn ngay khi vào và không bao giờ đặt
+        # được chip. Chỉ được xét vệt cuối (runs[-1]).
+        sim = self.simulation()
+        letters = "BBBBBBBBB" + "PPPPPPPPPPP" + "BB"
+        self.assertFalse(sim._exit_if_table_filter_failed(letters))
+        self.assertTrue(sim.running)
+        self.assertFalse(sim.filter_exit_done)
+
+    def test_the_current_run_reaching_the_threshold_still_exits(self):
+        sim = self.simulation()
+        letters = "BBBPB" + "BBBBBBB"   # vệt cuối Banker 7 tay
+        self.assertTrue(sim._exit_if_table_filter_failed(letters))
+        self.assertTrue(sim.filter_exit_done)
+
     def test_blocked_book_cannot_start(self):
         sim = self.simulation(start=False)
         sim.money.blocked = ("TAKE_PROFIT", "Chốt lời của phiên đã chạm")
@@ -4162,7 +4178,7 @@ class AutoPlaceReportingTests(unittest.TestCase):
             _wait_for_next_hand=Mock(return_value=(True, "")),
         )
         # place_armed_bet gọi các helper qua self; host rút gọn phải có đúng method thật.
-        for name in ("_set_place_status", "_finish_place", "_on_placed"):
+        for name in ("_set_place_status", "_finish_place", "_on_placed", "_trace"):
             setattr(host, name, MethodType(getattr(app.BCRApp, name), host))
         for key, value in changes.items():
             setattr(host, key, value)

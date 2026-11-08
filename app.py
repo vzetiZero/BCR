@@ -362,7 +362,11 @@ class LiveSimulation:
         "Trong bàn: thoát khi bệt đạt N tay".
         """
         runs = E.run_lengths(letters)
-        streak_side, streak_len = max(runs, key=lambda run: run[1], default=(None, 0))
+        # Chỉ xét VỆT ĐANG CHẠY ở tay mới nhất (runs[-1]); dùng vệt dài nhất trong cả
+        # lịch sử khiến bàn bị đá ngay khi vào nếu shoe từng có bệt ≥ ngưỡng từ lâu,
+        # dù cầu hiện tại bình thường — đúng lỗi "vào bàn vài giây rồi bị đá" lặp lại
+        # cùng một bàn trong bcr_trace.jsonl và không bao giờ kịp đặt chip.
+        streak_side, streak_len = runs[-1] if runs else (None, 0)
         if streak_len < self.live_exit_streak:
             return False
         self.filter_exit_done = True
@@ -1897,10 +1901,13 @@ class BCRApp:
         self.place_busy = True
         self.place_status.config(text="Đang tự đặt %s VN2 vào %s…" % (
             M.fmt_money(stake), E.SIDE_NAME[side]), fg=ACCENT)
+        self._trace("place_start", dict(table=self.sim.table_key, side=side, stake=stake,
+                                        step=plan.get("ladder_step")))
 
         def work():
             try:
                 ok_gate, gate_note = self._wait_for_next_hand(unit)
+                self._trace("place_gate", dict(ok=ok_gate, note=gate_note))
                 if not ok_gate:
                     self.events.put(("placed", (False, gate_note, plan)))
                     return
