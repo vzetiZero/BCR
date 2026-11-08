@@ -596,9 +596,11 @@ class BCRApp:
         return tk.Label(parent, text=text, bg=parent.cget("bg"), fg=color,
                         font=("Segoe UI", size, "bold" if bold else "normal"), **kw)
 
-    def _button(self, parent, text, command, primary=False):
-        return tk.Button(parent, text=text, command=command, bg=ACCENT if primary else PANEL,
-                         fg="white" if primary else TEXT, activebackground=PALE,
+    def _button(self, parent, text, command, primary=False, bg=None, fg=None):
+        background = bg or (ACCENT if primary else PANEL)
+        foreground = fg or ("white" if primary else TEXT)
+        return tk.Button(parent, text=text, command=command, bg=background,
+                         fg=foreground, activebackground=PALE,
                          activeforeground=ACCENT, relief="flat", bd=0, cursor="hand2",
                          font=("Segoe UI", 10, "bold"), padx=14, pady=8)
 
@@ -699,17 +701,19 @@ class BCRApp:
         self.wallet_balance_label.pack(side="left", fill="x", expand=True)
         self.wallet_sync_button = self._button(wallet_row, "Cập nhật số dư", self.request_wallet_sync)
         self.wallet_sync_button.pack(side="right", padx=(8, 0))
-        sweep_row = tk.Frame(connect, bg=PANEL)
-        sweep_row.pack(fill="x", padx=10, pady=(0, 6))
+        sweep_row = tk.Frame(connect, bg=PALE, highlightbackground=ACCENT, highlightthickness=1)
+        sweep_row.pack(fill="x", padx=10, pady=(0, 8), ipady=4)
         self.enter_lobby_button = self._button(sweep_row, "Nhận tab sảnh", self.enter_lobby)
         self.enter_lobby_button.pack(side="left")
-        self.sweep_button = self._button(sweep_row, "Quét sảnh", self.sweep_lobby)
+        self.sweep_button = self._button(sweep_row, "Quét sảnh", self.sweep_lobby, primary=True)
         self.sweep_button.pack(side="left", padx=4)
-        self.auto_open_button = self._button(sweep_row, "Tự mở bàn", lambda: self.auto_open_table(True))
+        self.auto_open_button = self._button(sweep_row, "Tự mở bàn", lambda: self.auto_open_table(True),
+                                             bg=BLUE, fg="white")
+        self.auto_open_button.config(disabledforeground="#d7e3fb")
         self.auto_open_button.pack(side="left", padx=4)
         tk.Checkbutton(sweep_row, text="Ưa thích", variable=self.favorites_only,
-                       command=self._save_state, bg=PANEL, fg=TEXT, selectcolor=PALE,
-                       activebackground=PANEL, activeforeground=ACCENT,
+                       command=self._save_state, bg=PALE, fg=TEXT, selectcolor=PANEL,
+                       activebackground=PALE, activeforeground=ACCENT,
                        font=("Segoe UI", 9)).pack(side="left", padx=(4, 0))
         self.sweep_note = self._label(connect, "Bạn tự mở tab sảnh Baccarat trong Chrome rồi bấm “Nhận tab sảnh”. "
                                               "Vào bàn là app tự đánh, lặp khối tới khi đủ lãi mới đóng bàn.",
