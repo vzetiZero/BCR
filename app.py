@@ -329,6 +329,10 @@ class LiveSimulation:
         tiến khi có cược thật. Kế hoạch cho tay kế tiếp được chốt lại trên cùng bậc.
         """
         reason = plan.get("place_note") or "không xác nhận được lượt đặt chip."
+        if hasattr(self, "_trace"):
+            self._trace("hand_not_placed", dict(table=self.table_key, hand=len(letters),
+                                                side=plan.get("side"),
+                                                stake=plan.get("stake"), reason=str(reason)[:120]))
         self.letters = letters
         self.results = list(letters)
         self.place_skips += 1

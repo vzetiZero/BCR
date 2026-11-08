@@ -341,9 +341,13 @@ window.__BCR_SCAN = (function () {
 
   return function scan() {
     // Chỉ đọc ví ở sảnh danh sách Baccarat; hash-route độc lập với domain/mirror.
+    // Số dư hiển thị ở header khi cửa sổ đủ rộng và chuyển xuống footer khi thu nhỏ,
+    // nên đọc cả hai role thay vì chỉ footer (trước đây bỏ trống khi header hiện).
     const isBaccaratLobby = /(?:^|[&#])category=baccarat(?:&|$)/.test(location.hash || "");
+    const walletEl = document.querySelector('[data-role="header-balance"]')
+      || document.querySelector('[data-role="footer-balance"]');
     const walletBalance = isBaccaratLobby
-      ? ((document.querySelector('[data-role="footer-balance"]') || {}).textContent || "").replace(/\s+/g, " ").trim()
+      ? ((walletEl || {}).textContent || "").replace(/\s+/g, " ").trim()
       : "";
     const tid = (() => {
       const m = /table_id=([^&]+)/.exec(location.href);
