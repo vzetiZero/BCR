@@ -3521,10 +3521,11 @@ class ChipMatchingTests(unittest.TestCase):
         self.assertEqual(sorted(split["chips"]), [20, 100])
         self.assertEqual(split["total_vnd"], 120)
 
-    def test_140_needs_100_plus_two_20s(self):
+    def test_140_needs_100_plus_40_on_the_real_tray(self):
+        # Khay thật của bàn có 20/40/100/500/2000/10000 nên 140 = 100 + 40 (2 chip).
         split = TB.decompose(140)
         self.assertTrue(split["exact"])
-        self.assertEqual(split["chips"], [100, 20, 20])
+        self.assertEqual(split["chips"], [100, 40])
 
     def test_decomposition_reports_an_ungroupable_amount(self):
         # Khay không có mệnh giá 10 nên 10 không ghép được.

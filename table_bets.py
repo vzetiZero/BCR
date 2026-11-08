@@ -24,7 +24,7 @@ SPOT_ROLE = (("Banker", "B"), ("Player", "P"), ("Tie", "T"))
 # Không quy đổi sang VNĐ nữa để UI, khay chip và số dư luôn cùng một thang số.
 DEFAULT_CHIP_UNIT = 1
 # Mệnh giá khay chip theo đơn vị hiển thị; khay thật luôn được đọc từ DOM và thay thế.
-DEFAULT_DENOMINATIONS = (20, 50, 100, 500, 2000, 10000)
+DEFAULT_DENOMINATIONS = (20, 40, 100, 500, 2000, 10000)
 # Giữa hai ván, dealer "mở bài"/gom chip thì khay chip và ô cược tạm biến mất khỏi DOM
 # rồi render lại sau vài giây. Phải CHỜ-ĐỌC-LẠI tới khi đủ dữ liệu, không được đọc một
 # lần rồi bỏ cuộc — nếu không, place_bet trả lỗi "Không bấm được chip nào" ngay cả khi
@@ -71,7 +71,22 @@ READ_JS = r"""(() => {
     const st = getComputedStyle(el);
     return r.width > 4 && r.height > 4 && st.display !== 'none' && st.visibility !== 'hidden';
   };
-  const tray = document.querySelector('[data-role="chip-stack"]');
+  const tray = (() => {
+    const named = document.querySelector('[data-role="chip-stack"]');
+    if (named) return named;
+    const chips = [...document.querySelectorAll('[data-role="chip"][data-value]')]
+      .filter((el) => visible(el) && !el.closest('[data-role^="bet-spot-"]')
+        && (parseInt(el.getAttribute('data-value'), 10) || 0) > 0);
+    if (!chips.length) return null;
+    let node = chips[0];
+    for (let i = 0; i < 8 && node && node !== document.body; i++) {
+      const count = [...node.querySelectorAll('[data-role="chip"][data-value]')]
+        .filter((el) => visible(el) && !el.closest('[data-role^="bet-spot-"]')).length;
+      if (count >= chips.length) return node;
+      node = node.parentElement;
+    }
+    return chips[0].parentElement;
+  })();
   // Nhận diện bàn bằng KHU VỰC CƯỢC, không chỉ bằng cầu: khay chip + ô cược đã hiện
   // nhưng Bead-road chưa render/đang ẩn vẫn là bàn đặt được. Đòi mỗi Bead-road thì app
   // báo "no_table_view" mãi dù người dùng đã thấy khay chip, nên không bao giờ bấm.
@@ -327,7 +342,27 @@ TARGETS_JS = r"""(() => {
   })();
   const role = %s;
   const spot = document.querySelector('[data-role="bet-spot-' + role + '"]');
-  const tray = document.querySelector('[data-role="chip-stack"]');
+  // Khay chip: ưu tiên role chuẩn; layout mới có thể đổi container, khi đó dò mọi
+  // [data-role="chip"][data-value>0] KHÔNG nằm trong ô cược (luôn có placeholder
+  // data-value="0" trong ô cược) và chỉ giữ phần tử hiển thị.
+  const inSpot = (el) => !!el.closest('[data-role^="bet-spot-"]');
+  const trayOf = () => {
+    const named = document.querySelector('[data-role="chip-stack"]');
+    if (named) return named;
+    const chips = [...document.querySelectorAll('[data-role="chip"][data-value]')]
+      .filter((el) => visible(el) && !inSpot(el)
+        && (parseInt(el.getAttribute('data-value'), 10) || 0) > 0);
+    if (!chips.length) return null;
+    let node = chips[0];
+    for (let i = 0; i < 8 && node && node !== document.body; i++) {
+      const count = [...node.querySelectorAll('[data-role="chip"][data-value]')]
+        .filter((el) => visible(el) && !inSpot(el)).length;
+      if (count >= chips.length) return node;
+      node = node.parentElement;
+    }
+    return chips[0].parentElement;
+  };
+  const tray = trayOf();
   const chips = {};
   if (tray) {
     // Có thể có nhiều phần tử trùng data-value trong khay (icon mờ/placeholder chồng
