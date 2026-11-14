@@ -12,7 +12,6 @@ Luật đánh:
 
 import unittest
 
-import app
 from bcr.adapters import lobby_stream as LS
 from bcr.models import longlong
 
@@ -374,35 +373,59 @@ class LongLongSimulationTests(unittest.TestCase):
         self.assertAlmostEqual(sim.balance, 40 * 0.95 * 1000)
 
 
-class LongLongLadderMigrationTests(unittest.TestCase):
-    """State cũ ghi thang bằng đồng (2.000...) phải hạ 1000 về đơn vị sảnh (2...)."""
+class LongLongStatsTests(unittest.TestCase):
+    """Thống kê hiệu quả (tab Thống kê): tỉ lệ thắng/thua + chuỗi thua dài nhất."""
 
-    def test_old_currency_ladder_is_divided_by_one_thousand(self):
-        import types
-        from unittest.mock import Mock
+    def sample(self):
+        return [
+            {"won": True, "delta": 38},
+            {"won": False, "delta": -40},
+            {"won": False, "delta": -80},
+            {"won": False, "delta": -160},
+            {"won": True, "delta": 38},
+            {"won": False, "delta": -40},
+            {"won": False, "delta": -80},
+        ]
 
-        vars_ = [Mock(set=Mock()) for _ in range(12)]
-        host = types.SimpleNamespace(
-            longlong_ladder_vars=vars_, longlong_base_var=Mock(set=Mock()),
-            _longlong_saved={"base": "40",
-                             "ladder": [2000, 4000, 8000, 16000, 32000, 64000,
-                                        128000, 256000, 512000, 1024000, 2048000, 4096000]})
-        app.BCRApp._apply_saved_longlong_ladder(host)
-        written_last = [v.set.call_args_list[-1].args[0] for v in vars_]
-        self.assertEqual(written_last, ["2", "4", "8", "16", "32", "64", "128",
-                                        "256", "512", "1024", "2048", "4096"])
+    def test_empty_history_is_all_zero(self):
+        stats = longlong.summarize_history([])
+        self.assertEqual((stats["hands"], stats["wins"], stats["losses"]), (0, 0, 0))
+        self.assertEqual(stats["win_rate"], 0.0)
+        self.assertEqual(stats["max_loss_streak"], 0)
+        self.assertEqual(stats["streak_histogram"], {})
+        self.assertEqual(stats["curve"], [])
 
-    def test_lobby_unit_ladder_is_kept_as_is(self):
-        import types
-        from unittest.mock import Mock
+    def test_counts_ratio_and_longest_losing_run(self):
+        stats = longlong.summarize_history(self.sample())
+        self.assertEqual((stats["hands"], stats["wins"], stats["losses"]), (7, 2, 5))
+        self.assertEqual(stats["win_rate"], 28.6)
+        self.assertEqual(stats["loss_rate"], 71.4)
+        self.assertEqual(stats["max_loss_streak"], 3)      # L-L-L ở giữa sổ
+        self.assertEqual(stats["current_loss_streak"], 2)  # cuối sổ đang thua 2 tay
+        self.assertEqual(stats["max_win_streak"], 1)
+        self.assertEqual(stats["worst_loss"], -160)
+        self.assertEqual(stats["net_units"], -324)
+        self.assertEqual(stats["streak_histogram"], {"2": 1, "3": 1})
+        self.assertEqual(stats["recent"], ["W", "L", "L", "L", "W", "L", "L"])
 
-        vars_ = [Mock(set=Mock()) for _ in range(3)]
-        host = types.SimpleNamespace(
-            longlong_ladder_vars=vars_, longlong_base_var=Mock(set=Mock()),
-            _longlong_saved={"base": "40", "ladder": [40, 80, 160]})
-        app.BCRApp._apply_saved_longlong_ladder(host)
-        written = [v.set.call_args_list[-1].args[0] for v in vars_]
-        self.assertEqual(written, ["40", "80", "160"])
+    def test_curve_is_cumulative_and_matches_net(self):
+        stats = longlong.summarize_history(self.sample())
+        self.assertEqual(stats["curve"], [38, -2, -82, -242, -204, -244, -324])
+        self.assertEqual(stats["curve"][-1], stats["net_units"])
+
+    def test_recent_is_capped(self):
+        entries = [{"won": index % 2 == 0, "delta": 1} for index in range(60)]
+        stats = longlong.summarize_history(entries, recent=10)
+        self.assertEqual(len(stats["recent"]), 10)
+        self.assertEqual(stats["hands"], 60)
+
+    def test_session_ledger_feeds_the_stats(self):
+        sim = longlong.LongLongSimulation([40], capital=0)
+        sim.ingest(["VD", "VV", "VD", "VD"], auto_arm=True)
+        stats = longlong.summarize_history(sim.log)
+        self.assertEqual(stats["hands"], len(sim.log))
+        self.assertEqual(stats["hands"], stats["wins"] + stats["losses"])
+        self.assertGreaterEqual(stats["max_loss_streak"], 1)
 
 
 if __name__ == "__main__":

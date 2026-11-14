@@ -21,12 +21,12 @@
   <div class="shell">
     <aside class="rail">
       <div class="rail-title">TRÒ CHƠI</div>
-      <button class="game" data-game="baccarat">
+      <button class="game active" data-game="baccarat">
         <span class="g-ico">B</span>
         <span class="g-txt"><b>Baccarat</b><small>đọc cầu 3-3</small></span>
         <span class="g-led" data-led="baccarat"></span>
       </button>
-      <button class="game active" data-game="longlong">
+      <button class="game" data-game="longlong">
         <span class="g-ico gold">LL</span>
         <span class="g-txt"><b>LONG-LONG</b><small>2 bát vàng / đỏ</small></span>
         <span class="g-led" data-led="longlong"></span>
@@ -39,7 +39,7 @@
 
     <main>
       <!-- ================= LONG-LONG ================= -->
-      <section class="view" id="view-longlong">
+      <section class="view hidden" id="view-longlong">
         <div class="view-head">
           <div class="head-txt">
             <h1>LONG-LONG</h1>
@@ -56,6 +56,7 @@
         <nav class="subtabs" data-subtabs="longlong">
           <button class="active" data-sub="play">Bàn chơi</button>
           <button data-sub="config">Cấu hình</button>
+          <button data-sub="stats">Thống kê</button>
           <button data-sub="log">Nhật ký</button>
         </nav>
 
@@ -151,10 +152,79 @@
               </label>
               <button class="btn" id="ll-reset">Reset phiên</button>
             </div>
+            <div class="card pad">
+              <h3>Cửa sổ Chrome</h3>
+              <label class="switch"><input type="checkbox" id="ll-fullscreen" /><span>Toàn màn hình</span></label>
+              <div class="grid two tight">
+                <label class="field">Ngang
+                  <input id="ll-win-w" type="number" min="800" step="10" />
+                </label>
+                <label class="field">Dọc
+                  <input id="ll-win-h" type="number" min="600" step="10" />
+                </label>
+                <label class="field">Tỉ lệ %
+                  <input id="ll-win-scale" type="number" min="50" max="200" step="5" />
+                </label>
+              </div>
+              <div class="row">
+                <button class="btn primary" id="ll-save-window">Lưu cửa sổ</button>
+              </div>
+              <label class="field">Link mở đầu
+                <input id="ll-start-url" type="text" />
+              </label>
+              <button class="btn" id="ll-save-url">Lưu link</button>
+              <p class="hint">Áp dụng ngay nếu Chrome đang mở; nếu chưa mở thì lưu cho lần mở sau.
+                Mỗi trò dùng profile Chrome riêng (cổng 9223 cho LONG-LONG).</p>
+            </div>
           </div>
           <div class="card pad">
             <h3>8 bậc cược</h3>
             <div class="ladder-edit" id="ll-ladder-edit"></div>
+          </div>
+        </div>
+
+        <div class="subview hidden" data-game="longlong" data-sub="stats">
+          <div class="grid kpis">
+            <div class="card kpi">
+              <div class="kpi-label">TỈ LỆ THẮNG</div>
+              <div class="kpi-value green" id="ll-stat-winrate">—</div>
+              <div class="kpi-foot" id="ll-stat-hands">0 tay đã cược</div>
+            </div>
+            <div class="card kpi">
+              <div class="kpi-label">THẮNG / THUA</div>
+              <div class="kpi-value" id="ll-stat-wl">— / —</div>
+              <div class="kpi-foot" id="ll-stat-lossrate">—</div>
+            </div>
+            <div class="card kpi">
+              <div class="kpi-label">CHUỖI THUA DÀI NHẤT</div>
+              <div class="kpi-value red" id="ll-stat-maxloss">—</div>
+              <div class="kpi-foot" id="ll-stat-currentloss">hiện tại: 0 tay</div>
+            </div>
+            <div class="card kpi">
+              <div class="kpi-label">LÃI / LỖ PHIÊN</div>
+              <div class="kpi-value" id="ll-stat-net">—</div>
+              <div class="kpi-foot" id="ll-stat-worst">tay lỗ nặng nhất: —</div>
+            </div>
+          </div>
+
+          <div class="grid two">
+            <div class="card pad chart-card">
+              <h3>Tỉ lệ thắng / thua</h3>
+              <div class="chart-wrap"><canvas id="ll-chart-ratio" class="chart"></canvas></div>
+              <div class="legend" id="ll-legend-ratio"></div>
+            </div>
+            <div class="card pad chart-card">
+              <h3>Phân bố chuỗi thua</h3>
+              <div class="chart-wrap"><canvas id="ll-chart-streak" class="chart"></canvas></div>
+              <p class="hint" id="ll-streak-note">Chưa có tay thua nào.</p>
+            </div>
+          </div>
+
+          <div class="card pad chart-card">
+            <h3>Lãi / lỗ luỹ kế theo từng tay</h3>
+            <div class="chart-wrap tall"><canvas id="ll-chart-curve" class="chart"></canvas></div>
+            <div class="wl-title">40 TAY GẦN NHẤT</div>
+            <div class="wl-strip" id="ll-recent"></div>
           </div>
         </div>
 
@@ -170,11 +240,11 @@
       </section>
 
       <!-- ================= BACCARAT ================= -->
-      <section class="view hidden" id="view-baccarat">
+      <section class="view" id="view-baccarat">
         <div class="view-head">
           <div class="head-txt">
             <h1>BACCARAT</h1>
-            <p>Đọc cầu 3-3 / 3-2 · engine riêng, không ảnh hưởng LONG-LONG</p>
+            <p>Đọc cầu 3-3 / 3-2 · tự đặt chip theo kế hoạch · engine riêng, không ảnh hưởng LONG-LONG</p>
           </div>
           <div class="head-actions">
             <span class="chip" id="ba-chrome-chip" data-state="off">Chrome: chưa kết nối</span>
@@ -186,26 +256,235 @@
 
         <nav class="subtabs" data-subtabs="baccarat">
           <button class="active" data-sub="play">Bàn chơi</button>
+          <button data-sub="config">Cấu hình</button>
+          <button data-sub="history">Lịch sử</button>
           <button data-sub="log">Nhật ký</button>
         </nav>
 
+        <!-- ---------------- BÀN CHƠI ---------------- -->
         <div class="subview" data-game="baccarat" data-sub="play">
-          <div class="card pad">
-            <div class="log-head">
-              <h3>Bàn đọc được</h3>
-              <button class="btn tiny" id="ba-scan">Quét ngay</button>
+          <div class="grid kpis">
+            <div class="card kpi">
+              <div class="kpi-label">VỐN PHIÊN</div>
+              <div class="kpi-value" id="ba-capital">—</div>
+              <div class="kpi-foot" id="ba-capital-note">—</div>
             </div>
-            <div class="table-list" id="ba-tables">
-              <p class="hint">Chưa quét. Mở Chrome, vào sảnh Baccarat rồi bấm “Quét ngay”.</p>
+            <div class="card kpi">
+              <div class="kpi-label">LÃI / LỖ</div>
+              <div class="kpi-value" id="ba-profit">—</div>
+              <div class="kpi-foot" id="ba-profit-note">—</div>
+            </div>
+            <div class="card kpi">
+              <div class="kpi-label">ROI</div>
+              <div class="kpi-value" id="ba-roi">—</div>
+              <div class="kpi-foot" id="ba-roi-note">÷ vốn đầu</div>
+            </div>
+            <div class="card kpi">
+              <div class="kpi-label">THẮNG / THUA</div>
+              <div class="kpi-value" id="ba-winrate">— / —</div>
+              <div class="kpi-foot" id="ba-winrate-note">không tính hoà</div>
             </div>
           </div>
+
+          <div class="card pad connect-card">
+            <div class="row wrap">
+              <button class="btn primary" id="ba-attach">Gắn Chrome đang mở</button>
+              <button class="btn" id="ba-lobby-enter">Nhận tab sảnh</button>
+              <button class="btn" id="ba-sweep">Quét sảnh</button>
+              <button class="btn" id="ba-scan">Đọc lại bàn</button>
+              <button class="btn" id="ba-leave">Rời bàn</button>
+              <button class="btn danger-btn" id="ba-close">Đóng Chrome</button>
+            </div>
+            <div class="conn-note" id="ba-conn-note">Chưa kết nối Chrome.</div>
+            <div class="conn-note" id="ba-wallet">Số dư ví trên web: chưa đọc được</div>
+            <div class="conn-note" id="ba-sweep-note"></div>
+          </div>
+
+          <div class="card hunt-banner hidden" id="ba-hunt">
+            <span class="hunt-spin" id="ba-hunt-spin">●</span>
+            <span class="hunt-text" id="ba-hunt-text"></span>
+            <button class="btn tiny" id="ba-hunt-cancel">Dừng tự quét</button>
+          </div>
+
+          <div class="grid two">
+            <div class="card hero">
+              <div class="hero-top">
+                <div class="hero-label">TAY KẾ TIẾP</div>
+                <div class="hero-state" id="ba-plan-state">CHỜ</div>
+              </div>
+              <div class="hero-main" id="ba-plan">Chưa chọn bàn — quét sảnh rồi bấm “Theo dõi”.</div>
+              <div class="hero-sub" id="ba-plan-reason"></div>
+              <div class="ps-title">KHỐI HIỆN TẠI</div>
+              <div class="plan-strip" id="ba-block-strip"></div>
+              <div class="checks" id="ba-checks"></div>
+            </div>
+
+            <div class="card pad">
+              <h3>Bàn đang theo dõi</h3>
+              <div class="table-name" id="ba-table-name">Chưa chọn bàn</div>
+              <div class="road" id="ba-road"></div>
+              <div class="conn-note" id="ba-table-note">Chọn một bàn trong danh sách bên dưới.</div>
+              <div class="divider"></div>
+              <div class="chip-title">CHIP TRÊN BÀN</div>
+              <div class="chip-status" id="ba-chip-status">Chưa đọc chip.</div>
+              <div class="chip-detail" id="ba-chip-detail"></div>
+              <div class="conn-note" id="ba-place-status"></div>
+            </div>
+          </div>
+
           <div class="card pad">
-            <h3>Ghi chú</h3>
-            <p class="hint">Tab này dùng engine Baccarat riêng (profile Chrome + cổng CDP riêng). Bản Electron hiện
-              đọc bàn và theo dõi; phần đặt cược Baccarat vẫn nằm trong app Tk cũ cho tới khi được chuyển sang đây.</p>
+            <div class="log-head">
+              <h3 id="ba-table-title">Bàn đọc được · 0</h3>
+              <div class="row">
+                <input id="ba-search" class="mini-input" type="text" placeholder="tìm bàn…" />
+                <label class="switch inline-switch">
+                  <input type="checkbox" id="ba-only-eligible" />
+                  <span>Chỉ bàn đạt</span>
+                </label>
+              </div>
+            </div>
+            <div class="tbl-list" id="ba-tables">
+              <p class="hint">Chưa quét. Mở Chrome, vào sảnh Baccarat rồi bấm “Quét sảnh”.</p>
+            </div>
           </div>
         </div>
 
+        <!-- ---------------- CẤU HÌNH ---------------- -->
+        <div class="subview hidden" data-game="baccarat" data-sub="config">
+          <div class="grid two">
+            <div class="card pad">
+              <h3>Vốn &amp; chốt lời</h3>
+              <label class="field">Vốn phiên (VN2)
+                <input id="ba-capital-input" type="number" min="1" step="100" />
+              </label>
+              <label class="field">Chốt lời (% vốn)
+                <input id="ba-tp-input" type="number" min="1" step="1" />
+              </label>
+              <p class="hint">Đổi vốn giữa phiên sẽ bị chặn để không sai lãi/lỗ — dùng “Phiên mới”.</p>
+              <div class="row">
+                <button class="btn primary" id="ba-save-money">Lưu vốn &amp; chốt lời</button>
+                <button class="btn" id="ba-new-session">Phiên mới</button>
+                <button class="btn" id="ba-reset-session">Reset phiên</button>
+              </div>
+            </div>
+
+            <div class="card pad">
+              <h3>Phương pháp vào cầu</h3>
+              <div class="radios" id="ba-profiles">
+                <label><input type="radio" name="ba-profile" value="3-3" /> 3-3 · 6 tay (3 mạnh + 3 đổi)</label>
+                <label><input type="radio" name="ba-profile" value="3-2" /> 3-2 · 5 tay (3 mạnh + 2 đổi)</label>
+              </div>
+              <div class="radios" id="ba-block-modes">
+                <label><input type="radio" name="ba-block-mode" value="recalculate" /> Tính lại bên mạnh sau mỗi khối</label>
+                <label><input type="radio" name="ba-block-mode" value="repeat" /> Lặp lại hướng khối đầu tiên</label>
+              </div>
+              <div class="radios" id="ba-ladder-modes">
+                <label><input type="radio" name="ba-ladder-mode" value="manual" /> Tự config — điền từng bậc</label>
+                <label><input type="radio" name="ba-ladder-mode" value="multiply" /> Tự nhân — 1-3-7-15-32-64</label>
+              </div>
+              <label class="field">Bậc 1 khi tự nhân (VN2)
+                <input id="ba-ladder-base" type="number" min="1" step="10" />
+              </label>
+              <div class="ladder-edit" id="ba-ladder-edit"></div>
+              <div class="row">
+                <button class="btn primary" id="ba-save-ladder">Lưu phương pháp &amp; thang</button>
+              </div>
+            </div>
+
+            <div class="card pad">
+              <h3>Bộ lọc cầu</h3>
+              <div class="grid two tight">
+                <label class="field">Tay đã đi · min
+                  <input id="ba-min-hands" type="number" min="10" max="50" step="1" />
+                </label>
+                <label class="field">Tay đã đi · max
+                  <input id="ba-max-hands" type="number" min="10" max="50" step="1" />
+                </label>
+                <label class="field">Bệt tối đa
+                  <input id="ba-max-streak" type="number" min="1" max="12" step="1" />
+                </label>
+                <label class="field">Chênh lệch B/P min
+                  <input id="ba-min-lead" type="number" min="1" max="20" step="1" />
+                </label>
+                <label class="field">Chênh lệch B/P max
+                  <input id="ba-max-lead" type="number" min="1" max="20" step="1" />
+                </label>
+                <label class="field">Thoát bàn khi bệt
+                  <input id="ba-live-exit" type="number" min="1" max="12" step="1" />
+                </label>
+              </div>
+              <div class="field">Khi B = P (hoà điểm) thì ưu tiên
+                <div class="radios" id="ba-tie-sides">
+                  <label><input type="radio" name="ba-tie-side" value="B" /> Bên đỏ (Banker)</label>
+                  <label><input type="radio" name="ba-tie-side" value="P" /> Bên xanh (Player)</label>
+                  <label><input type="radio" name="ba-tie-side" value="run" /> Theo vệt đang chạy</label>
+                </div>
+              </div>
+              <button class="btn primary" id="ba-save-filter">Lưu bộ lọc</button>
+            </div>
+
+            <div class="card pad">
+              <h3>Chu trình &amp; tùy chọn</h3>
+              <label class="switch"><input type="checkbox" id="ba-auto-cycle" /><span>Tự rời bàn khi hết khối / chốt lời</span></label>
+              <label class="switch"><input type="checkbox" id="ba-auto-hunt" /><span>Tự săn bàn tới khi vào được</span></label>
+              <label class="switch"><input type="checkbox" id="ba-auto-recover" /><span>Tự phục hồi phiên khi bị văng (EV.7)</span></label>
+              <label class="switch"><input type="checkbox" id="ba-favorites-only" /><span>Chỉ quét bàn Ưa thích</span></label>
+              <label class="switch"><input type="checkbox" id="ba-human-mouse" /><span>Chuột người thật khi bấm sảnh/ô bàn</span></label>
+              <label class="switch danger"><input type="checkbox" id="ba-auto-place" /><span>TỰ ĐẶT CHIP THẬT theo kế hoạch</span></label>
+              <label class="field">Số bàn muốn chơi
+                <input id="ba-tables-target" type="number" min="1" step="1" />
+              </label>
+              <button class="btn primary" id="ba-save-options">Lưu tùy chọn</button>
+            </div>
+
+            <div class="card pad">
+              <h3>Cửa sổ Chrome</h3>
+              <label class="switch"><input type="checkbox" id="ba-fullscreen" /><span>Toàn màn hình</span></label>
+              <div class="grid two tight">
+                <label class="field">Ngang
+                  <input id="ba-win-w" type="number" min="800" step="10" />
+                </label>
+                <label class="field">Dọc
+                  <input id="ba-win-h" type="number" min="600" step="10" />
+                </label>
+                <label class="field">Tỉ lệ %
+                  <input id="ba-win-scale" type="number" min="50" max="200" step="5" />
+                </label>
+              </div>
+              <div class="row">
+                <button class="btn primary" id="ba-save-window">Lưu cửa sổ</button>
+              </div>
+              <label class="field">Link mở đầu
+                <input id="ba-start-url" type="text" />
+              </label>
+              <button class="btn" id="ba-save-url">Lưu link</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- ---------------- LỊCH SỬ ---------------- -->
+        <div class="subview hidden" data-game="baccarat" data-sub="history">
+          <div class="card pad">
+            <div class="log-head">
+              <h3>Kết quả bàn</h3>
+              <button class="btn tiny" id="ba-export">Xuất CSV</button>
+            </div>
+            <div class="conn-note" id="ba-history-note"></div>
+            <div class="table-wrap">
+              <table class="grid-table">
+                <thead>
+                  <tr>
+                    <th>GIỜ</th><th>BÀN</th><th>TAY</th><th>CƯỢC</th>
+                    <th>KQ</th><th>TIỀN</th><th>LÃI/LỖ</th><th>VỐN</th>
+                  </tr>
+                </thead>
+                <tbody id="ba-history-body"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- ---------------- NHẬT KÝ ---------------- -->
         <div class="subview hidden" data-game="baccarat" data-sub="log">
           <div class="card pad log-card">
             <div class="log-head">

@@ -8,6 +8,7 @@ Chrome tự quản lý việc lưu profile; phiên có thể hết hạn. Không
 import json
 import os
 import re
+import socket
 import subprocess
 import threading
 import time
@@ -374,10 +375,76 @@ class BrowserSession:
         self.last_error = ""
         self.connection_state = "closed"
         self._last_cdp_targets = []
+        # Kiểm tra "Chrome còn sống" có cache: tránh gọi HTTP mỗi lần UI hỏi state
+        # nhưng vẫn phát hiện được người dùng tự đóng cửa sổ Chrome.
+        self._alive_checked_at = 0.0
+        self._alive_ok = False
 
     @property
     def connected(self):
-        return self.driver is not None or self.cdp_attached
+        """True khi Chrome còn thật sự sống (không chỉ là cờ cũ còn sót).
+
+        Người dùng đóng cửa sổ Chrome bằng tay thì ``driver``/``cdp_attached`` vẫn còn
+        giá trị cũ, nên phải dò lại cổng CDP. Kết quả được cache ngắn để không gọi
+        HTTP liên tục khi UI lấy state mỗi 2 giây.
+        """
+        if self.driver is None and not self.cdp_attached:
+            return False
+        if self._alive_cached():
+            return True
+        self.mark_closed()
+        return False
+
+    def _alive_cached(self, ttl=3.0):
+        now = time.monotonic()
+        if now - self._alive_checked_at < ttl:
+            return self._alive_ok
+        self._alive_checked_at = now
+        self._alive_ok = self._probe_alive()
+        return self._alive_ok
+
+    def _probe_alive(self):
+        """Chrome còn sống không? WebDriver còn trả lời, hoặc cổng CDP còn mở.
+
+        Dùng TCP connect thay vì HTTP: khi người dùng đóng cửa sổ Chrome thì cổng
+        9222 đóng ngay và connect_ex trả lỗi tức thì, còn ``urlopen`` có thể treo tới
+        hết timeout (firewall nuốt gói) khiến app tưởng Chrome vẫn còn.
+        """
+        if self.driver is not None:
+            try:
+                if bool(self.driver.window_handles):
+                    return True
+            except Exception:
+                self.driver = None      # phiên WebDriver đã chết
+        return self._port_open()
+
+    @staticmethod
+    def _port_open(port=None, timeout=0.6):
+        # Đọc CDP_PORT tại thời điểm gọi: engine đổi cổng theo từng trò (9222/9223).
+        port = CDP_PORT if port is None else port
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(timeout)
+                return sock.connect_ex(("127.0.0.1", port)) == 0
+        except OSError:
+            return False
+
+    def mark_closed(self, note=None):
+        """Xoá trạng thái kết nối sau khi Chrome bị đóng (bởi người dùng hoặc lỗi)."""
+        with self.lock:
+            self.driver = None
+            self.cdp_attached = False
+            self.mode = ""
+            self._selected_handle = None
+            self._reader = None
+            self.last_frames = 0
+            self.last_diag = {}
+            self.connection_state = "closed"
+            self._driver_info = "Chrome đã đóng."
+            self._alive_checked_at = time.monotonic()
+            self._alive_ok = False
+            self.note = note or "Chrome đã đóng · bấm “Mở Chrome” để mở lại."
+            return self.note
 
     @property
     def driver_info(self):

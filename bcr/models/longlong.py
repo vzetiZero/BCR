@@ -247,6 +247,72 @@ def payout_of(door=DOOR):
     return PAYOUT.get(door, PAYOUT[DOOR])
 
 
+def summarize_history(entries, recent=40):
+    """Thống kê hiệu quả của phiên từ sổ tay đã cược (``LongLongSimulation.log``).
+
+    Chỉ tính các tay THẬT SỰ có tiền trên bàn (mỗi phần tử có ``won``/``delta``), nên
+    tỉ lệ thắng/thua phản ánh đúng hiệu quả đặt cược, không phải số tay đã xem.
+
+    Trả dict cho chart ở UI:
+        hands, wins, losses, win_rate, loss_rate
+        max_loss_streak   — chuỗi thua dài nhất (số tay thua liên tiếp)
+        current_loss_streak — chuỗi thua đang chạy ở cuối sổ
+        max_win_streak
+        worst_loss        — tay lỗ nặng nhất (đơn vị sảnh, số âm)
+        net_units         — tổng lãi/lỗ của phiên (đơn vị sảnh)
+        streak_histogram  — {"1": số lần, "2": số lần, ...} độ dài chuỗi thua
+        recent            — "W"/"L" của ``recent`` tay gần nhất (cũ -> mới)
+        curve             — lãi/lỗ luỹ kế theo từng tay đã cược
+    """
+    flags = [bool(entry.get("won")) for entry in (entries or [])]
+    deltas = [float(entry.get("delta") or 0.0) for entry in (entries or [])]
+    hands = len(flags)
+    wins = sum(1 for flag in flags if flag)
+    losses = hands - wins
+
+    max_loss = current_loss = 0
+    max_win = current_win = 0
+    histogram = {}
+    run = 0
+    for flag in flags:
+        if flag:
+            current_win += 1
+            current_loss = 0
+            max_win = max(max_win, current_win)
+            if run:                      # kết thúc một chuỗi thua -> đếm 1 lần
+                histogram[run] = histogram.get(run, 0) + 1
+                run = 0
+        else:
+            run += 1
+            current_loss = run
+            current_win = 0
+            max_loss = max(max_loss, run)
+    if run:                              # chuỗi thua đang chạy ở cuối sổ
+        histogram[run] = histogram.get(run, 0) + 1
+
+    curve = []
+    running = 0.0
+    for delta in deltas:
+        running += delta
+        curve.append(round(running, 2))
+
+    return {
+        "hands": hands,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": round(wins / hands * 100, 1) if hands else 0.0,
+        "loss_rate": round(losses / hands * 100, 1) if hands else 0.0,
+        "max_loss_streak": max_loss,
+        "current_loss_streak": current_loss,
+        "max_win_streak": max_win,
+        "worst_loss": round(min(deltas), 2) if deltas else 0.0,
+        "net_units": round(sum(deltas), 2),
+        "streak_histogram": {str(k): v for k, v in sorted(histogram.items())},
+        "recent": ["W" if flag else "L" for flag in flags[-recent:]],
+        "curve": curve[-120:],
+    }
+
+
 class LongLongStrategy:
     """Máy trạng thái: chờ bộ VD/DV -> đặt ô 1 vàng 1 đỏ -> thắng về vốn 1 / thua lên bậc."""
 

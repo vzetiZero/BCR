@@ -1,7 +1,7 @@
 // Electron main: cửa sổ + quản lý engine Python riêng cho từng trò.
 // Mỗi trò = một tiến trình python riêng (profile Chrome + cổng CDP + file cấu hình riêng),
 // nên thao tác ở tab này không ảnh hưởng tab kia.
-const { app, BrowserWindow, ipcMain, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, dialog } = require('electron');
 const { spawn } = require('node:child_process');
 const path = require('node:path');
 const fs = require('node:fs');
@@ -175,6 +175,22 @@ ipcMain.handle('app:info', () => ({
 }));
 
 ipcMain.handle('app:openExternal', (_event, url) => shell.openExternal(url));
+
+// Lưu file text (CSV lịch sử bàn) qua hộp thoại của Windows.
+ipcMain.handle('app:saveText', async (_event, { name, text }) => {
+  try {
+    const result = await dialog.showSaveDialog(mainWindow, {
+      title: 'Lưu file',
+      defaultPath: path.join(PROJECT_ROOT, name || 'bcr-export.csv'),
+      filters: [{ name: 'CSV', extensions: ['csv'] }, { name: 'Tất cả', extensions: ['*'] }],
+    });
+    if (result.canceled || !result.filePath) return { ok: false, error: 'Đã huỷ lưu file.' };
+    await fs.promises.writeFile(result.filePath, String(text ?? ''), 'utf8');
+    return { ok: true, path: result.filePath };
+  } catch (error) {
+    return { ok: false, error: `Không lưu được file: ${error.message || error}` };
+  }
+});
 
 ipcMain.on('window:control', (_event, action) => {
   if (!mainWindow) return;

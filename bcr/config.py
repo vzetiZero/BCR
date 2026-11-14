@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
-"""Hằng số dùng chung: màu giao diện, thời gian chờ, đường dẫn file trạng thái.
+"""Hằng số dùng chung: thời gian chờ, ngưỡng dữ liệu, nhận diện bàn đặc biệt.
 
-Mọi tầng đều import từ đây để View/Controller/Model nói cùng một thang số.
+Mọi tầng (Model · Adapter · Controller · Service) import từ đây để nói cùng một
+thang số; không chứa màu sắc hay thiết lập giao diện.
 """
 
 from pathlib import Path
 
 # Thư mục gốc dự án (config.py nằm trong bcr/ nên lên một cấp).
 HERE = Path(__file__).resolve().parents[1]
-STATE_FILE = HERE / "bcr_state.json"
 
 SCAN_SECONDS = 4
 FAST_SCAN = 1.5
@@ -32,14 +32,6 @@ PLACE_SKIP_LIMIT = 3
 # vậy thread chết giữa chừng không khiến việc tính tay bị treo vĩnh viễn.
 PLACE_CONFIRM_TIMEOUT = 60.0
 
-BG, PANEL, NAV = "#f3f6fa", "#ffffff", "#111e32"
-TEXT, MUTED, LINE = "#172b45", "#718198", "#e5ebf2"
-ACCENT, PALE = "#087f78", "#e8f5f2"
-RED, BLUE, GREEN = "#d94d62", "#3f7edf", "#16866b"
-COLORS = {"B": RED, "P": BLUE, "T": GREEN}
-MONEY_FIELDS = ("balance", "hands_played", "wins", "losses", "pushes", "ties_bet",
-                "total_staked", "total_returned", "peak", "max_drawdown", "loss_streak", "blocked")
-DEFAULT_UI_SCALE = 80
 # Bàn Siêu Tốc Độ (Super Speed) có cửa sổ đặt cược quá ngắn: chờ khay chip render, đọc
 # mệnh giá, lượt chuột và xác nhận đã vượt cửa sổ nên tay luôn bị bỏ (not_placed).
 # Không tự vào các bàn này khi săn bàn để khỏi đốt tay; người dùng vẫn tự mở được.

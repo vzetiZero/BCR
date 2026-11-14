@@ -125,7 +125,8 @@ class LiveSimulation:
                  max_streak=ME.MAX_STREAK_ALLOWED,
                  live_exit_streak=ME.DEFAULT_LIVE_EXIT_STREAK,
                  min_lead=ME.DEFAULT_MIN_LEAD,
-                 block_mode=ME.BLOCK_MODE_RECALCULATE):
+                 block_mode=ME.BLOCK_MODE_RECALCULATE,
+                 max_lead=None, tie_side=ME.DEFAULT_TIE_SIDE):
         self.money = book or M.MoneyBook()
         self.profile = profile
         self.ladder = ME.ladder_stakes(profile, ladder)
@@ -133,6 +134,11 @@ class LiveSimulation:
         self.max_streak = ME.normalize_streak(max_streak)
         self.live_exit_streak = ME.normalize_streak(live_exit_streak, ME.DEFAULT_LIVE_EXIT_STREAK)
         self.min_lead = ME.normalize_min_lead(min_lead)
+        # Chặn hai đầu: lệch quá ít thì cầu dễ đổi, lệch quá nhiều thì cầu đã ngả hẳn.
+        self.max_lead = ME.normalize_max_lead(max_lead, None)
+        if self.max_lead is not None:
+            self.max_lead = max(self.min_lead, self.max_lead)
+        self.tie_side = ME.normalize_tie_side(tie_side)
         self.block_mode = (ME.BLOCK_MODE_REPEAT if block_mode == "alternate" else block_mode)
         self.block_mode = (self.block_mode if self.block_mode in
                            (ME.BLOCK_MODE_RECALCULATE, ME.BLOCK_MODE_REPEAT)
@@ -170,14 +176,31 @@ class LiveSimulation:
         return ME.plan(self.results, self.ladder, s["ladder_step"], s["hands_in_block"],
                        s["started"], s["strong"], self.profile,
                        self.min_hands, self.max_hands, self.max_streak, self.block_mode,
-                       self.min_lead)
+                       self.min_lead, max_lead=self.max_lead, tie_side=self.tie_side)
 
     def set_road_filter(self, min_hands, max_hands, max_streak, min_lead=ME.DEFAULT_MIN_LEAD):
         """Đổi bộ lọc cầu (khoảng tay đã đi + số tay bệt tối đa); kẹp trong biên của method."""
         self.min_hands, self.max_hands = ME.normalize_hand_range(min_hands, max_hands)
         self.max_streak = ME.normalize_streak(max_streak)
         self.min_lead = ME.normalize_min_lead(min_lead)
+        if self.max_lead is not None:
+            self.max_lead = max(self.min_lead, self.max_lead)
         return self.min_hands, self.max_hands, self.max_streak, self.min_lead
+
+    def set_lead_range(self, min_lead=None, max_lead="__keep__"):
+        """Đổi khoảng chênh lệch B/P: tối thiểu (bỏ trống = giữ) và tối đa (None = không giới hạn)."""
+        if min_lead is not None:
+            self.min_lead = ME.normalize_min_lead(min_lead)
+        if max_lead != "__keep__":
+            self.max_lead = ME.normalize_max_lead(max_lead, None)
+        if self.max_lead is not None:
+            self.max_lead = max(self.min_lead, self.max_lead)
+        return self.min_lead, self.max_lead
+
+    def set_tie_side(self, tie_side):
+        """Khi B = P: 'B' (đỏ, mặc định), 'P' hoặc 'run' (theo vệt hiện tại)."""
+        self.tie_side = ME.normalize_tie_side(tie_side)
+        return self.tie_side
 
     def set_live_exit_streak(self, live_exit_streak):
         self.live_exit_streak = ME.normalize_streak(live_exit_streak, ME.DEFAULT_LIVE_EXIT_STREAK)

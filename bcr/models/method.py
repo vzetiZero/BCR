@@ -47,6 +47,13 @@ MAX_HANDS = 50
 DEFAULT_MIN_LEAD = 3
 LEAD_LOWER = 1
 LEAD_UPPER = 20
+# Chênh lệch TỐI ĐA giữa B và P: hai bên xa nhau quá thì cầu đã ngả hẳn một bên,
+# không còn là cầu cân để vào khối 3-3/3-2. ``None`` = không giới hạn (giữ hành vi
+# cũ cho app Tk); engine Electron đặt 5 (khoảng 4-5 tay như yêu cầu vận hành).
+DEFAULT_MAX_LEAD = 5
+# Khi B và P bằng điểm: ưu tiên BÊN ĐỎ (Banker) — "run" để lấy bên của vệt hiện tại.
+TIE_SIDE_RUN = "run"
+DEFAULT_TIE_SIDE = "B"
 # Người dùng chỉnh khoảng tay đã đi trong Cài đặt; hai mốc dưới là biên hợp lệ.
 HANDS_LOWER = 10
 HANDS_UPPER = 50
@@ -68,6 +75,31 @@ def normalize_min_lead(value=DEFAULT_MIN_LEAD, fallback=DEFAULT_MIN_LEAD):
     except (TypeError, ValueError):
         number = fallback
     return max(LEAD_LOWER, min(LEAD_UPPER, number))
+
+
+def normalize_max_lead(value=DEFAULT_MAX_LEAD, fallback=None):
+    """Kẹp chênh lệch tay TỐI ĐA; ``None``/rỗng nghĩa là không giới hạn.
+
+    Luôn ≥ ``LEAD_LOWER`` để cặp (min, max) không bị đảo; việc bảo đảm max ≥ min
+    do ``check_table`` xử lý vì max có thể nhỏ hơn min khi người dùng nhập lệch.
+    """
+    if value is None or value == "":
+        return fallback
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    return max(LEAD_LOWER, min(LEAD_UPPER, number))
+
+
+def normalize_tie_side(value=DEFAULT_TIE_SIDE, fallback=DEFAULT_TIE_SIDE):
+    """Chuẩn hoá lựa chọn khi B = P: 'B' (đỏ), 'P' (xanh) hay 'run' (theo vệt hiện tại)."""
+    text = str(value or "").strip().upper()
+    if text in (E.BANKER, E.PLAYER):
+        return text
+    if text == TIE_SIDE_RUN.upper():
+        return TIE_SIDE_RUN
+    return fallback
 
 
 def normalize_hand_range(min_hands=MIN_HANDS, max_hands=MAX_HANDS):
@@ -143,10 +175,13 @@ def has_3_3(results):
     return False, None
 
 
-def strong_side(results, lookback=None):
+def strong_side(results, lookback=None, tie_side=DEFAULT_TIE_SIDE):
     """Bên mạnh = bên ra nhiều tay hơn trên TOÀN BỘ ván đang đi (đúng số liệu
-    Banker/Player hiển thị trên UI), không chỉ vài tay gần nhất. Hòa điểm thì
-    lấy bên của vệt hiện tại.
+    Banker/Player hiển thị trên UI), không chỉ vài tay gần nhất.
+
+    Hai bên BẰNG ĐIỂM thì mặc định ưu tiên BÊN ĐỎ (Banker) — quy ước vận hành:
+    cầu cân thì chọn cửa đỏ. Truyền ``tie_side="run"`` để quay lại luật cũ
+    (lấy bên của vệt đang chạy), ``"P"`` để ưu tiên Player.
 
     ``lookback`` được giữ lại trong chữ ký để tương thích lời gọi cũ nhưng
     không còn cắt bớt lịch sử; truyền số dương vẫn hoạt động như trước nếu có
@@ -158,20 +193,32 @@ def strong_side(results, lookback=None):
     if not dec:
         return None, {}
     b, p = dec.count(E.BANKER), dec.count(E.PLAYER)
+    tie_side = normalize_tie_side(tie_side)
     if b == p:
+        if tie_side in (E.BANKER, E.PLAYER):
+            return tie_side, {"banker": b, "player": p, "tie_break": True,
+                              "tie_side": tie_side}
         runs = E.run_lengths(results)
         side = runs[-1][0] if runs else None
-        return side, {"banker": b, "player": p, "tie_break": True}
+        return side, {"banker": b, "player": p, "tie_break": True, "tie_side": side}
     side = E.BANKER if b > p else E.PLAYER
     return side, {"banker": b, "player": p, "tie_break": False}
 
 
 def check_table(results, min_hands=MIN_HANDS, max_hands=MAX_HANDS,
-                max_streak=MAX_STREAK_ALLOWED, min_lead=DEFAULT_MIN_LEAD):
-    """Kết luận bàn này có đủ điều kiện để vào theo nguyên tắc 1 hay không."""
+                max_streak=MAX_STREAK_ALLOWED, min_lead=DEFAULT_MIN_LEAD,
+                max_lead=None, tie_side=DEFAULT_TIE_SIDE):
+    """Kết luận bàn này có đủ điều kiện để vào theo nguyên tắc 1 hay không.
+
+    ``max_lead``: chênh lệch B/P tối đa còn nhận (None = không giới hạn).
+    ``tie_side``: khi B = P thì ưu tiên bên nào ('B' đỏ mặc định, 'P', hoặc 'run').
+    """
     min_hands, max_hands = normalize_hand_range(min_hands, max_hands)
     max_streak = normalize_streak(max_streak)
     min_lead = normalize_min_lead(min_lead)
+    max_lead = normalize_max_lead(max_lead, None)
+    if max_lead is not None:
+        max_lead = max(min_lead, max_lead)
     hands = len(results)
     streak_side, streak_len = has_long_streak(results, max_streak)
     already_33, pair = has_3_3(results)
@@ -193,7 +240,7 @@ def check_table(results, min_hands=MIN_HANDS, max_hands=MAX_HANDS,
          "ok": streak_side is None, "detail": streak_detail},
         {"name": "Chưa từng có cầu 3-3", "ok": not already_33, "detail": three3_detail},
     ]
-    side, detail = strong_side(results)
+    side, detail = strong_side(results, tie_side=tie_side)
     dec = E.decisions_only(results)
     banker, player = dec.count(E.BANKER), dec.count(E.PLAYER)
     lead = abs(banker - player)
@@ -205,6 +252,14 @@ def check_table(results, min_hands=MIN_HANDS, max_hands=MAX_HANDS,
         "detail": "Banker %d · Player %d (lệch %d tay, cần ≥ %d)" % (
             banker, player, lead, min_lead),
     })
+    # Ngược lại, xa quá ``max_lead`` thì cầu đã ngả hẳn một bên, không còn cân.
+    if max_lead is not None:
+        checks.append({
+            "name": "Chênh lệch B/P tối đa %d tay" % max_lead,
+            "ok": lead <= max_lead,
+            "detail": "Banker %d · Player %d (lệch %d tay, chỉ nhận ≤ %d)" % (
+                banker, player, lead, max_lead),
+        })
     runs = E.run_lengths(results)
     return {
         "eligible": all(c["ok"] for c in checks),
@@ -214,18 +269,26 @@ def check_table(results, min_hands=MIN_HANDS, max_hands=MAX_HANDS,
         "weak": E.PLAYER if side == E.BANKER else E.BANKER,
         "strong_detail": detail,
         "streak": runs[-1] if runs else None,
+        "banker": banker,
+        "player": player,
+        "lead": lead,
+        "min_lead": min_lead,
+        "max_lead": max_lead,
+        "tie_break": bool(detail.get("tie_break")) if isinstance(detail, dict) else False,
+        "tie_side": normalize_tie_side(tie_side),
     }
 
 
 def plan(results, stakes, ladder_step=0, hands_in_block=0, started=False,
          strong=None, profile=DEFAULT_PROFILE, min_hands=MIN_HANDS, max_hands=MAX_HANDS,
          max_streak=MAX_STREAK_ALLOWED, block_mode=BLOCK_MODE_RECALCULATE,
-         min_lead=DEFAULT_MIN_LEAD):
+         min_lead=DEFAULT_MIN_LEAD, max_lead=None, tie_side=DEFAULT_TIE_SIDE):
     """Bàn tay tiếp theo nên làm gì. Trả về cửa, số tiền, vị trí trong khối theo phương pháp đã chọn."""
     stakes = ladder_stakes(profile, stakes)
     cycle = strong_hands(profile)
     block = block_hands(profile)
-    info = check_table(results, min_hands, max_hands, max_streak, min_lead)
+    info = check_table(results, min_hands, max_hands, max_streak, min_lead,
+                       max_lead=max_lead, tie_side=tie_side)
 
     if not started:
         if not info["eligible"]:
