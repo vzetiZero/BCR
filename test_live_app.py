@@ -3174,7 +3174,7 @@ class BrowserCdpRegressionTests(unittest.TestCase):
                 diag = dict(kind="road", scanned=15, roads=1, frame=safe_url, auth_required=False)
                 self.assertEqual(reports, [dict(page=dict(url=safe_url, title=raw["page"]["title"][:80],
                                                          table_id="table_01:2", wallet_balance=""),
-                                               tables=raw["tables"], race=[], diag=diag)])
+                                               tables=raw["tables"], longlong=[], diag=diag)])
                 self.assertEqual(raw, before)
                 for secret in ("QUERY_SECRET", "HASH_SECRET", "user:password", "PAGE_SECRET",
                                "DIAG_SECRET", "REPORT_SECRET"):

@@ -25,3 +25,8 @@ ui-*.png
 tmp_*
 *.bak
 backtest_report.txt
+
+# Bang chung do DOM ban LONG-LONG that
+longlong-probe.json
+longlong-probe-ws.json
+longlong-probe-live.json

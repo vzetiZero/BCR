@@ -10,9 +10,9 @@ import random
 import statistics
 import sys
 
-import engine as E
-import method as ME
-import money as M
+from bcr.models import engine as E
+from bcr.models import method as ME
+from bcr.models import money as M
 
 PROBS = [(E.BANKER, 0.45860), (E.PLAYER, 0.44620), (E.TIE, 0.09520)]
 BASE_STAKE = 100000

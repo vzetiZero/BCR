@@ -2,7 +2,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const test = require('node:test');
-const source = fs.readFileSync(__dirname + '/reader.js', 'utf8');
+const source = fs.readFileSync(__dirname + '/bcr/adapters/reader.js', 'utf8');
 
 function canvas(history, {id = 'tableABC', title = 'Baccarat Tốc Độ A', type = 'baccarat', stale = false} = {}) {
   const root = {stateNode: {}};
@@ -170,7 +170,7 @@ test('skips bead containers without readable items', () => {
 
 // EVO_ENTRY_JS song song với luồng bấm nút ở lobby_stream.py: doc truc tiep tu nguồn Python.
 const entrySource = /EVO_ENTRY_JS = """([\s\S]*?)"""/.exec(
-  fs.readFileSync(__dirname + '/lobby_stream.py', 'utf8'))[1];
+  fs.readFileSync(__dirname + '/bcr/adapters/lobby_stream.py', 'utf8'))[1];
 
 function evoItem({attrs = {'data-subprovider': 'EVO'}, alt = 'Evolution', disabled = false,
                   buttonClass = 'nrc-button btn-main', buttonText = 'Chơi game',
@@ -309,7 +309,7 @@ test('prefers the Evolution tile and stops when two tiles look identical', () =>
 
 // SELECTED_CHIP_JS trong table_bets.py: chạy đúng đoạn JS mà app tiêm vào bàn thật.
 const selectedChipSource = /SELECTED_CHIP_JS = r"""([\s\S]*?)"""/.exec(
-  fs.readFileSync(__dirname + '/table_bets.py', 'utf8'))[1];
+  fs.readFileSync(__dirname + '/bcr/adapters/table_bets.py', 'utf8'))[1];
 
 function selectedChip({marked = [], outside = [], label = null, labelText = null, tray = true} = {}) {
   const chip = (v) => ({getAttribute: (k) => (k === 'data-value' ? String(v) : null)});
@@ -376,7 +376,7 @@ test('still reads the marked chip when the tray has not rendered yet', () => {
 
 // TARGETS_JS trong table_bets.py: toạ độ đo trong khung bàn + khoảng lệch tới khung gốc.
 const targetsSource = /TARGETS_JS = r"""([\s\S]*?)"""/.exec(
-  fs.readFileSync(__dirname + '/table_bets.py', 'utf8'))[1];
+  fs.readFileSync(__dirname + '/bcr/adapters/table_bets.py', 'utf8'))[1];
 
 function targets({role = 'Banker', spot = {x: 10, y: 20, width: 100, height: 40},
                   chips = [], chain = [], crossOrigin = false} = {}) {
@@ -473,7 +473,7 @@ test('keeps the largest visible chip element per denomination', () => {
 
 // READ_JS trong table_bets.py: nhận diện màn hình bàn và đọc mệnh giá thật của khay.
 const readSource = /READ_JS = r"""([\s\S]*?)"""/.exec(
-  fs.readFileSync(__dirname + '/table_bets.py', 'utf8'))[1];
+  fs.readFileSync(__dirname + '/bcr/adapters/table_bets.py', 'utf8'))[1];
 
 function readChip(value, {selected = false} = {}) {
   return {

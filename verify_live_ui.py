@@ -38,6 +38,25 @@ def screenshot(name):
 def begin():
     assert not hasattr(app, "start_button") and not hasattr(app, "toggle_simulation")
     assert not app.sim.running
+    # Nút mở Chrome nằm ở thanh trên cùng nên thấy được ở cả hai tab.
+    assert app.top_chrome_button.cget("text") == "Mở Chrome", app.top_chrome_button.cget("text")
+    assert app.top_chrome_button.cget("state") == "normal"
+    assert app.top_attach_button.cget("text") == "Gắn Chrome"
+    # Tab LONG-LONG: đúng thang 8 bậc theo cấu hình, chỉ một ô đánh nên không có ô chọn cửa.
+    app.select_game("longlong")
+    assert [v.get() for v in app.longlong_ladder_vars] == [
+        "40", "80", "160", "320", "640", "1280", "2560", "4920"], app.longlong_ladder_vars[0].get()
+    assert not hasattr(app, "longlong_side_var")
+    assert app.longlong_next.cget("text").startswith("Tay kế tiếp:")
+    # Khối số dư thật + nút cập nhật realtime phải có sẵn trên tab LONG-LONG.
+    assert app.longlong_balance.cget("text") == "—"
+    assert app.longlong_live_button.cget("text") in ("Bật cập nhật", "Tắt cập nhật")
+    assert app.top_balance.cget("text").startswith("Số dư:")
+    # Mặc định: tự chốt kết quả BẬT, đặt chip thật TẮT (an toàn tiền thật).
+    assert app.longlong_auto_var.get() is True
+    assert app.longlong_place_var.get() is False
+    assert app.longlong_auto_log.cget("text") == "Chưa có ván nào."
+    app.select_game("baccarat")
     app.search.set("khong-co-ban")
     app.only_eligible.set(True)
     app._render_tables()

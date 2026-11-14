@@ -56,7 +56,7 @@ if not %errorlevel%==0 (
 
 echo.
 echo [..] Chay don vi test logic Python
-"%PY%" -m unittest -q test_live_app
+"%PY%" -m unittest -q test_live_app test_longlong test_longlong_table test_longlong_auto test_architecture
 if not %errorlevel%==0 (
   echo [XAI] Don vi test Python that bai. Chua nen chay gia lap.
   pause

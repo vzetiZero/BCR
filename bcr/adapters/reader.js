@@ -318,9 +318,15 @@ window.__BCR_SCAN = (function () {
     return {roads, scanned: canvases.length};
   }
 
-  /* ---------- Đua ngựa: lịch sử ván trong [data-role="history-grid"] ---------- */
-  function raceGrids() {
+  /* ---------- LONG-LONG: lịch sử ván trong [data-role="history-grid"] ---------- */
+  function longlongGrids() {
     const out = [];
+    /* Ô kết quả có thể là ảnh/nhãn màu: đọc aria-label, title hoặc text và giữ token
+       ngắn (số hoặc chữ vàng/đỏ/hỗn). Decoder Python quyết định nghĩa cuối cùng. */
+    const token = (n) => ((n.getAttribute && (n.getAttribute('aria-label') || n.getAttribute('title')))
+      || n.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 24);
+    const isResult = (t) => /^[0-9]{1,2}$/.test(t)
+      || /(vàng|vang|gold|yellow|đỏ|\bred\b|hỗn|mix)/i.test(t);
     document.querySelectorAll('[data-role="history-grid"]').forEach((grid) => {
       const tile = grid.closest('[data-role="table-tile"]');
       let tableId = "";
@@ -332,8 +338,8 @@ window.__BCR_SCAN = (function () {
       }
       const values = [...grid.querySelectorAll('*')]
         .filter((n) => n.children.length === 0)
-        .map((n) => (n.textContent || '').trim())
-        .filter((t) => /^[0-9]{1,2}$/.test(t));
+        .map(token)
+        .filter((t) => t && isResult(t));
       if (values.length) out.push({table_id: tableId, results: values});
     });
     return out;
@@ -391,7 +397,7 @@ window.__BCR_SCAN = (function () {
         table_id: r.table_id || '', game_type: r.game_type || '', read_error: r.read_error || ''
       })),
       diag: { kind, scanned: out.scanned, roads: out.roads.length, frame: location.origin + location.pathname },
-      race: raceGrids()
+      longlong: longlongGrids()
     };
   };
 })();
