@@ -30,3 +30,12 @@ backtest_report.txt
 longlong-probe.json
 longlong-probe-ws.json
 longlong-probe-live.json
+
+# Electron UI: thư viện cài bằng npm, không commit
+ui/node_modules/
+ui/dist/
+
+# Trạng thái riêng của từng trò (mỗi engine một file)
+bcr_state_baccarat.json
+bcr_state_longlong.json
+chrome_profile_longlong/

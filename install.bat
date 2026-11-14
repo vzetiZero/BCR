@@ -56,7 +56,7 @@ if not %errorlevel%==0 (
 
 echo.
 echo [..] Chay don vi test logic Python
-"%PY%" -m unittest -q test_live_app test_longlong test_longlong_table test_longlong_auto test_architecture
+"%PY%" -m unittest -q test_live_app test_longlong test_longlong_table test_longlong_auto test_engine test_architecture
 if not %errorlevel%==0 (
   echo [XAI] Don vi test Python that bai. Chua nen chay gia lap.
   pause
@@ -64,7 +64,24 @@ if not %errorlevel%==0 (
 )
 
 where node >nul 2>nul
-if %errorlevel%==0 goto :node_tests
+if %errorlevel%==0 goto 
+echo.
+echo [..] Cai giao dien Electron (ui)
+where npm >nul 2>nul
+if not %errorlevel%==0 (
+  echo [BO QUA] Chua co npm - giao dien Electron se khong cai duoc.
+  goto :skip_ui
+)
+pushd "%~dp0ui"
+call npm install --no-audit --no-fund
+if not exist "node_modules\electron\dist\electron.exe" (
+  echo [..] Tai binary Electron
+  node node_modules\electron\install.js
+)
+popd
+:skip_ui
+
+:node_tests
 echo.
 echo [..] Bo qua test reader.js (may chua cai Node.js). Khong anh huong van hanh.
 goto :done
@@ -82,7 +99,8 @@ if not %errorlevel%==0 (
 :done
 echo.
 echo [OK] Cai dat hoan tat.
-echo Mo ung dung: double-click Chay_BCR.bat
+echo Mo giao dien moi: double-click Chay_UI.bat (Electron)
+echo Mo giao dien cu:  double-click Chay_BCR.bat (Tk)
 echo   - "Mo Chrome" hoac "Gan Chrome dang mo" (CDP localhost 9222) roi bam "Vao sanh EVO".
 echo   - "Quet toan sanh" roi "Tu mo ban dat chuan" de vao ban va gia lap duoi tay that.
 echo   - Tick "Chi ban Ua thich" de app bam o loc Ua thich tren sanh va chi quet cac ban da thich.

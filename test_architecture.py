@@ -136,6 +136,38 @@ class NoHorseRacingLeftoversTests(unittest.TestCase):
                     "%s còn sót %r" % (path.relative_to(ROOT), pattern))
 
 
+class ServiceLayerTests(unittest.TestCase):
+    """Engine cho Electron phải chạy headless (không tkinter) và tách theo từng trò."""
+
+    def test_engine_module_is_headless(self):
+        names = imported_names(PKG / "service/engine.py")
+        self.assertFalse(any(matches(name, ("tkinter",)) for name in names),
+                         "engine chạy nền cho Electron, không được import tkinter")
+
+    def test_engine_supports_both_games_with_separate_profiles_and_ports(self):
+        from bcr.service import engine
+
+        baccarat = engine.GAMES["baccarat"]
+        longlong = engine.GAMES["longlong"]
+        self.assertNotEqual(baccarat[0], longlong[0], "mỗi trò một cổng CDP riêng")
+        self.assertNotEqual(baccarat[1], longlong[1], "mỗi trò một profile Chrome riêng")
+        self.assertNotEqual(baccarat[2], longlong[2], "mỗi trò một file trạng thái riêng")
+
+    def test_electron_ui_files_are_present(self):
+        for rel in ("ui/package.json", "ui/main.js", "ui/preload.js",
+                    "ui/renderer/index.html", "ui/renderer/app.js", "ui/renderer/styles.css"):
+            self.assertTrue((ROOT / rel).exists(), rel)
+
+    def test_ui_never_touches_python_directly(self):
+        """Renderer chỉ nói chuyện qua preload/contextBridge, không spawn tiến trình."""
+        renderer = (ROOT / "ui/renderer/app.js").read_text(encoding="utf-8")
+        self.assertNotIn("require('child_process')", renderer)
+        self.assertNotIn("spawn(", renderer)
+        preload = (ROOT / "ui/preload.js").read_text(encoding="utf-8")
+        self.assertIn("contextBridge.exposeInMainWorld", preload)
+        self.assertNotIn("nodeIntegration: true", (ROOT / "ui/main.js").read_text(encoding="utf-8"))
+
+
 class LongLongWiringTests(unittest.TestCase):
     def test_the_game_menu_offers_baccarat_and_longlong(self):
         text = (PKG / "views/main_window.py").read_text(encoding="utf-8")

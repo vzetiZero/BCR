@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;" />
+  <title>BCR Desktop</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="titlebar">
+    <div class="brand"><span class="dot"></span> BCR <em>Desktop</em></div>
+    <div class="drag"></div>
+    <div class="winbtns">
+      <button data-win="minimize" title="Thu nhỏ">&#8211;</button>
+      <button data-win="maximize" title="Phóng to">&#9723;</button>
+      <button data-win="close" class="danger" title="Đóng">&#10005;</button>
+    </div>
+  </header>
+
+  <div class="shell">
+    <aside class="rail">
+      <div class="rail-title">TRÒ CHƠI</div>
+      <button class="game" data-game="baccarat">
+        <span class="g-ico">B</span>
+        <span class="g-txt"><b>Baccarat</b><small>đọc cầu 3-3</small></span>
+        <span class="g-led" data-led="baccarat"></span>
+      </button>
+      <button class="game active" data-game="longlong">
+        <span class="g-ico gold">LL</span>
+        <span class="g-txt"><b>LONG-LONG</b><small>2 bát vàng / đỏ</small></span>
+        <span class="g-led" data-led="longlong"></span>
+      </button>
+      <div class="rail-foot">
+        <div class="rail-note">Mỗi trò chạy engine riêng (Chrome riêng, cấu hình riêng) nên không ảnh hưởng nhau.</div>
+        <div class="rail-ver" id="app-ver">v2.0</div>
+      </div>
+    </aside>
+
+    <main>
+      <!-- ================= LONG-LONG ================= -->
+      <section class="view" id="view-longlong">
+        <div class="view-head">
+          <div class="head-txt">
+            <h1>LONG-LONG</h1>
+            <p>Hai bát súc xắc · vàng / đỏ · chỉ đánh ô “1 vàng 1 đỏ” (0.95)</p>
+          </div>
+          <div class="head-actions">
+            <span class="chip" id="ll-chrome-chip" data-state="off">Chrome: chưa kết nối</span>
+            <span class="chip" id="ll-tool-chip" data-state="off">Tool: đang dừng</span>
+            <button class="btn" id="ll-open-chrome">Mở Chrome</button>
+            <button class="btn primary" id="ll-tool">Chạy tool</button>
+          </div>
+        </div>
+
+        <nav class="subtabs" data-subtabs="longlong">
+          <button class="active" data-sub="play">Bàn chơi</button>
+          <button data-sub="config">Cấu hình</button>
+          <button data-sub="log">Nhật ký</button>
+        </nav>
+
+        <div class="subview" data-game="longlong" data-sub="play">
+          <div class="grid kpis">
+            <div class="card kpi">
+              <div class="kpi-label">SỐ DƯ THỰC TẾ</div>
+              <div class="kpi-value gold" id="ll-balance">—</div>
+              <div class="kpi-foot" id="ll-balance-note">chưa đọc bàn</div>
+            </div>
+            <div class="card kpi">
+              <div class="kpi-label">BẬC HIỆN TẠI</div>
+              <div class="kpi-value" id="ll-step">1 / 8</div>
+              <div class="kpi-foot" id="ll-step-note">mức kế tiếp 40 đv</div>
+            </div>
+            <div class="card kpi">
+              <div class="kpi-label">LÃI / LỖ PHIÊN</div>
+              <div class="kpi-value" id="ll-profit">0 đv</div>
+              <div class="kpi-foot" id="ll-hands">0 ván đã thấy</div>
+            </div>
+            <div class="card kpi">
+              <div class="kpi-label">TỔNG ĐẶT CỦA BẠN</div>
+              <div class="kpi-value" id="ll-total">—</div>
+              <div class="kpi-foot" id="ll-phase">chưa có ván</div>
+            </div>
+          </div>
+
+          <div class="card hero">
+            <div class="hero-top">
+              <div class="hero-label">TAY KẾ TIẾP</div>
+              <div class="hero-state" id="ll-plan-state">CHỜ</div>
+            </div>
+            <div class="hero-main" id="ll-plan">Chưa đọc được bàn — bấm “Mở Chrome” rồi “Chạy tool”.</div>
+            <div class="hero-sub" id="ll-plan-reason"></div>
+          </div>
+
+          <div class="grid doors">
+            <div class="card door" id="door-JNS_B">
+              <div class="door-head"><span class="door-code">B</span><span class="door-rate">2.90 : 1</span></div>
+              <div class="door-name">2 VÀNG · Hoàng Long</div>
+              <div class="door-amount" data-door-amount="JNS_B">—</div>
+              <div class="door-foot" data-door-foot="JNS_B">—</div>
+            </div>
+            <div class="card door target" id="door-JNS_C">
+              <div class="door-head"><span class="door-code">C</span><span class="door-rate">0.95 : 1</span></div>
+              <div class="door-name">1 VÀNG 1 ĐỎ · ô của tool</div>
+              <div class="door-amount" data-door-amount="JNS_C">—</div>
+              <div class="door-foot" data-door-foot="JNS_C">—</div>
+            </div>
+            <div class="card door" id="door-JNS_A">
+              <div class="door-head"><span class="door-code">A</span><span class="door-rate">2.90 : 1</span></div>
+              <div class="door-name">2 ĐỎ · Hồng Long</div>
+              <div class="door-amount" data-door-amount="JNS_A">—</div>
+              <div class="door-foot" data-door-foot="JNS_A">—</div>
+            </div>
+          </div>
+
+          <div class="card ladder-strip">
+            <div class="ls-title">Thang cược</div>
+            <div class="ls-row" id="ll-ladder-strip"></div>
+          </div>
+        </div>
+
+        <div class="subview hidden" data-game="longlong" data-sub="config">
+          <div class="grid two">
+            <div class="card pad">
+              <h3>Vốn &amp; thang</h3>
+              <label class="field">Mức gốc (đơn vị sảnh, 1 = 1.000đ)
+                <input id="ll-base" type="number" min="1" step="10" />
+              </label>
+              <label class="field">Vốn phiên (đơn vị sảnh · 10.000 = 10 triệu)
+                <input id="ll-capital" type="number" min="10" step="100" />
+              </label>
+              <div class="row">
+                <button class="btn" id="ll-divide">Chia thang theo vốn</button>
+                <button class="btn primary" id="ll-save">Lưu cấu hình</button>
+              </div>
+              <p class="hint">Chia thang: các bậc ×2, bậc cuối bù phần lẻ để tổng đúng bằng vốn.</p>
+            </div>
+            <div class="card pad">
+              <h3>An toàn</h3>
+              <label class="switch">
+                <input type="checkbox" id="ll-auto-result" />
+                <span>Tự chốt kết quả ván (mỗi ván đúng 1 lần)</span>
+              </label>
+              <label class="switch danger">
+                <input type="checkbox" id="ll-place-real" />
+                <span>ĐẶT CHIP THẬT (tiền thật)</span>
+              </label>
+              <p class="hint">Khi bật, tool bấm chip thật vào ô C theo thang; lệch tiền sẽ tự HOÀN TÁC.</p>
+              <label class="field">Khoảng cách tối thiểu giữa 2 ván (giây)
+                <input id="ll-min-gap" type="number" min="5" step="1" />
+              </label>
+              <button class="btn" id="ll-reset">Reset phiên</button>
+            </div>
+          </div>
+          <div class="card pad">
+            <h3>8 bậc cược</h3>
+            <div class="ladder-edit" id="ll-ladder-edit"></div>
+          </div>
+        </div>
+
+        <div class="subview hidden" data-game="longlong" data-sub="log">
+          <div class="card pad log-card">
+            <div class="log-head">
+              <h3>Nhật ký</h3>
+              <button class="btn tiny" id="ll-clear-log">Xoá</button>
+            </div>
+            <div class="log" id="ll-log"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= BACCARAT ================= -->
+      <section class="view hidden" id="view-baccarat">
+        <div class="view-head">
+          <div class="head-txt">
+            <h1>BACCARAT</h1>
+            <p>Đọc cầu 3-3 / 3-2 · engine riêng, không ảnh hưởng LONG-LONG</p>
+          </div>
+          <div class="head-actions">
+            <span class="chip" id="ba-chrome-chip" data-state="off">Chrome: chưa kết nối</span>
+            <span class="chip" id="ba-tool-chip" data-state="off">Tool: đang dừng</span>
+            <button class="btn" id="ba-open-chrome">Mở Chrome</button>
+            <button class="btn primary" id="ba-tool">Chạy tool</button>
+          </div>
+        </div>
+
+        <nav class="subtabs" data-subtabs="baccarat">
+          <button class="active" data-sub="play">Bàn chơi</button>
+          <button data-sub="log">Nhật ký</button>
+        </nav>
+
+        <div class="subview" data-game="baccarat" data-sub="play">
+          <div class="card pad">
+            <div class="log-head">
+              <h3>Bàn đọc được</h3>
+              <button class="btn tiny" id="ba-scan">Quét ngay</button>
+            </div>
+            <div class="table-list" id="ba-tables">
+              <p class="hint">Chưa quét. Mở Chrome, vào sảnh Baccarat rồi bấm “Quét ngay”.</p>
+            </div>
+          </div>
+          <div class="card pad">
+            <h3>Ghi chú</h3>
+            <p class="hint">Tab này dùng engine Baccarat riêng (profile Chrome + cổng CDP riêng). Bản Electron hiện
+              đọc bàn và theo dõi; phần đặt cược Baccarat vẫn nằm trong app Tk cũ cho tới khi được chuyển sang đây.</p>
+          </div>
+        </div>
+
+        <div class="subview hidden" data-game="baccarat" data-sub="log">
+          <div class="card pad log-card">
+            <div class="log-head">
+              <h3>Nhật ký</h3>
+              <button class="btn tiny" id="ba-clear-log">Xoá</button>
+            </div>
+            <div class="log" id="ba-log"></div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div class="toast" id="toast"></div>
+  <script src="app.js"></script>
+</body>
+</html>

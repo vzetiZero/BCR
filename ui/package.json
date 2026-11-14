@@ -1,0 +1,14 @@
+{
+  "name": "bcr-desktop",
+  "version": "2.0.0",
+  "private": true,
+  "description": "BCR Desktop — giao diện Electron cho tool Baccarat & LONG-LONG",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "start:debug": "electron . --remote-debugging-port=9333"
+  },
+  "devDependencies": {
+    "electron": "^32.2.0"
+  }
+}
