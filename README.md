@@ -112,18 +112,39 @@ Quy đổi nằm ở `models/longlong.py`: `to_site_amount()` (đv → số gử
 ## Chống “ván ma” và độ trễ khi đặt chip (LONG-LONG)
 
 Sàn báo ô thắng bằng class hiệu ứng, và rê chuột lên ô cược cũng gắn class — nên bộ đếm
-ván dễ sinh **ván không có thật** (sổ vốn cộng/trừ tiền cho tay chưa mở). Ba lớp chặn:
+ván dễ sinh **ván không có thật** (sổ vốn cộng/trừ tiền cho tay chưa mở). Bốn lớp chặn:
 
 | Lớp | Ở đâu | Tác dụng |
 |---|---|---|
-| Xác nhận `confirm_reads` lần đọc liên tiếp | `controllers/longlong_auto.py` | lọc nhiễu animation/hover |
+| Khối KẾT QUẢ của sàn phải đổi | `controllers/longlong_auto.py` | hover/animation không làm khối `[data-role="result"]` đổi → không sinh ván ma |
+| Xác nhận `confirm_reads` lần đọc liên tiếp | idem | lọc nhiễu animation |
 | Hai ván cách nhau ≥ `min_hand_gap` giây | idem | chặn 2 “ván” cách nhau 2 giây |
 | Lệnh gắn số ván (`pending["hand"]`) | `controllers/longlong.py` | ván khác ra kết quả thì **bỏ lệnh**, không tính tiền |
+
+Thêm hai lớp chống tính tiền oan:
+
+- **Chip phải còn trên bàn**: sau khi bấm, tool đọc `total_bet` mỗi nhịp; nếu tiền biến
+  mất quá `chip_watch_seconds` giây mà chưa có kết quả → sàn đã huỷ/hoàn tiền → bỏ ván,
+  không ghi sổ.
+- **Không bấm khi sàn báo đã đóng cược**: `[data-role="status-text"]` chứa “kết quả”,
+  “no more bets”, “chờ kết quả”… thì `place()` từ chối (kèm câu trạng thái trong nhật ký).
 
 Khi đang cần bấm chip mà chưa bấm được, vòng đọc tự nhanh lên 0.7 giây (`PLACE_POLL_SECONDS`)
 để không trễ cửa sổ cược. `adapters/longlong_table.py::place()` đọc lại TỔNG ĐẶT CƯỢC
 **sau từng chip**; cú bấm nào không vào bàn thì dừng và HOÀN TÁC ngay, và tự đưa chuột
-ra khỏi ô cược để hover không bị đọc thành “ô thắng”.
+ra khỏi ô cược (cả trước mỗi lần đọc) để hover không bị đọc thành “ô thắng”.
+
+### Lấy kết quả trực tiếp từ luồng WebSocket của sàn
+
+Kết quả ván được sàn đẩy qua WebSocket của iframe game (`/frontend/evo/...`). Muốn đọc
+thẳng luồng đó (không phụ thuộc DOM), bắt một lần frame rồi gắn bộ giải mã:
+
+```
+python tools/probe_longlong.py --port 9223 --ws 60
+```
+
+File `tools/longlong-probe-ws.json` sinh ra chứa các frame thật; gửi lại để chuyển
+`result_source` sang luồng WebSocket.
 
 ## Tab Thống kê (LONG-LONG)
 

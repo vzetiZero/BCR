@@ -281,6 +281,41 @@ class PaceTests(unittest.TestCase):
         self.assertEqual(len(fails), 2, [entry["text"] for entry in service.logs])
 
 
+class ChipWatchTests(unittest.TestCase):
+    """Chip bị sàn huỷ/hoàn tiền trước khi có kết quả -> không được tính tiền."""
+
+    def test_chip_that_disappears_voids_the_bet(self):
+        table = FakeTable([state("JNS_C", "VD", at=1000.0, balance=500.0)])
+        service = make_service(table=table, config={"place_real": True, "confirm_reads": 1,
+                                                    "chip_watch_seconds": 0.0})
+        service.tick()
+        self.assertIsNotNone(service.sim.strategy.pending)
+        self.assertEqual(service.sim.strategy.pending["amount_site"], 40)
+        service._watch_chips({"total_bet_vn2": 0.0})
+        service._watch_chips({"total_bet_vn2": 0.0})
+        self.assertIsNone(service.sim.strategy.pending, "chip biến mất thì phải bỏ lệnh")
+        self.assertEqual(service.sim.log, [], "bỏ lệnh thì không ghi tiền")
+        texts = [entry["text"] for entry in service.logs]
+        self.assertTrue(any("biến mất" in text for text in texts), texts)
+
+    def test_chip_still_on_the_table_keeps_the_bet(self):
+        table = FakeTable([state("JNS_C", "VD", at=1000.0, balance=500.0)])
+        service = make_service(table=table, config={"place_real": True, "confirm_reads": 1,
+                                                    "chip_watch_seconds": 0.0})
+        service.tick()
+        service._watch_chips({"total_bet_vn2": 40.0})
+        self.assertIsNotNone(service.sim.strategy.pending, "còn tiền trên bàn thì giữ lệnh")
+
+    def test_short_gap_does_not_void(self):
+        table = FakeTable([state("JNS_C", "VD", at=1000.0, balance=500.0)])
+        service = make_service(table=table, config={"place_real": True, "confirm_reads": 1,
+                                                    "chip_watch_seconds": 30.0})
+        service.tick()
+        service._watch_chips({"total_bet_vn2": 0.0})
+        service._watch_chips({"total_bet_vn2": 0.0})
+        self.assertIsNotNone(service.sim.strategy.pending, "chưa đủ thời gian chờ thì chưa bỏ")
+
+
 class ConfigTests(unittest.TestCase):
     def test_config_set_persists_and_updates_the_ladder(self):
         service = make_service()

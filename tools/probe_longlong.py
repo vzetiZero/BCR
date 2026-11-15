@@ -380,6 +380,11 @@ def ws_capture(seconds=45.0, out_name="longlong-probe-ws.json"):
 
 
 def main():
+    # --port: mỗi trò dùng cổng CDP riêng (Baccarat 9222, LONG-LONG 9223).
+    if "--port" in sys.argv:
+        index = sys.argv.index("--port")
+        if len(sys.argv) > index + 1:
+            BR.CDP_PORT = int(sys.argv[index + 1])
     if "--ws" in sys.argv:
         index = sys.argv.index("--ws")
         seconds = float(sys.argv[index + 1]) if len(sys.argv) > index + 1 else 45.0
@@ -390,7 +395,8 @@ def main():
         return watch(seconds)
     items = targets()
     if not items:
-        print("Chưa thấy Chrome ở cổng 9222. Trong app bấm “Mở Chrome” rồi vào bàn LONG-LONG.")
+        print("Chưa thấy Chrome ở cổng %s. Trong app bấm “Mở Chrome” rồi vào bàn LONG-LONG."
+              % BR.CDP_PORT)
         return 1
     pages = [item for item in items
              if item.get("type") in ("page", "iframe")

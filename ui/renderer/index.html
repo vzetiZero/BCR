@@ -164,9 +164,12 @@
                   <input id="ll-min-hand-gap" type="number" min="0" max="60" step="1" />
                 </label>
               </div>
-              <p class="hint">Chống “ván ma”: chỉ chốt khi cùng một ô thắng được đọc
-                2 lần liên tiếp và hai ván cách nhau đủ lâu. Đặt 1 nếu bàn quá nhanh mà
-                tool bỏ sót ván.</p>
+              <label class="field">Chờ xác nhận chip trên bàn (giây)
+                <input id="ll-chip-watch" type="number" min="0" max="30" step="1" />
+              </label>
+              <p class="hint">Chống “ván ma” và chống tính tiền oan: chỉ chốt ván khi khối
+                KẾT QUẢ của sàn cũng đổi; nếu tiền đặt biến mất quá lâu mà chưa có kết quả
+                thì coi như sàn đã huỷ và bỏ ván đó.</p>
               <label class="field">Khoảng cách tối thiểu giữa 2 ván cùng ô thắng (giây)
                 <input id="ll-min-gap" type="number" min="5" step="1" />
               </label>

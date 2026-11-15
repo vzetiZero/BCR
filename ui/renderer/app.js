@@ -246,6 +246,9 @@ function renderLongLong(snapshot) {
   if (document.activeElement !== $('#ll-min-hand-gap')) {
     $('#ll-min-hand-gap').value = config.min_hand_gap ?? 6;
   }
+  if (document.activeElement !== $('#ll-chip-watch')) {
+    $('#ll-chip-watch').value = config.chip_watch_seconds ?? 3;
+  }
   const unitSelect = $('#ll-unit-mode');
   if (unitSelect && document.activeElement !== unitSelect) {
     unitSelect.value = config.unit_mode === 'vnd' ? 'vnd' : 'vn2';
@@ -906,6 +909,7 @@ $('#ll-save').addEventListener('click', async () => {
     min_gap: Number($('#ll-min-gap').value),
     confirm_reads: Number($('#ll-confirm-reads').value),
     min_hand_gap: Number($('#ll-min-hand-gap').value),
+    chip_watch_seconds: Number($('#ll-chip-watch').value),
     place_real: $('#ll-place-real').checked,
     auto_result: $('#ll-auto-result').checked,
     ladder,

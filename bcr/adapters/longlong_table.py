@@ -156,6 +156,38 @@ def parse_spot(text):
     return out
 
 
+CLOSED_WORDS = ("ket qua", "dong cuoc", "dong cua", "khong nhan cuoc", "ngung nhan",
+                "sap mo", "cho ket qua", "dang chia", "result", "closed", "no more bets",
+                "waiting", "last bets")
+OPEN_WORDS = ("dat cuoc", "cuoc cua ban", "bet now", "place your bet", "place bet",
+              "open bet", "bets open", "mo cuoc")
+
+
+def plain_text(text):
+    """Chữ thường, bỏ dấu tiếng Việt để so khớp câu chữ của sàn."""
+    text = str(text or "").lower()
+    for src, dst in (("àáạảãâầấậẩẫăằắặẳẵ", "a"), ("èéẹẻẽêềếệểễ", "e"),
+                     ("ìíịỉĩ", "i"), ("òóọỏõôồốộổỗơờớợởỡ", "o"),
+                     ("ùúụủũưừứựửữ", "u"), ("ỳýỵỷỹ", "y"), ("đ", "d")):
+        for ch in src:
+            text = text.replace(ch, dst)
+    return " ".join(text.split())
+
+
+def bets_closed(status):
+    """Trạng thái bàn có nói "đã đóng cược / đang ra kết quả" không.
+
+    Ưu tiên marker "mở cược": câu "ĐẶT CƯỢC CỦA BẠN" chứa cả "đặt cược", nên nếu có
+    marker mở thì KHÔNG coi là đóng — tránh chặn oan khi sàn đổi câu chữ.
+    """
+    text = plain_text(status)
+    if not text:
+        return False
+    if any(word in text for word in OPEN_WORDS):
+        return False
+    return any(word in text for word in CLOSED_WORDS)
+
+
 def detect_winner(spots):
     """Ô vừa thắng, suy ra từ class hiệu ứng của sàn.
 
@@ -383,6 +415,11 @@ class LongLongTable:
                 parsed["raw"] = DOORS.get(role, (None, None, None))[2]
                 parsed["my_chips"] = (value.get("my_chips") or {}).get(role)
                 state["doors"][role] = parsed
+            # Dấu vân tay khối KẾT QUẢ ván của chính sàn ([data-role="result"]).
+            # Rỗng nghĩa là sàn không có khối này -> bộ đếm ván chỉ dựa vào ô thắng.
+            loose = " ".join((value.get("result_cls") or "").split())
+            html = " ".join((value.get("result_html") or "").split())
+            state["result_sig"] = ("%s|%s" % (loose, html)) if (loose or html) else ""
             state["read_at"] = time.time()
             self.last_error = ""
             return state
@@ -486,7 +523,14 @@ class LongLongTable:
             if not isinstance(state, dict) or not state.get("door"):
                 return {"ok": False, "error": "Chưa thấy ô cược trên bàn."}
             if state.get("winner_present"):
-                return {"ok": False, "error": "Ván đã có kết quả; chờ ván mới."}
+                return {"ok": False, "error": "Ván đã có kết quả; chờ ván mới.",
+                        "status": clean_text(state.get("status"))}
+            # Sàn tự nói "đang ra kết quả / đã đóng cược": bấm lúc này chip sẽ bị bỏ
+            # (bàn ghi 0.0) hoặc bị huỷ sau đó — không bấm.
+            status = clean_text(state.get("status"))
+            if bets_closed(status):
+                return {"ok": False, "status": status,
+                        "error": "Chưa mở cược (%s)." % (status or "sàn báo đang ra kết quả")}
             before = parse_vn2(state.get("total_bet")) or 0.0
             denominations = [int(value) for value in (state.get("chips") or {})
                              if str(value).isdigit()]

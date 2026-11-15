@@ -89,6 +89,68 @@ class HandTrackerTests(unittest.TestCase):
         self.assertEqual(tracker.feed("JNS_C", "VD", 101.0), "VD")
 
 
+class ResultSignatureTests(unittest.TestCase):
+    """Khối KẾT QUẢ của sàn là trọng tài: khối đó không đổi thì không phải ván mới."""
+
+    SIG = "cls-result|html-result"
+
+    def test_a_door_flicker_without_a_new_result_is_ignored(self):
+        tracker = HandTracker(min_gap=15.0, min_hand_gap=6.0, confirm=2)
+        self.assertIsNone(tracker.feed("JNS_C", "VD", 100.0, self.SIG + "-1"))
+        self.assertEqual(tracker.feed("JNS_C", "VD", 102.0, self.SIG + "-1"), "VD")
+        # Ô đỏ nháy sau khi bấm chip, nhưng khối kết quả KHÔNG đổi -> không có ván mới.
+        self.assertIsNone(tracker.feed("JNS_A", "DD", 104.0, self.SIG + "-1"))
+        self.assertIsNone(tracker.feed("JNS_A", "DD", 106.0, self.SIG + "-1"))
+        self.assertEqual(tracker.hands, 1)
+
+    def test_a_real_new_result_is_accepted(self):
+        tracker = HandTracker(min_gap=15.0, min_hand_gap=6.0, confirm=2)
+        tracker.feed("JNS_C", "VD", 100.0, self.SIG + "-1")
+        tracker.feed("JNS_C", "VD", 102.0, self.SIG + "-1")
+        # Sàn công bố kết quả mới -> chốt ngay ván mới dù cùng ô thắng.
+        self.assertEqual(tracker.feed("JNS_C", "VD", 118.0, self.SIG + "-2"), "VD")
+        self.assertEqual(tracker.hands, 2)
+
+    def test_a_repeat_outcome_with_identical_markup_is_accepted_later(self):
+        # Cầu lặp: ván mới ra y hệt ván trước nên markup khối kết quả không đổi.
+        # Không được chặn mãi — quá 2*min_hand_gap thì vẫn phải chốt.
+        tracker = HandTracker(min_gap=15.0, min_hand_gap=6.0, confirm=2)
+        tracker.feed("JNS_C", "VD", 100.0, self.SIG)
+        self.assertEqual(tracker.feed("JNS_C", "VD", 102.0, self.SIG), "VD")
+        self.assertIsNone(tracker.feed("JNS_C", "VD", 110.0, self.SIG), "còn trong hạn hoãn")
+        self.assertEqual(tracker.feed("JNS_C", "VD", 130.0, self.SIG), "VD")
+        self.assertEqual(tracker.hands, 2)
+
+    def test_without_a_result_element_the_door_rule_still_works(self):
+        tracker = HandTracker(min_gap=15.0, min_hand_gap=6.0, confirm=2)
+        tracker.feed("JNS_C", "VD", 100.0, "")
+        self.assertEqual(tracker.feed("JNS_C", "VD", 102.0, ""), "VD")
+        self.assertEqual(tracker.hands, 1)
+
+    def test_reset_forgets_the_last_result_signature(self):
+        tracker = HandTracker(confirm=1)
+        tracker.feed("JNS_C", "VD", 100.0, self.SIG + "-1")
+        tracker.reset()
+        self.assertIsNone(tracker._fired_sig)
+
+
+class StatusGateTests(unittest.TestCase):
+    """Câu chữ trạng thái của sàn: chỉ chặn khi rõ ràng "đã đóng/đang ra kết quả"."""
+
+    def test_open_bets_status_is_not_closed(self):
+        self.assertFalse(LT.bets_closed("ĐẶT CƯỢC CỦA BẠN"))
+        self.assertFalse(LT.bets_closed("PLACE YOUR BETS"))
+
+    def test_result_status_is_closed(self):
+        self.assertTrue(LT.bets_closed("KẾT QUẢ"))
+        self.assertTrue(LT.bets_closed("Chờ kết quả"))
+        self.assertTrue(LT.bets_closed("NO MORE BETS"))
+
+    def test_unknown_status_is_not_blocked(self):
+        for text in ("", None, "XYZ", "—"):
+            self.assertFalse(LT.bets_closed(text), text)
+
+
 class DecomposeTests(unittest.TestCase):
     """Chia số tiền thành mệnh giá chip đang có trên khay bàn thật."""
 

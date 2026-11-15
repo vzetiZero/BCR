@@ -62,6 +62,7 @@ class LongLongController:
         # Nhịp nền: đẩy state + phát hiện Chrome bị đóng kể cả khi tool đang dừng.
         self.offline_noted = False
         self._last_place_fail = None    # (ván, lỗi) đã báo — chống spam nhật ký
+        self._chip_gone_at = None       # mốc bắt đầu thấy tiền đặt biến mất khỏi bàn
         self._heartbeat = None
         self._heartbeat_stop = None
         self.log("Engine LONG-LONG sẵn sàng.")
@@ -121,6 +122,9 @@ class LongLongController:
             # phải cách nhau ≥ 6 giây, nếu không sổ vốn sẽ tính tiền cho tay chưa mở.
             "confirm_reads": longlong_auto.DEFAULT_CONFIRM,
             "min_hand_gap": longlong_auto.DEFAULT_MIN_HAND_GAP,
+            # Bao lâu không thấy tiền đặt trên bàn (mà chưa có kết quả) thì coi như sàn
+            # đã huỷ/hoàn tiền -> bỏ ván, không tính tiền. Xem _watch_chips().
+            "chip_watch_seconds": longlong_auto.DEFAULT_CHIP_WATCH,
             "start_url": BR.START_URL,                 # link Chrome mở khi bấm “Mở Chrome”
             # Cửa sổ Chrome: cùng bộ tham số với tab Baccarat.
             "chrome_window": {"width": 1280, "height": 800, "percent": 100,
@@ -159,6 +163,14 @@ class LongLongController:
                                                     else longlong_auto.DEFAULT_MIN_HAND_GAP))
         except (TypeError, ValueError):
             config["min_hand_gap"] = longlong_auto.DEFAULT_MIN_HAND_GAP
+        try:
+            config["chip_watch_seconds"] = max(0.0, min(float(config.get("chip_watch_seconds")
+                                                             if config.get("chip_watch_seconds")
+                                                             is not None
+                                                             else longlong_auto.DEFAULT_CHIP_WATCH),
+                                                       30.0))
+        except (TypeError, ValueError):
+            config["chip_watch_seconds"] = longlong_auto.DEFAULT_CHIP_WATCH
         return config
 
     @property
@@ -377,12 +389,44 @@ class LongLongController:
         self.last_state = state
         if state.get("ok") and self.config.get("auto_result", True):
             raw = self.tracker.feed(state.get("winner"), state.get("winner_raw"),
-                                    state.get("read_at"))
+                                    state.get("read_at"), state.get("result_sig"))
             if raw:
                 self._on_hand(raw, hand=self.tracker.hands)
         if state.get("ok"):
+            self._watch_chips(state)
             self._try_place(state)
         return self._push_state()
+
+    def _watch_chips(self, state):
+        """Chip đã bấm có còn nằm trên bàn không?
+
+        Sàn có thể nhận cú bấm (tổng nhảy lên) rồi huỷ/hoàn tiền khi cửa sổ cược đã
+        đóng. Nếu tiền của mình biến mất TRƯỚC khi có kết quả ván mới thì lệnh đó không
+        được tính vào sổ — đây chính là chỗ sinh ra "báo THẮNG cho tay không có tiền".
+        """
+        strategy = self.sim.strategy
+        pending = strategy.pending
+        if not pending or not self.config.get("place_real", False):
+            self._chip_gone_at = None
+            return
+        amount = float(pending.get("amount_site") or 0)
+        total = state.get("total_bet_vn2")
+        if amount <= 0 or total is None:
+            return
+        if total + 0.01 >= amount:
+            self._chip_gone_at = None       # còn tiền trên bàn: yên tâm chờ kết quả
+            return
+        now = time.monotonic()
+        if self._chip_gone_at is None:
+            self._chip_gone_at = now
+            return
+        if now - self._chip_gone_at < float(self.config.get("chip_watch_seconds",
+                                                           longlong_auto.DEFAULT_CHIP_WATCH)):
+            return
+        strategy.pending = None
+        self._chip_gone_at = None
+        self.log("Tiền đặt (%s) biến mất trước khi có kết quả — sàn đã huỷ/hoàn tiền: "
+                 "bỏ ván, không tính." % _fn(amount), "error")
 
     # ------------------------------------------------------------------ một ván
     def _on_hand(self, raw, hand=None):
@@ -417,6 +461,7 @@ class LongLongController:
         else:
             self.log("Ván %d: ra %s" % (hand, longlong.raw_label(raw)))
         self._last_place_fail = None
+        self._chip_gone_at = None
         plan = strategy.plan()
         if plan["action"] == "bet":
             amount = longlong.to_site_amount(plan["stake"], self.unit_mode)
@@ -460,6 +505,10 @@ class LongLongController:
             result = self.table.place(amount)
             if result.get("ok"):
                 self.sim.strategy.arm(hand=self.tracker.hands + 1)
+                if self.sim.strategy.pending is not None:
+                    # Ghi lại số tiền đã nằm trên bàn để canh chip có bị huỷ không.
+                    self.sim.strategy.pending["amount_site"] = amount
+                self._chip_gone_at = None
                 self._last_place_fail = None
                 self.log("Đã đặt %s %s (= %sđ) vào ô %s · chip %s · tổng của bạn %s" % (
                     _fn(amount), longlong.UNIT_MODE_SHORT[mode],
@@ -472,7 +521,10 @@ class LongLongController:
                 key = (self.tracker.hands, result.get("error") or "?")
                 if key != getattr(self, "_last_place_fail", None):
                     self._last_place_fail = key
-                    self.log("Đặt chip chưa được: %s" % (result.get("error") or "?"), "error")
+                    status = result.get("status")
+                    note = (" [sàn báo: %s]" % status) if status else ""
+                    self.log("Đặt chip chưa được: %s%s" % (result.get("error") or "?", note),
+                             "error")
                     hint = self._unit_hint(stake, result)
                     if hint:
                         self.log(hint, "error")
@@ -552,6 +604,13 @@ class LongLongController:
                 self.config["confirm_reads"] = max(1, min(int(params["confirm_reads"]), 5))
                 self.tracker.configure(confirm=self.config["confirm_reads"])
                 changed.append("confirm_reads")
+            except (TypeError, ValueError):
+                pass
+        if "chip_watch_seconds" in params:
+            try:
+                self.config["chip_watch_seconds"] = max(0.0, min(float(params["chip_watch_seconds"]),
+                                                                30.0))
+                changed.append("chip_watch_seconds")
             except (TypeError, ValueError):
                 pass
         if "start_url" in params:
