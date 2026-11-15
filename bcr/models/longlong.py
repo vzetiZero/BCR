@@ -35,6 +35,7 @@ NGUYÊN TẮC ĐÁNH (chỉ đánh ô "1 vàng 1 đỏ")
 Module thuần trạng thái: không phụ thuộc giao diện, trình duyệt hay Baccarat.
 """
 
+import math
 import re
 
 # Một tay cho ra một bộ; VD và DV là cùng một ô cược nên giữ nguyên thứ tự đã ra.
@@ -51,13 +52,18 @@ RAW_LABEL = {"VV": "2 vàng", "DD": "2 đỏ", "VD": "vàng-đỏ", "DV": "đỏ
 # Thang gấp thếp tính theo ĐƠN VỊ CỦA SẢNH: 1 đv = 1.000đ, nên 40 đv = 40.000đ.
 DEFAULT_BASE = 40
 DEFAULT_STEPS = 8
+# Hệ số nhân mỗi bậc khi chia vốn (bảng chia vốn thực tế đang dùng ×2.25):
+#   40 · 90 · 210 · 480 · 1.080 · 2.430 · 5.470  -> tổng 9.800 đv (vừa 10 triệu).
+DEFAULT_LADDER_MULT = 2.25
+MULT_LOWER, MULT_UPPER = 1.01, 10.0
 # Vốn phiên mặc định: 10.000 đv = 10.000.000đ.
 DEFAULT_CAPITAL = 10000
 # Làm tròn bậc cuối về bội số 10 đv (= 10.000đ) để số tiền luôn chẵn, dễ bấm chip.
 ROUND_STEP = 10
 
-# Vốn 10 triệu chia 8 tay gấp đôi: 40 → 4.920 (bậc cuối bù phần lẻ), tổng đúng 10.000 đv.
-DEFAULT_LADDER = [40, 80, 160, 320, 640, 1280, 2560, 4920]
+# Vốn 10 triệu chia theo hệ số 2.25: 40 → 5.470, tổng 9.800 đv (dừng ở tay 7 vì tay 8
+# 12.310 sẽ vượt vốn). Đúng bằng ladder_for_capital(DEFAULT_CAPITAL).
+DEFAULT_LADDER = [40, 90, 210, 480, 1080, 2430, 5470]
 
 LADDER_LOWER = 1
 LADDER_UPPER = 20
@@ -188,56 +194,83 @@ def raw_label(raw):
     return RAW_LABEL.get(raw, str(raw or "?"))
 
 
-def multiply_ladder(base, steps=DEFAULT_STEPS):
-    """Sinh thang gấp thếp ×2 từ mức gốc theo đơn vị sảnh (40 → 40, 80, 160, ...)."""
+def normalize_mult(value, default=DEFAULT_LADDER_MULT):
+    """Hệ số nhân bậc hợp lệ (1.01–10); giá trị lạ thì về ``default``."""
+    try:
+        number = float(str(value).replace(",", ".").strip())
+    except (TypeError, ValueError):
+        return float(default)
+    if not MULT_LOWER <= number <= MULT_UPPER:
+        return float(default)
+    return number
+
+
+def ceil_step(value, step=1):
+    """Làm tròn LÊN bội số ``step``: (202.5, 10) -> 210; (1080, 10) -> 1080."""
+    step = max(1, int(step or 1))
+    try:
+        ratio = round(float(value) / step, 6)
+    except (TypeError, ValueError):
+        return step
+    return int(math.ceil(ratio) * step)
+
+
+def multiply_ladder(base, steps=DEFAULT_STEPS, mult=2.0, round_to=None):
+    """Sinh thang gấp thếp từ mức gốc theo ``mult`` (mặc định ×2 như DEFAULT_LADDER).
+
+    ``round_to`` (tuỳ chọn) làm tròn LÊN bội số cho số tiền chẵn, giống bảng chia vốn
+    thực tế: 40 × 2.25 = 90; 90 × 2.25 = 202,5 -> 210; 210 × 2.25 = 472,5 -> 480.
+    """
     try:
         value = float(str(base).replace(".", "").replace(",", "").strip())
     except (TypeError, ValueError):
         value = float(DEFAULT_BASE)
     if not value > 0:
         value = float(DEFAULT_BASE)
+    factor = normalize_mult(mult)
+    step = max(1, int(round_to or 1))
     steps = max(1, min(int(steps), LADDER_UPPER))
-    return [int(value * (2 ** i)) for i in range(steps)]
+    ladder = []
+    stake = ceil_step(value, step)
+    for _ in range(steps):
+        ladder.append(int(stake))
+        stake = ceil_step(stake * factor, step)
+    return ladder
 
 
-def ladder_for_capital(capital, base=DEFAULT_BASE, steps=DEFAULT_STEPS, round_to=ROUND_STEP):
-    """Chia vốn thành thang gấp đôi: các bậc ×2, bậc cuối nhận phần còn lại.
+def ladder_for_capital(capital, base=DEFAULT_BASE, steps=DEFAULT_STEPS, round_to=ROUND_STEP,
+                       mult=DEFAULT_LADDER_MULT):
+    """Chia vốn theo hệ số nhân ``mult``: chỉ thêm bậc khi TỔNG còn nằm trong vốn.
 
-    Ví dụ vốn 10.000 đv, gốc 40, 8 bậc -> 40, 80, 160, 320, 640, 1.280, 2.560, 4.920
-    (tổng đúng 10.000 đv = 10.000.000đ). Bậc cuối được làm tròn XUỐNG bội số
-    ``round_to`` để số tiền chẵn; nếu vốn không đủ cho đủ số bậc thì cắt bớt bậc cuối.
+    Vốn 10.000 đv, gốc 40, hệ số 2.25 (làm tròn lên bội 10):
+
+        40 · 90 · 210 · 480 · 1.080 · 2.430 · 5.470   (tổng 9.800 đv)
+        -> DỪNG, vì bậc kế tiếp 12.310 sẽ đẩy tổng lên 22.110 > 10.000.
+
+    Khác cách cũ (nhồi phần vốn còn lại vào bậc cuối): bậc cuối ở đây luôn đúng hệ số,
+    nên "lãi nếu thắng" của từng tay đều dương và vốn không bị dồn vào một tay lẻ.
     """
     steps = max(1, min(int(steps or DEFAULT_STEPS), LADDER_UPPER))
-    doubling = multiply_ladder(base, steps)
+    step = max(1, int(round_to or 1))
+    factor = normalize_mult(mult)
     try:
         target = int(capital)
     except (TypeError, ValueError):
         target = 0
     if target <= 0:
-        return doubling
-    if steps == 1:
+        return multiply_ladder(base, steps, factor, step)
+    first = int(ceil_step(base, step))
+    if first > target:
+        # Vốn không đủ cho bậc gốc: giữ đúng một bậc bằng vốn để tool còn chạy được.
         return [max(1, target)]
-    # Vốn không đủ cho bậc đầu: giữ đúng một bậc bằng vốn.
-    if doubling[0] > target:
-        return [target]
-    body = [stake for stake in doubling[:-1]]
-    while len(body) > 1 and sum(body) + body[-1] > target:
-        body.pop()
-    rest = target - sum(body)
-    step = max(1, int(round_to or 1))
-    last = (rest // step) * step
-    if last < body[-1]:
-        # Phần còn lại nhỏ hơn bậc trước: bỏ bớt một bậc để bậc cuối vẫn lớn dần.
-        if len(body) > 1:
-            body.pop()
-            rest = target - sum(body)
-            last = (rest // step) * step
-        if last < body[-1]:
-            # Vốn quá nhỏ cho thang gấp đôi: giữ các bậc đã vừa vốn, không thêm bậc lẻ.
-            return body
-    if last <= 0:
-        return body
-    return body + [last]
+    ladder, total, stake = [], 0, first
+    for _ in range(steps):
+        if total + stake > target:
+            break
+        ladder.append(int(stake))
+        total += int(stake)
+        stake = int(ceil_step(stake * factor, step))
+    return ladder or [max(1, target)]
 
 
 def normalize_ladder(stakes=None):

@@ -95,7 +95,26 @@ Lệnh LONG-LONG: `chrome.open|close|status|window`, `tool.start|stop`, `config.
 (nhận cả `unit_mode`, `start_url`, `chrome_window`), `ladder.fromCapital`, `hand.manual`,
 `session.reset`, `tick`.
 
-## Đơn vị tiền trên sàn (LONG-LONG)
+## Chia thang theo vốn (LONG-LONG)
+
+Cấu hình → **Vốn & thang** → nhập *Mức gốc*, *Vốn phiên*, *Hệ số nhân mỗi bậc* (mặc định
+**2.25**) rồi bấm **Chia thang theo vốn**.
+
+Quy tắc: mỗi bậc = bậc trước × hệ số, **làm tròn lên bội 10 đv**; chỉ thêm bậc khi
+**tổng vốn còn nằm trong vốn phiên** → thang có thể ít tay hơn số bậc tối đa.
+
+| Vốn | Gốc | Hệ số | Thang | Tổng |
+|---|---|---|---|---|
+| 10.000 đv (10 triệu) | 40 | 2.25 | 40 · 90 · 210 · 480 · 1.080 · 2.430 · 5.470 | 9.800 đv → **dừng ở tay 7** |
+| 3.000 đv (3 triệu) | 40 | 2.25 | 40 · 90 · 210 · 480 · 1.080 | 1.900 đv |
+| 10.000 đv | 40 | 2.00 | 40 · 80 · 160 · 320 · 640 · 1.280 · 2.560 | 5.080 đv |
+
+Tay 8 của thang ×2.25 là 12.310 đv, cộng dồn 22.110 đv nên với 10 triệu thì **không đủ
+vốn để chơi tay 8** — tool dừng thang ở tay 7 (chạm đáy là dừng phiên).
+
+Thẻ *Thang cược* trên tab Bàn chơi hiện `· 7 tay · tổng 9.800 đv (9.800.000 đ) · ×2.25 · vốn 10.000 đv`.
+
+
 
 Một bậc thang cược luôn là "đv" = 1.000đ, nhưng **số tiền gửi cho sàn phải cùng thang
 với khay chip**, nên tab Cấu hình có 2 lựa chọn (`config.unit_mode`):

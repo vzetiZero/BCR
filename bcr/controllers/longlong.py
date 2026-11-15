@@ -118,6 +118,8 @@ class LongLongController:
             "ladder": list(longlong.DEFAULT_LADDER),
             "base": longlong.DEFAULT_BASE,
             "capital": longlong.DEFAULT_CAPITAL,       # đơn vị sảnh (10.000 = 10 triệu)
+            # Hệ số nhân mỗi bậc khi chia vốn (2.25 = bảng chia vốn đang dùng).
+            "ladder_mult": longlong.DEFAULT_LADDER_MULT,
             # Đơn vị tiền trên KHAY CHIP của sàn: "vn2" (chip 40 = 40.000đ) hay "vnd"
             # (chip 10.000 = 10.000đ). Xem bcr.models.longlong.UNIT_*.
             "unit_mode": longlong.DEFAULT_UNIT_MODE,
@@ -163,6 +165,7 @@ class LongLongController:
             (window.get("width"), window.get("height")),
             window.get("percent"), window.get("fullscreen"))
         config["unit_mode"] = longlong.normalize_unit_mode(config.get("unit_mode"))
+        config["ladder_mult"] = longlong.normalize_mult(config.get("ladder_mult"))
         try:
             config["confirm_reads"] = max(1, min(int(config.get("confirm_reads")
                                                     or longlong_auto.DEFAULT_CONFIRM), 5))
@@ -735,6 +738,12 @@ class LongLongController:
                 changed.append("base")
             except (TypeError, ValueError):
                 pass
+        if "ladder_mult" in params:
+            mult = longlong.normalize_mult(params.get("ladder_mult"))
+            if mult != self.config.get("ladder_mult"):
+                self.config["ladder_mult"] = mult
+                changed.append("ladder_mult")
+                self.log("Hệ số nhân bậc: ×%g (bấm “Chia thang theo vốn” để áp dụng)." % mult)
         if "capital" in params:
             try:
                 self.config["capital"] = int(params["capital"])
@@ -810,13 +819,25 @@ class LongLongController:
         return self._push_ok()
 
     def ladder_from_capital(self, params):
-        stakes = longlong.ladder_for_capital(params.get("capital"),
-                                            params.get("base", self.config["base"]),
-                                            int(params.get("steps") or len(self.config["ladder"])))
+        """Chia thang theo vốn với hệ số nhân ``mult`` (mặc định 2.25).
+
+        Chỉ thêm bậc khi tổng còn nằm trong vốn; bậc cuối luôn đúng hệ số (không nhồi
+        phần lẻ), nên số tay có thể ít hơn ``steps`` — đúng như bảng chia vốn thực tế.
+        """
+        base = params.get("base", self.config["base"])
+        capital = params.get("capital", self.config["capital"])
+        mult = longlong.normalize_mult(params.get("mult", self.config.get("ladder_mult")))
+        steps = int(params.get("steps") or len(self.config["ladder"]))
+        stakes = longlong.ladder_for_capital(capital, base, steps, mult=mult)
         self.config["ladder"] = stakes
+        self.config["ladder_mult"] = mult
+        self.config["base"] = int(base) if str(base).isdigit() else self.config["base"]
         self.sim.set_ladder(stakes)
         self._save_config()
-        self.log("Chia thang theo vốn: %s." % " → ".join(str(s) for s in stakes))
+        total = sum(stakes)
+        self.log("Chia thang theo vốn: %s (×%g) · %d tay · tổng %s đv (= %s) / vốn %s đv." % (
+            " → ".join(str(s) for s in stakes), mult, len(stakes), _fn(total),
+            _fn(total * longlong.DONG_PER_UNIT), _fn(capital)))
         return self._push_ok()
 
     def session_reset(self):

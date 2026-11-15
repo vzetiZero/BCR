@@ -247,6 +247,14 @@ function renderLongLong(snapshot) {
       })
       .join('');
   }
+  const ladderTotal = $('#ll-ladder-total');
+  if (ladderTotal) {
+    const sum = ladder.reduce((acc, value) => acc + Number(value || 0), 0);
+    const config = snapshot.config || {};
+    ladderTotal.textContent = `· ${ladder.length} tay · tổng ${fmtUnits(sum)} đv`
+      + ` (${fmtVnd(sum * 1000)}) · ×${config.ladder_mult ?? 2.25}`
+      + ` · vốn ${fmtUnits(config.capital || 0)} đv`;
+  }
 
   const chromeChip = $('#ll-chrome-chip');
   chromeChip.textContent = snapshot.chrome_connected ? 'Chrome: đã kết nối' : 'Chrome: chưa kết nối';
@@ -263,6 +271,7 @@ function renderLongLong(snapshot) {
   const config = snapshot.config || {};
   if (document.activeElement !== $('#ll-base')) $('#ll-base').value = config.base ?? '';
   if (document.activeElement !== $('#ll-capital')) $('#ll-capital').value = config.capital ?? '';
+  if (document.activeElement !== $('#ll-mult')) $('#ll-mult').value = config.ladder_mult ?? 2.25;
   if (document.activeElement !== $('#ll-min-gap')) $('#ll-min-gap').value = config.min_gap ?? 15;
   if (document.activeElement !== $('#ll-confirm-reads')) {
     $('#ll-confirm-reads').value = config.confirm_reads ?? 2;
@@ -932,6 +941,7 @@ $('#ll-save').addEventListener('click', async () => {
   await call('longlong', 'config.set', {
     base: Number($('#ll-base').value),
     capital: Number($('#ll-capital').value),
+    ladder_mult: Number($('#ll-mult').value),
     unit_mode: $('#ll-unit-mode').value,
     min_gap: Number($('#ll-min-gap').value),
     confirm_reads: Number($('#ll-confirm-reads').value),
@@ -959,6 +969,7 @@ $('#ll-divide').addEventListener('click', async () => {
   await call('longlong', 'ladder.fromCapital', {
     capital: Number($('#ll-capital').value),
     base: Number($('#ll-base').value),
+    mult: Number($('#ll-mult').value),
   });
   toast('Đã chia thang theo vốn.');
 });

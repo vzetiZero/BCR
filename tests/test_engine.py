@@ -495,9 +495,16 @@ class ConfigTests(unittest.TestCase):
 
     def test_ladder_from_capital_matches_the_board(self):
         service = make_service()
-        snapshot = service.ladder_from_capital({"capital": 10000, "base": 40})
-        self.assertEqual(snapshot["ladder"], [40, 80, 160, 320, 640, 1280, 2560, 4920])
-        self.assertEqual(sum(snapshot["ladder"]), 10000)
+        snapshot = service.ladder_from_capital({"capital": 10000, "base": 40, "mult": 2.25})
+        self.assertEqual(snapshot["ladder"], [40, 90, 210, 480, 1080, 2430, 5470])
+        self.assertEqual(sum(snapshot["ladder"]), 9800, "dừng ở tay 7, không vượt vốn")
+        self.assertEqual(snapshot["config"]["ladder_mult"], 2.25)
+
+    def test_ladder_from_capital_with_mult_two_keeps_room(self):
+        service = make_service()
+        snapshot = service.ladder_from_capital({"capital": 10000, "base": 40, "mult": 2})
+        self.assertEqual(snapshot["ladder"], [40, 80, 160, 320, 640, 1280, 2560])
+        self.assertLessEqual(sum(snapshot["ladder"]), 10000)
 
     def test_session_reset_clears_strategy_and_tracker(self):
         service = make_service()
@@ -685,7 +692,7 @@ class LongLongStatsWiringTests(unittest.TestCase):
         self.assertEqual(stats["hands"], 2)
         self.assertEqual((stats["wins"], stats["losses"]), (1, 1))
         self.assertEqual(stats["max_loss_streak"], 1)
-        self.assertEqual(stats["net_units"], 36)          # -40 (bậc 1) + 76 (bậc 2 thắng)
+        self.assertAlmostEqual(stats["net_units"], 45.5, places=6)  # -40 + 85,5 (bậc 2)
         self.assertEqual(stats["recent"], ["L", "W"])
 
 

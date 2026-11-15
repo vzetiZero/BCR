@@ -40,27 +40,28 @@ class LongLongPayoutTests(unittest.TestCase):
 
 
 class LongLongLadderTests(unittest.TestCase):
-    def test_default_ladder_is_ten_million_split_into_eight_doubling_hands(self):
-        # Cấu hình chốt: vốn 10 triệu, 8 tay gấp đôi, bậc cuối 4.920.000đ bù phần lẻ.
+    def test_default_ladder_is_the_capital_allocation_with_the_default_multiplier(self):
+        # Cấu hình chốt: vốn 10 triệu, gốc 40, hệ số 2.25 -> 7 tay, tổng 9.800 đv.
         self.assertEqual(longlong.DEFAULT_BASE, 40)
         self.assertEqual(longlong.DEFAULT_STEPS, 8)
         self.assertEqual(longlong.DEFAULT_CAPITAL, 10000)      # 10.000 đv = 10.000.000đ
+        self.assertEqual(longlong.DEFAULT_LADDER_MULT, 2.25)
         self.assertEqual(longlong.DEFAULT_LADDER,
-                         [40, 80, 160, 320, 640, 1280, 2560, 4920])
-        self.assertEqual(longlong.ladder_total(longlong.DEFAULT_LADDER), 10000)
-        for i in range(1, len(longlong.DEFAULT_LADDER) - 1):
-            self.assertEqual(longlong.DEFAULT_LADDER[i],
-                             longlong.DEFAULT_LADDER[i - 1] * 2)
+                         [40, 90, 210, 480, 1080, 2430, 5470])
+        self.assertEqual(longlong.DEFAULT_LADDER,
+                         longlong.ladder_for_capital(longlong.DEFAULT_CAPITAL))
+        self.assertEqual(longlong.ladder_total(longlong.DEFAULT_LADDER), 9800)
 
-    def test_ladder_for_capital_reproduces_the_board(self):
+    def test_ladder_for_capital_uses_the_default_multiplier(self):
+        # Hệ số mặc định đang dùng là ×2.25 (bảng chia vốn thực tế): dừng ở tay 7.
         self.assertEqual(longlong.ladder_for_capital(10000),
-                         [40, 80, 160, 320, 640, 1280, 2560, 4920])
+                         [40, 90, 210, 480, 1080, 2430, 5470])
 
-    def test_tail_absorbs_the_remainder_and_rounds_to_an_even_amount(self):
-        ladder = longlong.ladder_for_capital(10000, 20, 12)
-        self.assertEqual(longlong.ladder_total(ladder), 10000)
-        self.assertEqual(ladder[-1], 4900, "bậc cuối làm tròn xuống bội số 10 đv")
-        self.assertGreaterEqual(ladder[-1], ladder[-2])
+    def test_every_rung_follows_the_multiplier(self):
+        ladder = longlong.ladder_for_capital(10000, 20, 12, mult=2.25)
+        self.assertLessEqual(longlong.ladder_total(ladder), 10000)
+        for prev, cur in zip(ladder, ladder[1:]):
+            self.assertEqual(cur, longlong.ceil_step(prev * 2.25, longlong.ROUND_STEP))
 
     def test_ladder_never_exceeds_the_capital(self):
         for capital in (25, 40, 50, 200, 1000, 5000, 10000, 12345):
@@ -68,8 +69,9 @@ class LongLongLadderTests(unittest.TestCase):
             self.assertLessEqual(longlong.ladder_total(ladder), capital, capital)
             self.assertTrue(all(stake > 0 for stake in ladder), capital)
 
-    def test_zero_capital_falls_back_to_the_pure_doubling(self):
-        self.assertEqual(longlong.ladder_for_capital(0, 40, 4), [40, 80, 160, 320])
+    def test_zero_capital_falls_back_to_the_full_ladder(self):
+        self.assertEqual(longlong.ladder_for_capital(0, 40, 4), [40, 90, 210, 480])
+        self.assertEqual(longlong.ladder_for_capital(0, 40, 4, mult=2), [40, 80, 160, 320])
 
     def test_multiply_ladder_builds_doubling_from_a_base(self):
         self.assertEqual(longlong.multiply_ladder(20, 4), [20, 40, 80, 160])
@@ -230,16 +232,17 @@ class LongLongStrategyTests(unittest.TestCase):
         self.assertFalse(s.stopped)
         self.assertEqual(s.step, 0)
 
-    def test_losing_the_whole_ladder_costs_exactly_the_configured_capital(self):
-        """Thua đủ 8 bậc = mất đúng 10.000 đv = 10.000.000đ rồi dừng."""
+    def test_losing_the_whole_ladder_costs_exactly_the_ladder_total(self):
+        """Thua hết thang = mất đúng tổng các bậc; phần vốn chưa dùng còn nguyên."""
         sim = longlong.LongLongSimulation(longlong.DEFAULT_LADDER, capital=10_000_000)
         hands = []
         for _ in range(len(longlong.DEFAULT_LADDER)):
             hands += ["VD", "VV"]          # bộ vàng-đỏ kích hoạt -> tay sau thua
         sim.ingest(hands)
+        spent = longlong.ladder_total(longlong.DEFAULT_LADDER) * 1000.0
         self.assertTrue(sim.strategy.stopped)
-        self.assertAlmostEqual(sim.balance, 0.0)
-        self.assertAlmostEqual(sim.balance - sim.start_capital, -10_000_000.0)
+        self.assertAlmostEqual(sim.balance, 10_000_000.0 - spent)
+        self.assertAlmostEqual(sim.balance - sim.start_capital, -spent)
         self.assertEqual(len(sim.log), len(longlong.DEFAULT_LADDER))
 
     def test_matches_the_walkthrough_from_the_rule_book(self):
@@ -470,6 +473,49 @@ class LongLongUnitModeTests(unittest.TestCase):
         self.assertEqual(longlong.to_site_amount("x", longlong.UNIT_VND), 0)
         self.assertEqual(longlong.to_site_amount(None, longlong.UNIT_VND), 0)
         self.assertEqual(longlong.from_site_amount("x", longlong.UNIT_VND), 0.0)
+
+
+class LadderFromCapitalTests(unittest.TestCase):
+    """Chia vốn theo hệ số nhân: chỉ thêm bậc khi tổng còn trong vốn.
+
+    Bảng chia vốn thực tế đang dùng: gốc 40, ×2.25, làm tròn lên bội 10 →
+    40 · 90 · 210 · 480 · 1.080 · 2.430 · 5.470 (tổng 9.800 đv); vốn 10 triệu thì
+    dừng ở tay 7 vì tay 8 (12.310) đẩy tổng lên 22.110.
+    """
+
+    BOARD = [40, 90, 210, 480, 1080, 2430, 5470]
+
+    def test_matches_the_real_allocation_table(self):
+        self.assertEqual(longlong.ladder_for_capital(10000, base=40, mult=2.25),
+                         self.BOARD)
+        self.assertEqual(sum(self.BOARD), 9800)
+
+    def test_stops_when_the_next_rung_would_exceed_the_capital(self):
+        ladder = longlong.ladder_for_capital(10000, base=40, mult=2.25)
+        self.assertEqual(len(ladder), 7)
+        self.assertLessEqual(sum(ladder), 10000)
+        next_rung = longlong.ceil_step(ladder[-1] * 2.25, 10)
+        self.assertGreater(sum(ladder) + next_rung, 10000)
+
+    def test_rounds_each_rung_up_to_the_step(self):
+        self.assertEqual(longlong.ceil_step(202.5, 10), 210)
+        self.assertEqual(longlong.ceil_step(472.5, 10), 480)
+        self.assertEqual(longlong.ceil_step(1080, 10), 1080)
+        self.assertEqual(longlong.ceil_step(5467.5, 10), 5470)
+
+    def test_multiply_ladder_uses_the_multiplier(self):
+        self.assertEqual(longlong.multiply_ladder(40, 4, 2.25, 10), [40, 90, 210, 480])
+        self.assertEqual(longlong.multiply_ladder(40, 4, 2), [40, 80, 160, 320])
+
+    def test_small_capital_keeps_one_affordable_rung(self):
+        self.assertEqual(longlong.ladder_for_capital(30, base=40, mult=2.25), [30])
+        self.assertEqual(longlong.ladder_for_capital(3000, base=40, mult=2.25),
+                         [40, 90, 210, 480, 1080])
+
+    def test_bad_multiplier_falls_back_to_the_default(self):
+        for value in (None, 0, 1, 99, "x"):
+            self.assertEqual(longlong.normalize_mult(value), longlong.DEFAULT_LADDER_MULT, value)
+        self.assertEqual(longlong.normalize_mult("2,5"), 2.5)
 
 
 if __name__ == "__main__":
