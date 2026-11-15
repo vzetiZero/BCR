@@ -175,7 +175,13 @@ function renderLongLong(snapshot) {
   $('#ll-hands').textContent = `${snapshot.hands_seen || 0} ván đã thấy`;
 
   $('#ll-total').textContent = fmtSite(snapshot.total_bet_vn2);
-  $('#ll-phase').textContent = snapshot.status || 'chưa có ván';
+  const ws = snapshot.ws || {};
+  // Luồng WebSocket của sàn: cho biết đang ở phase nào và còn bao lâu mới đóng cược.
+  const wsText = ws.ok
+    ? `${ws.phase || '—'}${ws.remaining_ms !== null && ws.remaining_ms !== undefined
+        ? ` · còn ${(ws.remaining_ms / 1000).toFixed(1)}s` : ''}`
+    : (ws.error || 'chưa có luồng sàn');
+  $('#ll-phase').textContent = `${snapshot.status || 'chưa có ván'} · ${wsText}`;
 
   const plan = snapshot.plan || {};
   const planState = $('#ll-plan-state');

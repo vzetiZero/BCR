@@ -16,6 +16,7 @@ import threading
 import time
 
 from bcr.adapters import browser as BR
+from bcr.adapters import longlong_stream
 from bcr.adapters import longlong_table
 from bcr.controllers import longlong_auto
 from bcr.models import longlong
@@ -53,6 +54,8 @@ class LongLongController:
                                                      longlong_auto.DEFAULT_CONFIRM))
         self.table = longlong_table.LongLongTable()
         self.browser = BR.BrowserSession()
+        self.stream = longlong_stream.LongLongStream(session=self.browser)
+        self._ws_settled_round = None   # ván cuối cùng đã tất toán từ luồng WebSocket
         self.logs = collections.deque(maxlen=200)
         self.tool_running = False
         self._stop = threading.Event()
@@ -125,6 +128,9 @@ class LongLongController:
             # Bao lâu không thấy tiền đặt trên bàn (mà chưa có kết quả) thì coi như sàn
             # đã huỷ/hoàn tiền -> bỏ ván, không tính tiền. Xem _watch_chips().
             "chip_watch_seconds": longlong_auto.DEFAULT_CHIP_WATCH,
+            # Luồng WebSocket của sàn: biết đúng ván / cửa sổ cược / kết quả.
+            "use_ws": True,
+            "min_bet_ms": 3000,      # còn ít hơn mức này thì không bấm (tránh vào muộn)
             "start_url": BR.START_URL,                 # link Chrome mở khi bấm “Mở Chrome”
             # Cửa sổ Chrome: cùng bộ tham số với tab Baccarat.
             "chrome_window": {"width": 1280, "height": 800, "percent": 100,
@@ -171,6 +177,11 @@ class LongLongController:
                                                        30.0))
         except (TypeError, ValueError):
             config["chip_watch_seconds"] = longlong_auto.DEFAULT_CHIP_WATCH
+        config["use_ws"] = bool(config.get("use_ws", True))
+        try:
+            config["min_bet_ms"] = max(0, min(int(config.get("min_bet_ms") or 3000), 60000))
+        except (TypeError, ValueError):
+            config["min_bet_ms"] = 3000
         return config
 
     @property
@@ -241,6 +252,8 @@ class LongLongController:
             "stopped": strategy.stopped,
             "plan": plan,
             "hands_seen": self.tracker.hands,
+            # Luồng WebSocket của sàn (nguồn chuẩn): ván nào, phase nào, còn bao lâu.
+            "ws": self._ws_state(),
             "log": [dict(entry) for entry in strategy.log[-20:]],
             "profit_units": self.sim.profit / 1000.0,
             # Số liệu cho tab Thống kê: tỉ lệ thắng/thua, chuỗi thua dài nhất, đường lãi/lỗ.
@@ -251,6 +264,24 @@ class LongLongController:
         state = self.snapshot()
         self.emit.event("state", state)
         return state
+
+    def _ws_state(self):
+        """Ảnh chụp luồng WebSocket để UI hiện phase / thời gian còn lại / ván."""
+        try:
+            snap = self.stream.snapshot()
+        except Exception:
+            return {"ok": False}
+        return {
+            "ok": bool(snap.get("ok")),
+            "phase": snap.get("phase"),
+            "round": snap.get("round"),
+            "number": snap.get("number"),
+            "remaining_ms": snap.get("remaining_ms"),
+            "result": snap.get("result"),
+            "result_round": snap.get("result_round"),
+            "age_ms": snap.get("age_ms"),
+            "error": snap.get("error") if not snap.get("ok") else None,
+        }
 
     def _push_ok(self):
         """Đẩy state mới và trả về kèm ok=True cho các method làm thay đổi dữ liệu."""
@@ -339,6 +370,7 @@ class LongLongController:
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True, name="ll-tool")
         self._thread.start()
+        self.stream.start()          # nghe luồng WebSocket của sàn (nguồn chuẩn)
         self.log("Chạy tool: %s." % ("ĐẶT CHIP THẬT" if self.config["place_real"]
                                      else "chế độ mô phỏng (không bấm chip)"))
         return {"ok": True}
@@ -354,6 +386,7 @@ class LongLongController:
             if not getattr(self.browser, "connected", False):
                 self.tool_running = False
                 self.last_state = {}
+                self.stream.stop()
                 self.log("Chrome đã đóng · đã dừng tool. Bấm “Mở Chrome” để chạy lại.", "error")
                 break
             try:
@@ -362,6 +395,7 @@ class LongLongController:
                 self.log("Lỗi vòng đọc: %s" % exc, "error")
             self._stop.wait(self._next_wait())
         self.tool_running = False
+        self.stream.stop()
         self._push_state()
 
     def _next_wait(self):
@@ -383,26 +417,45 @@ class LongLongController:
         return self.interval
 
     def tick(self):
-        """Một nhịp: đọc bàn -> chốt ván -> (nếu được bật) đặt chip -> phát state."""
+        """Một nhịp: đọc bàn + luồng sàn -> chốt ván -> (nếu được bật) đặt chip."""
         state = self.table.read()
         state.setdefault("read_at", time.time())
         self.last_state = state
-        if state.get("ok") and self.config.get("auto_result", True):
+        wsnap = self.stream.snapshot() if self.config.get("use_ws", True) else {"ok": False}
+        if state.get("ok") and wsnap.get("ok"):
+            # Luồng WebSocket là nguồn chuẩn: biết đúng ván, đúng kết quả.
+            self._settle_from_stream(wsnap)
+        elif state.get("ok") and self.config.get("auto_result", True):
+            # Không có luồng: lùi về đọc class ô thắng như trước.
             raw = self.tracker.feed(state.get("winner"), state.get("winner_raw"),
                                     state.get("read_at"), state.get("result_sig"))
             if raw:
                 self._on_hand(raw, hand=self.tracker.hands)
         if state.get("ok"):
-            self._watch_chips(state)
-            self._try_place(state)
+            self._watch_chips(state, wsnap)
+            self._try_place(state, wsnap)
         return self._push_state()
 
-    def _watch_chips(self, state):
+    def _settle_from_stream(self, wsnap):
+        """Chốt ván khi luồng sàn báo ``GameResolved`` của một ván mới."""
+        round_id = wsnap.get("round")
+        result_round = wsnap.get("result_round")
+        raw = wsnap.get("result")
+        if not result_round or not raw:
+            return
+        if result_round == self._ws_settled_round:
+            return
+        self._ws_settled_round = result_round
+        self.tracker.hands = max(self.tracker.hands, 0) + 1
+        self._on_hand(raw, hand=self.tracker.hands, round_id=result_round)
+
+    def _watch_chips(self, state, wsnap=None):
         """Chip đã bấm có còn nằm trên bàn không?
 
         Sàn có thể nhận cú bấm (tổng nhảy lên) rồi huỷ/hoàn tiền khi cửa sổ cược đã
         đóng. Nếu tiền của mình biến mất TRƯỚC khi có kết quả ván mới thì lệnh đó không
         được tính vào sổ — đây chính là chỗ sinh ra "báo THẮNG cho tay không có tiền".
+        Có luồng WebSocket thì còn đối chiếu thêm ``previousChips`` của sàn.
         """
         strategy = self.sim.strategy
         pending = strategy.pending
@@ -429,7 +482,7 @@ class LongLongController:
                  "bỏ ván, không tính." % _fn(amount), "error")
 
     # ------------------------------------------------------------------ một ván
-    def _on_hand(self, raw, hand=None):
+    def _on_hand(self, raw, hand=None, round_id=None):
         """Nhận một ván đã chốt; chỉ tất toán lệnh nếu lệnh thuộc ĐÚNG ván này."""
         strategy = self.sim.strategy
         if hand is None:
@@ -439,8 +492,12 @@ class LongLongController:
         hand = int(hand)
         pending = strategy.pending
         # Lệnh đặt cho ván khác (bấm trễ / lệch nhịp đọc): bỏ, không cộng trừ tiền —
-        # đây chính là lỗi "tay chưa mở mà đã tính thắng".
-        stale = pending is not None and pending.get("hand") not in (None, hand)
+        # đây chính là lỗi "tay chưa mở mà đã tính thắng". Có mã ván của sàn thì so mã
+        # ván; không có thì so số ván.
+        if pending is not None and round_id and pending.get("round"):
+            stale = pending.get("round") != round_id
+        else:
+            stale = pending is not None and pending.get("hand") not in (None, hand)
         if stale:
             strategy.pending = None
         had_pending = strategy.pending is not None
@@ -475,13 +532,27 @@ class LongLongController:
             self.log("Phiên đã dừng: chạm đáy thang.", "error")
 
     # --------------------------------------------------------------- đặt chip
-    def _try_place(self, state):
+    def _try_place(self, state, wsnap=None):
         plan = self.sim.strategy.plan()
         if plan["action"] != "bet" or not self.config.get("place_real", False):
             return
         if not self._busy.acquire(blocking=False):
             return
         try:
+            # Cửa sổ cược: luồng WebSocket của sàn nói CHÍNH XÁC đang mở hay đóng, nên
+            # không còn cảnh bấm chip khi "ô chưa mở" rồi bị hoàn tiền.
+            round_id = None
+            if wsnap and wsnap.get("ok"):
+                round_id = wsnap.get("round")
+                phase = wsnap.get("phase")
+                if phase != longlong_stream.OPEN_PHASE:
+                    self._note_place_fail("Sàn chưa mở cược (%s)." % (phase or "?"))
+                    return
+                left = wsnap.get("remaining_ms")
+                need_ms = int(self.config.get("min_bet_ms", 3000))
+                if isinstance(left, int) and left < need_ms:
+                    self._note_place_fail("Chỉ còn %d ms là đóng cược — bỏ ván này." % left)
+                    return
             mode = self.unit_mode
             stake = plan["stake"]                                  # đv (1 đv = 1.000đ)
             amount = longlong.to_site_amount(stake, mode)          # đúng thang khay chip
@@ -495,19 +566,18 @@ class LongLongController:
                 if spendable + 1e-6 < stake:
                     # Không đủ tiền: BỎ ván, không chốt sổ — chốt sổ mà không có tiền
                     # trên bàn chính là kiểu "tính tiền cho tay chưa đặt".
-                    key = (self.tracker.hands, "low_balance")
-                    if key != getattr(self, "_last_place_fail", None):
-                        self._last_place_fail = key
-                        self.log("Không đủ số dư (%sđ < %sđ): bỏ ván này, không đặt." % (
-                            _fn(spendable * longlong.DONG_PER_UNIT),
-                            _fn(stake * longlong.DONG_PER_UNIT)), "error")
+                    self._note_place_fail("Không đủ số dư (%sđ < %sđ): bỏ ván này, không đặt."
+                                          % (_fn(spendable * longlong.DONG_PER_UNIT),
+                                             _fn(stake * longlong.DONG_PER_UNIT)),
+                                          tag="low_balance")
                     return
             result = self.table.place(amount)
             if result.get("ok"):
                 self.sim.strategy.arm(hand=self.tracker.hands + 1)
                 if self.sim.strategy.pending is not None:
-                    # Ghi lại số tiền đã nằm trên bàn để canh chip có bị huỷ không.
+                    # Ghi lại số tiền + mã ván để canh chip và tất toán đúng ván.
                     self.sim.strategy.pending["amount_site"] = amount
+                    self.sim.strategy.pending["round"] = round_id
                 self._chip_gone_at = None
                 self._last_place_fail = None
                 self.log("Đã đặt %s %s (= %sđ) vào ô %s · chip %s · tổng của bạn %s" % (
@@ -516,20 +586,22 @@ class LongLongController:
                     " + ".join(str(c) for c in (result.get("placed") or [])),
                     _fn(result.get("total") or 0.0)), "win")
             else:
-                # Cửa sổ cược chưa mở nên lần đọc nào cũng hỏng: chỉ báo MỘT lần cho mỗi
-                # ván/lỗi, tránh nhật ký bị 7 dòng "chưa đặt được" như trước.
-                key = (self.tracker.hands, result.get("error") or "?")
-                if key != getattr(self, "_last_place_fail", None):
-                    self._last_place_fail = key
-                    status = result.get("status")
-                    note = (" [sàn báo: %s]" % status) if status else ""
-                    self.log("Đặt chip chưa được: %s%s" % (result.get("error") or "?", note),
-                             "error")
-                    hint = self._unit_hint(stake, result)
-                    if hint:
-                        self.log(hint, "error")
+                status = result.get("status")
+                note = (" [sàn báo: %s]" % status) if status else ""
+                self._note_place_fail("%s%s" % (result.get("error") or "?", note))
+                hint = self._unit_hint(stake, result)
+                if hint:
+                    self._note_place_fail(hint)
         finally:
             self._busy.release()
+
+    def _note_place_fail(self, text, tag=None):
+        """Ghi lỗi đặt chip MỘT lần cho mỗi ván, tránh nhật ký đầy dòng lặp."""
+        key = (self.tracker.hands, tag or text)
+        if key == getattr(self, "_last_place_fail", None):
+            return
+        self._last_place_fail = key
+        self.log("Đặt chip chưa được: %s" % text, "error")
 
     def _unit_hint(self, stake, result):
         """Gợi ý đổi "Đơn vị tiền trên sàn" khi khay chip toàn mệnh giá lớn.

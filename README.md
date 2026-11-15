@@ -134,17 +134,45 @@ Khi đang cần bấm chip mà chưa bấm được, vòng đọc tự nhanh lê
 **sau từng chip**; cú bấm nào không vào bàn thì dừng và HOÀN TÁC ngay, và tự đưa chuột
 ra khỏi ô cược (cả trước mỗi lần đọc) để hover không bị đọc thành “ô thắng”.
 
-### Lấy kết quả trực tiếp từ luồng WebSocket của sàn
+### Đọc thẳng luồng WebSocket của sàn (nguồn chuẩn)
 
-Kết quả ván được sàn đẩy qua WebSocket của iframe game (`/frontend/evo/...`). Muốn đọc
-thẳng luồng đó (không phụ thuộc DOM), bắt một lần frame rồi gắn bộ giải mã:
+Sàn đẩy trạng thái ván qua WebSocket của game (`/frontend/evo/...`). Đã bắt thật trên bàn
+`DragonDragon0001` — message dạng:
+
+```json
+{"type":"twocoins.state","args":{
+   "gameId":"18e81b2596ce956a1918740c","number":"03:45:03",
+   "phase":{"type":"BetsOpen","history":[],"previousChips":{"JNS_C":80000},
+            "timeRemaining":14986},
+   "chips":{}}}
+```
+
+Chuỗi phase một ván (~39 giây): `BetsOpen` (15s) → `BetsClosedAnnounced` → `BetsClosed`
+→ `BowlOneShook` → `BowlTwoShook` → `CoinOneReveal` → `CoinTwoReveal` → `CoinsRevealed`
+→ `GameResolved` (`coins: ["Gold","Red"]`).
+
+`adapters/longlong_stream.py` đọc luồng này và cho biết:
+
+| Dùng để | Lấy từ |
+|---|---|
+| Được đặt chip hay chưa | `phase.type == "BetsOpen"` (+ còn > `min_bet_ms`) |
+| Lệnh thuộc ván nào | `args.gameId` (gắn vào `pending["round"]`) |
+| Kết quả ván | `GameResolved` → `coins` → `VV/DD/VD/DV` |
+| Đối chiếu tiền đã vào bàn | `phase.previousChips` |
+
+`Gold+Gold = VV` (2 vàng), `Red+Red = DD` (2 đỏ), `Gold+Red = VD`, `Red+Gold = DV`.
+
+Nhờ vậy tool **không bấm khi cửa sổ cược đóng** (hết cảnh "ô chưa mở"), và **chỉ tất
+toán kết quả của đúng ván mình đã đặt**. Nếu không đọc được luồng (Chrome đóng, sàn đổi
+định dạng) thì tự lùi về cách đọc ô thắng như trước.
+
+Nhiều sàn (ví dụ 9vnv và 1x) nhúng **cùng một vỏ game Evolution** nên định dạng message
+giống nhau; tool tự chọn tab nào thực sự phát `twocoins.*` trong Chrome, nên mở nhiều
+site cùng lúc vẫn đúng. Bắt tay frame của một sàn mới:
 
 ```
 python tools/probe_longlong.py --port 9223 --ws 60
 ```
-
-File `tools/longlong-probe-ws.json` sinh ra chứa các frame thật; gửi lại để chuyển
-`result_source` sang luồng WebSocket.
 
 ## Tab Thống kê (LONG-LONG)
 

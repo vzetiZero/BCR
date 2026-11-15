@@ -61,10 +61,30 @@ def state(winner=None, raw=None, balance=1000.0, at=1000.0):
             "total_bet_vn2": 0.0, "status": "ĐẶT CƯỢC CỦA BẠN", "doors": {}, "read_at": at}
 
 
-def make_service(states=None, config=None, table=None):
+class FakeStream:
+    """Luồng WebSocket giả: trả về ảnh chụp cố định cho test."""
+
+    def __init__(self, snap=None):
+        self.snap = dict(snap or {"ok": False})
+        self.started = False
+        self.stopped = False
+
+    def start(self):
+        self.started = True
+        return True
+
+    def stop(self):
+        self.stopped = True
+
+    def snapshot(self):
+        return dict(self.snap)
+
+
+def make_service(states=None, config=None, table=None, stream=None):
     folder = pathlib.Path(tempfile.mkdtemp())
     service = engine.LongLongService(folder / "state.json", FakeEmitter())
     service.table = table or FakeTable(states or [state()])
+    service.stream = stream or FakeStream()
     service.browser = type("FakeBrowser", (), {"connected": True, "note": "", "mode": "cdp",
                                                "stop": lambda self: None})()
     if config:
@@ -314,6 +334,82 @@ class ChipWatchTests(unittest.TestCase):
         service._watch_chips({"total_bet_vn2": 0.0})
         service._watch_chips({"total_bet_vn2": 0.0})
         self.assertIsNotNone(service.sim.strategy.pending, "chưa đủ thời gian chờ thì chưa bỏ")
+
+
+class WebSocketGateTests(unittest.TestCase):
+    """Luồng WebSocket của sàn: biết đúng cửa sổ cược và đúng ván để tất toán."""
+
+    OPEN = {"ok": True, "phase": "BetsOpen", "round": "r1", "remaining_ms": 12000}
+    CLOSED = {"ok": True, "phase": "BetsClosed", "round": "r1", "remaining_ms": 0}
+
+    @staticmethod
+    def prime(service, raw="VD"):
+        """Nạp sẵn một ván để chiến thuật có kế hoạch đặt ở ván kế tiếp."""
+        service.tracker.hands += 1
+        service._on_hand(raw, hand=service.tracker.hands, round_id="r0")
+
+    def test_places_only_while_the_site_says_bets_are_open(self):
+        table = FakeTable([state("JNS_C", "VD", at=1000.0, balance=500.0)])
+        service = make_service(table=table, stream=FakeStream(self.OPEN),
+                               config={"place_real": True, "confirm_reads": 1})
+        self.prime(service)
+        service.tick()
+        self.assertEqual(table.places, [40])
+        self.assertEqual(service.sim.strategy.pending["round"], "r1")
+
+    def test_does_not_click_when_the_window_is_closed(self):
+        table = FakeTable([state("JNS_C", "VD", at=1000.0, balance=500.0)])
+        service = make_service(table=table, stream=FakeStream(self.CLOSED),
+                               config={"place_real": True, "confirm_reads": 1})
+        self.prime(service)
+        service.tick()
+        self.assertEqual(table.places, [], "sàn báo đóng cược thì không bấm")
+        texts = [entry["text"] for entry in service.logs]
+        self.assertTrue(any("chưa mở cược" in text for text in texts), texts)
+
+    def test_refuses_when_the_window_is_about_to_close(self):
+        table = FakeTable([state("JNS_C", "VD", at=1000.0, balance=500.0)])
+        soon = dict(self.OPEN, remaining_ms=800)
+        service = make_service(table=table, stream=FakeStream(soon),
+                               config={"place_real": True, "confirm_reads": 1,
+                                       "min_bet_ms": 3000})
+        self.prime(service)
+        service.tick()
+        self.assertEqual(table.places, [], "còn 800ms là đóng thì bỏ ván")
+        texts = [entry["text"] for entry in service.logs]
+        self.assertTrue(any("đóng cược" in text for text in texts), texts)
+
+    def test_result_of_the_same_round_settles_the_bet(self):
+        resolved = {"ok": True, "phase": "GameResolved", "round": "r1",
+                    "result": "VD", "result_round": "r1", "remaining_ms": None}
+        service = make_service(stream=FakeStream(resolved))
+        self.prime(service)                      # có lệnh chờ cho ván kế tiếp
+        service.sim.strategy.arm(hand=2)
+        service.sim.strategy.pending.update({"round": "r1", "amount_site": 40})
+        service.tick()
+        self.assertEqual(len(service.sim.log), 1)
+        self.assertTrue(service.sim.log[0]["won"], "vàng-đỏ và đặt ô C -> thắng")
+
+    def test_result_of_another_round_drops_the_bet(self):
+        resolved = {"ok": True, "phase": "GameResolved", "round": "r9",
+                    "result": "VD", "result_round": "r9", "remaining_ms": None}
+        service = make_service(stream=FakeStream(resolved))
+        self.prime(service)
+        service.sim.strategy.arm(hand=2)
+        service.sim.strategy.pending.update({"round": "r1", "amount_site": 40})
+        service.tick()
+        self.assertEqual(service.sim.log, [], "kết quả ván khác thì không tính tiền")
+        texts = [entry["text"] for entry in service.logs]
+        self.assertTrue(any("BỎ lệnh" in text for text in texts), texts)
+
+    def test_the_same_round_is_settled_only_once(self):
+        resolved = {"ok": True, "phase": "GameResolved", "round": "r1",
+                    "result": "DD", "result_round": "r1", "remaining_ms": None}
+        service = make_service(stream=FakeStream(resolved))
+        service.tick()
+        service.tick()
+        service.tick()
+        self.assertEqual(service.tracker.hands, 1, "một ván chỉ chốt một lần")
 
 
 class ConfigTests(unittest.TestCase):
