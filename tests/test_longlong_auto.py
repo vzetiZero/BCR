@@ -17,28 +17,56 @@ DENOMS = [10, 20, 40, 100, 500, 2000]
 
 
 class HandTrackerTests(unittest.TestCase):
-    """Sàn giữ class "ô thắng" vài giây -> mỗi ván chỉ được chốt một lần."""
+    """Sàn giữ class "ô thắng" vài giây -> mỗi ván chỉ chốt một lần, không sinh ván ma."""
+
+    def test_needs_two_consecutive_reads_of_the_same_door(self):
+        tracker = HandTracker(min_gap=15.0, min_hand_gap=6.0, confirm=2)
+        self.assertIsNone(tracker.feed("JNS_C", "VD", 100.0), "lần đọc đầu chỉ là nghi ngờ")
+        self.assertEqual(tracker.feed("JNS_C", "VD", 102.0), "VD")
+        self.assertEqual(tracker.hands, 1)
 
     def test_fires_once_while_the_same_winner_keeps_showing(self):
-        tracker = HandTracker(min_gap=15.0)
-        self.assertEqual(tracker.feed("JNS_C", "VD", 100.0), "VD")
-        for moment in (101.0, 102.5, 104.0, 110.0):
+        tracker = HandTracker(min_gap=15.0, min_hand_gap=6.0, confirm=2)
+        tracker.feed("JNS_C", "VD", 100.0)
+        tracker.feed("JNS_C", "VD", 102.0)
+        for moment in (104.0, 106.0, 110.0):
             self.assertIsNone(tracker.feed("JNS_C", "VD", moment))
         self.assertEqual(tracker.hands, 1)
 
-    def test_a_different_winner_is_a_new_hand_immediately(self):
-        tracker = HandTracker(min_gap=15.0)
-        tracker.feed("JNS_C", "VD", 100.0)
-        self.assertEqual(tracker.feed("JNS_A", "DD", 101.0), "DD")
-        self.assertEqual(tracker.feed("JNS_B", "VV", 102.0), "VV")
-        self.assertEqual(tracker.hands, 3)
+    def test_a_flicker_to_another_door_does_not_create_a_phantom_hand(self):
+        # Log thật của người dùng: "Ván 5" 10:09:38 rồi "Ván 6" 10:09:40 (cách 2 giây).
+        tracker = HandTracker(min_gap=15.0, min_hand_gap=6.0, confirm=2)
+        self.assertIsNone(tracker.feed("JNS_C", "VD", 100.0))
+        self.assertEqual(tracker.feed("JNS_C", "VD", 102.0), "VD")
+        # Hiệu ứng đổi ô một nhịp rồi quay lại: không được thành ván mới.
+        self.assertIsNone(tracker.feed("JNS_A", "DD", 104.0))
+        self.assertIsNone(tracker.feed("JNS_C", "VD", 106.0))
+        self.assertEqual(tracker.hands, 1)
 
-    def test_same_winner_after_the_gap_counts_as_a_new_hand(self):
-        tracker = HandTracker(min_gap=15.0)
+    def test_two_real_hands_are_separated_by_the_minimum_gap(self):
+        tracker = HandTracker(min_gap=15.0, min_hand_gap=6.0, confirm=2)
         tracker.feed("JNS_C", "VD", 100.0)
-        self.assertIsNone(tracker.feed("JNS_C", "VD", 110.0))
-        self.assertEqual(tracker.feed("JNS_C", "VD", 116.0), "VD")
+        tracker.feed("JNS_C", "VD", 102.0)
+        self.assertIsNone(tracker.feed("JNS_A", "DD", 115.0))
+        self.assertEqual(tracker.feed("JNS_A", "DD", 117.0), "DD")
         self.assertEqual(tracker.hands, 2)
+
+    def test_a_new_hand_right_after_the_last_is_refused(self):
+        tracker = HandTracker(min_gap=15.0, min_hand_gap=6.0, confirm=1)
+        self.assertEqual(tracker.feed("JNS_C", "VD", 100.0), "VD")
+        self.assertIsNone(tracker.feed("JNS_A", "DD", 102.0), "2 giây không thể là ván thật")
+        self.assertEqual(tracker.hands, 1)
+
+    def test_confirm_one_fires_on_the_first_read(self):
+        tracker = HandTracker(min_gap=15.0, min_hand_gap=6.0, confirm=1)
+        self.assertEqual(tracker.feed("JNS_C", "VD", 100.0), "VD")
+
+    def test_a_blank_read_breaks_a_flickering_pair(self):
+        tracker = HandTracker(confirm=2)
+        self.assertIsNone(tracker.feed("JNS_C", "VD", 100.0))
+        self.assertIsNone(tracker.feed(None, None, 101.0))
+        self.assertIsNone(tracker.feed("JNS_C", "VD", 102.0))
+        self.assertEqual(tracker.hands, 0)
 
     def test_without_a_winner_nothing_is_recorded(self):
         tracker = HandTracker()
@@ -46,8 +74,15 @@ class HandTrackerTests(unittest.TestCase):
             self.assertIsNone(tracker.feed(winner, raw, 100.0))
         self.assertEqual(tracker.hands, 0)
 
+    def test_configure_clamps_bad_values(self):
+        tracker = HandTracker()
+        tracker.configure(confirm=99, min_hand_gap=-5, min_gap=-1)
+        self.assertEqual(tracker.confirm, 5)
+        self.assertEqual(tracker.min_hand_gap, 0.0)
+        self.assertEqual(tracker.min_gap, 0.0)
+
     def test_reset_clears_the_counter(self):
-        tracker = HandTracker(min_gap=15.0)
+        tracker = HandTracker(min_gap=15.0, min_hand_gap=6.0, confirm=1)
         tracker.feed("JNS_C", "VD", 100.0)
         tracker.reset()
         self.assertEqual(tracker.hands, 0)

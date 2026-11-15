@@ -130,6 +130,15 @@
               <label class="field">Vốn phiên (đơn vị sảnh · 10.000 = 10 triệu)
                 <input id="ll-capital" type="number" min="10" step="100" />
               </label>
+              <label class="field">Đơn vị tiền trên sàn (theo khay chip)
+                <select id="ll-unit-mode">
+                  <option value="vn2">VN2 — chip 40 = 40.000đ (EVO mặc định)</option>
+                  <option value="vnd">VND thật — chip 10.000 = 10.000đ</option>
+                </select>
+              </label>
+              <p class="hint">Bậc 10 đv sẽ gửi <b>10</b> ở chế độ VN2 (10.000đ) và
+                <b>10.000</b> ở chế độ VND (10.000đ). Chọn sai thì tool báo
+                “Không chia được … theo mệnh giá”.</p>
               <div class="row">
                 <button class="btn" id="ll-divide">Chia thang theo vốn</button>
                 <button class="btn primary" id="ll-save">Lưu cấu hình</button>
@@ -147,7 +156,18 @@
                 <span>ĐẶT CHIP THẬT (tiền thật)</span>
               </label>
               <p class="hint">Khi bật, tool bấm chip thật vào ô C theo thang; lệch tiền sẽ tự HOÀN TÁC.</p>
-              <label class="field">Khoảng cách tối thiểu giữa 2 ván (giây)
+              <div class="grid two tight">
+                <label class="field">Xác nhận kết quả (số lần đọc)
+                  <input id="ll-confirm-reads" type="number" min="1" max="5" step="1" />
+                </label>
+                <label class="field">Cách nhau tối thiểu 2 ván (giây)
+                  <input id="ll-min-hand-gap" type="number" min="0" max="60" step="1" />
+                </label>
+              </div>
+              <p class="hint">Chống “ván ma”: chỉ chốt khi cùng một ô thắng được đọc
+                2 lần liên tiếp và hai ván cách nhau đủ lâu. Đặt 1 nếu bàn quá nhanh mà
+                tool bỏ sót ván.</p>
+              <label class="field">Khoảng cách tối thiểu giữa 2 ván cùng ô thắng (giây)
                 <input id="ll-min-gap" type="number" min="5" step="1" />
               </label>
               <button class="btn" id="ll-reset">Reset phiên</button>

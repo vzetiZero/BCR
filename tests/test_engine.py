@@ -69,7 +69,12 @@ def make_service(states=None, config=None, table=None):
                                                "stop": lambda self: None})()
     if config:
         service.config.update(config)
-        service.sim.set_ladder(config["ladder"]) if "ladder" in config else None
+        if "ladder" in config:
+            service.sim.set_ladder(config["ladder"])
+        # config_set() mới đẩy tham số vào tracker; ở đây dựng cấu hình qua helper.
+        service.tracker.configure(min_gap=config.get("min_gap"),
+                                  min_hand_gap=config.get("min_hand_gap"),
+                                  confirm=config.get("confirm_reads"))
     return service
 
 
@@ -114,7 +119,7 @@ class TickTests(unittest.TestCase):
     def test_new_winner_counts_as_a_new_hand(self):
         table = FakeTable([state("JNS_C", "VD", at=1000.0),
                            state("JNS_A", "DD", at=1010.0)])
-        service = make_service(table=table)
+        service = make_service(table=table, config={"confirm_reads": 1})
         service.tick()
         service.tick()
         self.assertEqual(service.tracker.hands, 2)
@@ -122,31 +127,158 @@ class TickTests(unittest.TestCase):
 
     def test_simulation_mode_arms_on_paper_and_never_places(self):
         table = FakeTable([state("JNS_C", "VD", at=1000.0)])
-        service = make_service(table=table, config={"place_real": False})
+        service = make_service(table=table, config={"place_real": False, "confirm_reads": 1})
         service.tick()
         self.assertEqual(table.places, [])
         self.assertIsNotNone(service.sim.strategy.pending, "mô phỏng chốt trên giấy")
 
     def test_real_mode_places_40_and_only_then_arms(self):
         table = FakeTable([state("JNS_C", "VD", at=1000.0, balance=500.0)])
-        service = make_service(table=table, config={"place_real": True})
+        service = make_service(table=table, config={"place_real": True, "confirm_reads": 1})
         service.tick()
         self.assertEqual(table.places, [40])
         self.assertIsNotNone(service.sim.strategy.pending, "chip vào rồi mới chốt sổ")
 
     def test_low_balance_skips_placing_and_keeps_the_ladder(self):
         table = FakeTable([state("JNS_C", "VD", at=1000.0, balance=10.0)])
-        service = make_service(table=table, config={"place_real": True})
+        service = make_service(table=table, config={"place_real": True, "confirm_reads": 1})
         service.tick()
         self.assertEqual(table.places, [])
-        self.assertIsNotNone(service.sim.strategy.pending)
+        self.assertIsNone(service.sim.strategy.pending,
+                          "không có tiền trên bàn thì không được chốt sổ")
+        self.assertEqual(service.sim.log, [])
 
     def test_failed_placement_does_not_arm_the_plan(self):
         table = FakeTable([state("JNS_C", "VD", at=1000.0, balance=500.0)])
         table.place_result = {"ok": False, "error": "Ván đã có kết quả"}
-        service = make_service(table=table, config={"place_real": True})
+        service = make_service(table=table, config={"place_real": True, "confirm_reads": 1})
         service.tick()
         self.assertIsNone(service.sim.strategy.pending, "đặt hỏng thì không được tính là đã cược")
+
+
+class HandTieTests(unittest.TestCase):
+    """Lệnh phải thuộc ĐÚNG ván: đặt trễ thì bỏ, không cộng/trừ tiền cho tay chưa mở."""
+
+    def test_bet_armed_for_the_next_hand(self):
+        service = make_service()
+        service.manual_hand({"result": "VD"})
+        self.assertEqual(service.sim.strategy.pending["hand"], 2)
+
+    def test_matching_hand_is_settled(self):
+        service = make_service()
+        service.manual_hand({"result": "VD"})      # chốt lệnh cho ván 2
+        service.manual_hand({"result": "VD"})      # ván 2 khớp -> thắng
+        self.assertEqual(len(service.sim.log), 1)
+        self.assertTrue(service.sim.log[0]["won"])
+
+    def test_hand_from_another_round_drops_the_bet(self):
+        service = make_service()
+        service.manual_hand({"result": "VD"})      # lệnh cho ván 2
+        service._on_hand("VD", hand=3)             # nhưng ván 3 mới ra kết quả
+        self.assertEqual(service.sim.log, [], "không được ghi tiền cho tay này")
+        texts = [entry["text"] for entry in service.logs]
+        self.assertTrue(any("BỎ lệnh" in text for text in texts), texts)
+
+    def test_manual_hands_keep_numbering_consistent(self):
+        service = make_service()
+        service.manual_hand({"result": "VD"})
+        service.manual_hand({"result": "VV"})
+        self.assertEqual(service.tracker.hands, 2)
+        self.assertEqual(len(service.sim.log), 1)   # ván 2 khớp lệnh -> có tính tiền
+
+
+class UnitModePlacementTests(unittest.TestCase):
+    """Sàn in tiền thật (khay 10.000 …): bậc 10 đv phải gửi 10.000, không phải 10."""
+
+    def test_vn2_mode_sends_the_ladder_number_as_is(self):
+        table = FakeTable([state("JNS_C", "VD", at=1000.0, balance=500.0)])
+        service = make_service(table=table, config={"place_real": True, "confirm_reads": 1,
+                                                    "ladder": [40, 80], "unit_mode": "vn2"})
+        service.tick()
+        self.assertEqual(table.places, [40])
+
+    def test_vnd_mode_sends_ten_thousand_for_a_ten_unit_rung(self):
+        table = FakeTable([state("JNS_C", "VD", at=1000.0, balance=500000.0)])
+        service = make_service(table=table, config={"place_real": True, "confirm_reads": 1,
+                                                    "ladder": [10, 20], "unit_mode": "vnd"})
+        service.tick()
+        self.assertEqual(table.places, [10000])
+        self.assertTrue(table.place_result["ok"])
+
+    def test_balance_is_compared_in_ladder_units(self):
+        # Số dư 50.000 (VND) = 50 đv: đủ cho bậc 10 nhưng không đủ cho bậc 80.
+        table = FakeTable([state("JNS_C", "VD", at=1000.0, balance=50000.0)])
+        service = make_service(table=table, config={"place_real": True, "confirm_reads": 1,
+                                                    "ladder": [10, 20], "unit_mode": "vnd"})
+        service.tick()
+        self.assertEqual(table.places, [10000])
+        low = FakeTable([state("JNS_C", "VD", at=1000.0, balance=5000.0)])
+        service = make_service(table=low, config={"place_real": True, "confirm_reads": 1,
+                                                  "ladder": [10, 20], "unit_mode": "vnd"})
+        service.tick()
+        self.assertEqual(low.places, [], "5.000đ không đủ cho bậc 10 đv (10.000đ)")
+
+    def test_big_chips_trigger_a_hint_to_change_the_unit_mode(self):
+        table = FakeTable([state("JNS_C", "VD", at=1000.0, balance=500000.0)])
+        table.place_result = {"ok": False, "error": "Không chia được 40 theo mệnh giá",
+                              "denominations": [10000, 20000, 40000, 100000]}
+        service = make_service(table=table, config={"place_real": True, "confirm_reads": 1,
+                                                    "unit_mode": "vn2"})
+        service.tick()
+        texts = [entry["text"] for entry in service.logs]
+        self.assertTrue(any("Đơn vị tiền trên sàn" in text for text in texts), texts)
+
+    def test_snapshot_exposes_mode_and_scale_for_the_ui(self):
+        service = make_service(config={"unit_mode": "vnd"})
+        snapshot = service.snapshot()
+        self.assertEqual(snapshot["unit_mode"], "vnd")
+        self.assertEqual(snapshot["site_scale"], 1.0)
+        self.assertEqual(snapshot["config"]["unit_mode"], "vnd")
+
+    def test_config_set_persists_the_mode(self):
+        service = make_service()
+        reply = service.config_set({"unit_mode": "vnd"})
+        self.assertTrue(reply["ok"])
+        saved = json.loads(service.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["unit_mode"], "vnd")
+        self.assertEqual(service.unit_mode, "vnd")
+
+
+class PaceTests(unittest.TestCase):
+    """Nhịp đọc và chống spam nhật ký khi cửa sổ cược chưa mở."""
+
+    def test_polls_faster_while_waiting_to_place(self):
+        service = make_service(config={"place_real": True})
+        service.interval = 2.0
+        self.assertEqual(service._next_wait(), 2.0)
+        service._on_hand("VD", hand=1)          # có kế hoạch đặt -> đọc nhanh hơn
+        self.assertLess(service._next_wait(), 2.0)
+
+    def test_place_failures_are_logged_once_per_hand(self):
+        table = FakeTable([state("JNS_C", "VD", at=1000.0, balance=500.0)])
+        table.place_result = {"ok": False, "error": "Ván đã có kết quả; chờ ván mới."}
+        service = make_service(table=table, config={"place_real": True, "confirm_reads": 1})
+        for _ in range(4):
+            service.tick()
+        fails = [entry for entry in service.logs if "Đặt chip chưa được" in entry["text"]]
+        self.assertEqual(len(fails), 1, [entry["text"] for entry in service.logs])
+
+    def test_does_not_hot_poll_when_the_balance_is_too_low(self):
+        table = FakeTable([state("JNS_C", "VD", at=1000.0, balance=10.0)])
+        service = make_service(table=table, config={"place_real": True, "confirm_reads": 1})
+        service.interval = 2.0
+        service.tick()
+        self.assertEqual(service._next_wait(), 2.0, "thiếu tiền thì đọc nhanh cũng vô ích")
+
+    def test_a_new_hand_clears_the_failure_marker(self):
+        table = FakeTable([state("JNS_C", "VD", at=1000.0, balance=500.0),
+                           state("JNS_C", "VD", at=1030.0, balance=500.0)])
+        table.place_result = {"ok": False, "error": "Ván đã có kết quả; chờ ván mới."}
+        service = make_service(table=table, config={"place_real": True, "confirm_reads": 1})
+        service.tick()
+        service.tick()
+        fails = [entry for entry in service.logs if "Đặt chip chưa được" in entry["text"]]
+        self.assertEqual(len(fails), 2, [entry["text"] for entry in service.logs])
 
 
 class ConfigTests(unittest.TestCase):

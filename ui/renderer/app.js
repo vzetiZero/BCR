@@ -142,9 +142,18 @@ function renderLongLong(snapshot) {
   if (!snapshot) return;
   state.longlong = snapshot;
 
+  // Sàn có thể in tiền theo VN2 (chip 40 = 40.000đ) hoặc thẳng tiền thật
+  // (chip 10.000 = 10.000đ). site_scale = số VNĐ của 1 đơn vị số trên sàn.
+  const siteScale = Number(snapshot.site_scale || 1000);
+  const siteSuffix = snapshot.unit_mode === 'vnd' ? 'đ' : 'VN2';
+  const fmtSite = (value) => {
+    if (value === null || value === undefined || Number.isNaN(Number(value))) return '—';
+    return `${Number(value).toLocaleString('de-DE', { maximumFractionDigits: 2 })} ${siteSuffix}`;
+  };
+
   const balance = snapshot.balance_vn2;
   const balanceBox = $('#ll-balance');
-  balanceBox.textContent = fmtVn2(balance);
+  balanceBox.textContent = fmtSite(balance);
   balanceBox.className = 'kpi-value ' + (balance === null || balance === undefined ? '' : balance > 0 ? 'gold' : 'red');
   const balanceNote = $('#ll-balance-note');
   if (!snapshot.chrome_connected) {
@@ -152,7 +161,7 @@ function renderLongLong(snapshot) {
   } else {
     balanceNote.textContent = snapshot.read_error
       ? `lỗi đọc: ${snapshot.read_error}`
-      : `${fmtVnd(balance === null || balance === undefined ? null : balance * 1000)} · cập nhật ${fmtTime(snapshot.read_at)}`;
+      : `${fmtVnd(balance === null || balance === undefined ? null : balance * siteScale)} · cập nhật ${fmtTime(snapshot.read_at)}`;
   }
 
   const ladder = snapshot.ladder || [];
@@ -165,7 +174,7 @@ function renderLongLong(snapshot) {
   profitBox.className = 'kpi-value ' + (profit >= 0 ? 'green' : 'red');
   $('#ll-hands').textContent = `${snapshot.hands_seen || 0} ván đã thấy`;
 
-  $('#ll-total').textContent = fmtVn2(snapshot.total_bet_vn2);
+  $('#ll-total').textContent = fmtSite(snapshot.total_bet_vn2);
   $('#ll-phase').textContent = snapshot.status || 'chưa có ván';
 
   const plan = snapshot.plan || {};
@@ -178,7 +187,9 @@ function renderLongLong(snapshot) {
   } else if (plan.action === 'bet') {
     planState.textContent = 'ĐẶT';
     planState.className = 'hero-state bet';
-    planBox.textContent = `Đặt ${fmtUnits(plan.stake)} đv vào ô “1 vàng 1 đỏ” (bậc ${(plan.step || 0) + 1})`;
+    planBox.textContent = `Đặt ${fmtUnits(plan.stake)} đv = ${fmtVnd((plan.stake || 0) * 1000)}`
+      + ` (gửi ${fmtSite(snapshot.plan_amount ?? plan.stake)} lên sàn) vào ô “1 vàng 1 đỏ”`
+      + ` · bậc ${(plan.step || 0) + 1}`;
   } else {
     planState.textContent = 'CHỜ';
     planState.className = 'hero-state';
@@ -193,7 +204,7 @@ function renderLongLong(snapshot) {
     if (card) card.classList.toggle('win', snapshot.winner === role);
     const amount = $(`[data-door-amount="${role}"]`);
     const foot = $(`[data-door-foot="${role}"]`);
-    if (amount) amount.textContent = fmtVn2(door.amount);
+    if (amount) amount.textContent = fmtSite(door.amount);
     if (foot) {
       const bits = [];
       if (door.chips !== undefined && door.chips !== null) bits.push(`${door.chips} chip bàn`);
@@ -229,6 +240,16 @@ function renderLongLong(snapshot) {
   if (document.activeElement !== $('#ll-base')) $('#ll-base').value = config.base ?? '';
   if (document.activeElement !== $('#ll-capital')) $('#ll-capital').value = config.capital ?? '';
   if (document.activeElement !== $('#ll-min-gap')) $('#ll-min-gap').value = config.min_gap ?? 15;
+  if (document.activeElement !== $('#ll-confirm-reads')) {
+    $('#ll-confirm-reads').value = config.confirm_reads ?? 2;
+  }
+  if (document.activeElement !== $('#ll-min-hand-gap')) {
+    $('#ll-min-hand-gap').value = config.min_hand_gap ?? 6;
+  }
+  const unitSelect = $('#ll-unit-mode');
+  if (unitSelect && document.activeElement !== unitSelect) {
+    unitSelect.value = config.unit_mode === 'vnd' ? 'vnd' : 'vn2';
+  }
   $('#ll-place-real').checked = !!config.place_real;
   $('#ll-auto-result').checked = config.auto_result !== false;
 
@@ -881,12 +902,25 @@ $('#ll-save').addEventListener('click', async () => {
   await call('longlong', 'config.set', {
     base: Number($('#ll-base').value),
     capital: Number($('#ll-capital').value),
+    unit_mode: $('#ll-unit-mode').value,
     min_gap: Number($('#ll-min-gap').value),
+    confirm_reads: Number($('#ll-confirm-reads').value),
+    min_hand_gap: Number($('#ll-min-hand-gap').value),
     place_real: $('#ll-place-real').checked,
     auto_result: $('#ll-auto-result').checked,
     ladder,
   });
   toast('Đã lưu cấu hình LONG-LONG.');
+});
+
+$('#ll-unit-mode').addEventListener('change', async (event) => {
+  const mode = event.target.value;
+  const reply = await call('longlong', 'config.set', { unit_mode: mode });
+  if (reply) {
+    toast(mode === 'vnd'
+      ? 'Đơn vị tiền: VND thật — bậc 10 đv sẽ bấm 10.000.'
+      : 'Đơn vị tiền: VN2 — bậc 10 đv sẽ bấm 10 (= 10.000đ).');
+  }
 });
 
 $('#ll-divide').addEventListener('click', async () => {

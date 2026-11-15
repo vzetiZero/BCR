@@ -24,15 +24,53 @@ class Engine {
     this.nextId = 1;
     this.pending = new Map();
     this.ready = false;
+    this.stopping = false;      // đang tắt app: không báo lỗi pipe nữa
+    this.stderrTail = '';       // dòng stderr cuối, để giải thích khi engine thoát
+    this.restartTimer = null;   // hẹn giờ tự khởi động lại engine đã thoát
+    this.autoRestarts = 0;      // số lần tự khởi động lại liên tiếp (chống lặp vô hạn)
+    this.exitExplained = false; // đã báo lý do thoát (markDead) -> đừng báo lại
   }
 
   send(payload) {
-    if (!this.child || this.child.killed) return false;
+    const child = this.child;
+    if (!child || child.killed) return false;
+    // Engine đã thoát thì stdin là pipe gãy: kiểm tra trước để không phát sinh EPIPE.
+    if (!child.stdin || child.stdin.destroyed || !child.stdin.writable) return false;
     try {
-      this.child.stdin.write(JSON.stringify(payload) + '\n');
+      child.stdin.write(JSON.stringify(payload) + '\n');
       return true;
     } catch (error) {
+      this.onPipeError(error);
       return false;
+    }
+  }
+
+  /** Pipe hỏng (EPIPE): engine đã thoát. Nuốt lỗi, đánh dấu chết và khởi động lại sau. */
+  onPipeError(error) {
+    const code = (error && error.code) || '';
+    if (code === 'EPIPE' || code === 'ERR_STREAM_DESTROYED' || code === 'ERR_STREAM_WRITE_AFTER_END') {
+      this.markDead(`mất kết nối engine (${code})`);
+      return;
+    }
+    this.emitEvent('log', { level: 'error', text: `engine: ${String((error && error.message) || error)}` });
+  }
+
+  /** Dọn engine đang chết: reject lệnh đang chờ, lần gọi sau sẽ spawn lại. */
+  markDead(reason) {
+    const child = this.child;
+    const wasStopping = this.stopping;
+    this.child = null;
+    this.ready = false;
+    // Reject trước khi kill: kill() bắn 'exit' ngay và handler exit sẽ ghi đè lý do
+    // bằng câu chung "engine đã thoát", làm mất nguyên nhân thật (EPIPE...).
+    for (const [, entry] of this.pending) entry.reject(new Error(reason));
+    this.pending.clear();
+    this.exitExplained = true;      // 'exit' theo sau không cần báo lại lý do
+    if (child) {
+      try { if (!child.killed) child.kill(); } catch (error) { /* bỏ qua */ }
+    }
+    if (!wasStopping) {
+      this.emitEvent('log', { level: 'error', text: `${reason} — sẽ tự khởi động lại.` });
     }
   }
 
@@ -42,25 +80,81 @@ class Engine {
       if (candidate === 'python') return true;
       return fs.existsSync(candidate);
     }) || 'python';
-    this.child = spawn(python, ['-m', 'bcr.service.engine', '--game', this.game], {
+    this.stopping = false;
+    this.stderrTail = '';
+    this.buffer = '';
+    const child = spawn(python, ['-m', 'bcr.service.engine', '--game', this.game], {
       cwd: PROJECT_ROOT,
       env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUNBUFFERED: '1' },
       windowsHide: true,
     });
+    this.child = child;
 
-    this.child.stdout.setEncoding('utf8');
-    this.child.stdout.on('data', (chunk) => this.onData(chunk));
-    this.child.stderr.setEncoding('utf8');
-    this.child.stderr.on('data', (chunk) => {
-      this.emitEvent('log', { level: 'error', text: `engine stderr: ${String(chunk).trim()}` });
+    // Thiếu các handler 'error' dưới đây thì lỗi spawn (không có python) hoặc EPIPE khi
+    // engine thoát sẽ thành "Uncaught Exception" của main process — Electron bật hộp
+    // thoại đỏ "A JavaScript error occurred in the main process" và app đứng.
+    child.on('error', (error) => {
+      const reason = `không chạy được engine (${error.code || error.message})`;
+      if (this.child === child) this.markDead(reason);
+      else this.emitEvent('log', { level: 'error', text: reason });
     });
-    this.child.on('exit', (code) => {
-      this.emitEvent('log', { level: 'error', text: `engine đã thoát (code ${code}).` });
+    if (child.stdin) child.stdin.on('error', (error) => this.onPipeError(error));
+
+    if (child.stdout) {
+      child.stdout.setEncoding('utf8');
+      child.stdout.on('data', (chunk) => this.onData(chunk));
+      child.stdout.on('error', (error) => this.onPipeError(error));
+    }
+    if (child.stderr) {
+      child.stderr.setEncoding('utf8');
+      child.stderr.on('data', (chunk) => {
+        const text = String(chunk).trim();
+        if (text) this.stderrTail = text.slice(-300);
+        this.emitEvent('log', { level: 'error', text: `engine stderr: ${text}` });
+      });
+      child.stderr.on('error', () => { /* chỉ là log chẩn đoán */ });
+    }
+
+    child.on('exit', (code, signal) => {
+      const stopping = this.stopping;
+      const explained = this.exitExplained;
+      this.exitExplained = false;
+      if (this.child === child) {
+        this.child = null;
+        this.ready = false;
+      }
       for (const [, entry] of this.pending) entry.reject(new Error('engine đã thoát'));
       this.pending.clear();
-      this.child = null;
-      this.ready = false;
+      if (stopping) return;
+      if (!explained) {
+        const tail = this.stderrTail ? ` · ${this.stderrTail}` : '';
+        this.emitEvent('log', {
+          level: 'error',
+          text: `engine đã thoát (${code === null ? signal : code})${tail} — lệnh kế tiếp sẽ khởi động lại.`,
+        });
+      }
+      this.scheduleRestart();
     });
+  }
+
+  /** Tự dựng lại engine vừa thoát để UI không "đứng" mà không biết vì sao. */
+  scheduleRestart() {
+    if (this.stopping || this.restartTimer || this.child) return;
+    if (this.autoRestarts >= 5) {
+      this.autoRestarts = 0;      // thao tác kế tiếp của người dùng sẽ thử lại
+      this.emitEvent('log', {
+        level: 'error',
+        text: 'engine thoát 5 lần liên tiếp — đã ngừng tự khởi động lại. Bấm lại thao tác để thử.',
+      });
+      return;
+    }
+    const delay = Math.min(2000 * (2 ** this.autoRestarts), 20000);
+    this.autoRestarts += 1;
+    this.restartTimer = setTimeout(() => {
+      this.restartTimer = null;
+      if (this.stopping || this.child) return;
+      this.start();
+    }, delay);
   }
 
   onData(chunk) {
@@ -83,7 +177,10 @@ class Engine {
       return;
     }
     if (message.event) {
-      if (message.event === 'ready') this.ready = true;
+      if (message.event === 'ready') {
+        this.ready = true;
+        this.autoRestarts = 0;
+      }
       this.emitEvent(message.event, message.data);
       return;
     }
@@ -121,6 +218,11 @@ class Engine {
   }
 
   stop() {
+    this.stopping = true;
+    if (this.restartTimer) {
+      clearTimeout(this.restartTimer);
+      this.restartTimer = null;
+    }
     if (!this.child) return;
     this.send({ id: 0, method: 'shutdown', params: {} });
     const child = this.child;
@@ -134,6 +236,20 @@ const engines = {
   baccarat: new Engine('baccarat'),
   longlong: new Engine('longlong'),
 };
+
+// Lưới an toàn cuối: Electron biến mọi exception chưa bắt ở main process thành hộp
+// thoại đỏ "A JavaScript error occurred in the main process" và app đứng. Ghi log rồi
+// tiếp tục để người dùng thấy nguyên nhân trong tab Nhật ký thay vì bị chặn.
+function reportMainError(kind, error) {
+  const text = `${kind}: ${String((error && error.stack) || (error && error.message) || error).split('\n')[0]}`;
+  console.error(text);
+  for (const engine of Object.values(engines)) {
+    engine.emitEvent('log', { level: 'error', text });
+  }
+}
+
+process.on('uncaughtException', (error) => reportMainError('lỗi main process', error));
+process.on('unhandledRejection', (reason) => reportMainError('promise bị từ chối', reason));
 
 function createWindow() {
   mainWindow = new BrowserWindow({

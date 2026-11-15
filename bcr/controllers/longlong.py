@@ -21,6 +21,19 @@ from bcr.controllers import longlong_auto
 from bcr.models import longlong
 
 
+def _fn(value):
+    """Số kiểu Việt Nam cho log: 10.000 (không phần thập phân)."""
+    try:
+        return "{:,.0f}".format(float(value)).replace(",", ".")
+    except (TypeError, ValueError):
+        return str(value)
+
+
+# Nhịp đọc nhanh khi đang chờ bấm chip: cửa sổ cược của sàn ngắn nên đọc mỗi 2 giây là
+# quá trễ (ván đóng trước khi kịp bấm). Chỉ dùng khi thật sự sắp đặt tiền.
+PLACE_POLL_SECONDS = 0.7
+
+
 class LongLongController:
     """Đọc bàn LONG-LONG, chốt kết quả và đặt chip theo thang đã cấu hình."""
 
@@ -31,7 +44,13 @@ class LongLongController:
         self.config = self._load_config()
         self.sim = longlong.LongLongSimulation(self.config["ladder"],
                                                capital=self.config["capital"] * 1000.0)
-        self.tracker = longlong_auto.HandTracker(min_gap=self.config.get("min_gap", 15.0))
+        self.tracker = longlong_auto.HandTracker(min_gap=self.config.get("min_gap", 15.0),
+                                                 min_hand_gap=self.config.get(
+                                                     "min_hand_gap",
+                                                     longlong_auto.DEFAULT_MIN_HAND_GAP),
+                                                 confirm=self.config.get(
+                                                     "confirm_reads",
+                                                     longlong_auto.DEFAULT_CONFIRM))
         self.table = longlong_table.LongLongTable()
         self.browser = BR.BrowserSession()
         self.logs = collections.deque(maxlen=200)
@@ -42,6 +61,7 @@ class LongLongController:
         self.last_state = {}
         # Nhịp nền: đẩy state + phát hiện Chrome bị đóng kể cả khi tool đang dừng.
         self.offline_noted = False
+        self._last_place_fail = None    # (ván, lỗi) đã báo — chống spam nhật ký
         self._heartbeat = None
         self._heartbeat_stop = None
         self.log("Engine LONG-LONG sẵn sàng.")
@@ -91,9 +111,16 @@ class LongLongController:
             "ladder": list(longlong.DEFAULT_LADDER),
             "base": longlong.DEFAULT_BASE,
             "capital": longlong.DEFAULT_CAPITAL,       # đơn vị sảnh (10.000 = 10 triệu)
+            # Đơn vị tiền trên KHAY CHIP của sàn: "vn2" (chip 40 = 40.000đ) hay "vnd"
+            # (chip 10.000 = 10.000đ). Xem bcr.models.longlong.UNIT_*.
+            "unit_mode": longlong.DEFAULT_UNIT_MODE,
             "place_real": False,                       # đặt chip thật hay chỉ mô phỏng
             "auto_result": True,                       # tự chốt kết quả ván
             "min_gap": 15.0,
+            # Chống "ván ma": phải thấy cùng một ô thắng 2 lần đọc liên tiếp và hai ván
+            # phải cách nhau ≥ 6 giây, nếu không sổ vốn sẽ tính tiền cho tay chưa mở.
+            "confirm_reads": longlong_auto.DEFAULT_CONFIRM,
+            "min_hand_gap": longlong_auto.DEFAULT_MIN_HAND_GAP,
             "start_url": BR.START_URL,                 # link Chrome mở khi bấm “Mở Chrome”
             # Cửa sổ Chrome: cùng bộ tham số với tab Baccarat.
             "chrome_window": {"width": 1280, "height": 800, "percent": 100,
@@ -120,7 +147,24 @@ class LongLongController:
         config["chrome_window"] = BR.normalize_window(
             (window.get("width"), window.get("height")),
             window.get("percent"), window.get("fullscreen"))
+        config["unit_mode"] = longlong.normalize_unit_mode(config.get("unit_mode"))
+        try:
+            config["confirm_reads"] = max(1, min(int(config.get("confirm_reads")
+                                                    or longlong_auto.DEFAULT_CONFIRM), 5))
+        except (TypeError, ValueError):
+            config["confirm_reads"] = longlong_auto.DEFAULT_CONFIRM
+        try:
+            config["min_hand_gap"] = max(0.0, float(config.get("min_hand_gap")
+                                                    if config.get("min_hand_gap") is not None
+                                                    else longlong_auto.DEFAULT_MIN_HAND_GAP))
+        except (TypeError, ValueError):
+            config["min_hand_gap"] = longlong_auto.DEFAULT_MIN_HAND_GAP
         return config
+
+    @property
+    def unit_mode(self):
+        """Chế độ đơn vị tiền đang chọn (vn2 / vnd)."""
+        return longlong.normalize_unit_mode(self.config.get("unit_mode"))
 
     @property
     def window(self):
@@ -177,6 +221,10 @@ class LongLongController:
             "step": strategy.step,
             "step_stake": strategy.ladder[min(strategy.step, len(strategy.ladder) - 1)],
             "ladder": list(strategy.ladder),
+            # Đơn vị tiền của sàn: UI dùng để in đúng nhãn và quy ra VNĐ.
+            "unit_mode": self.unit_mode,
+            "site_scale": longlong.site_scale(self.unit_mode),
+            "plan_amount": longlong.to_site_amount(plan.get("stake") or 0, self.unit_mode),
             "pending": strategy.pending,
             "stopped": strategy.stopped,
             "plan": plan,
@@ -300,9 +348,27 @@ class LongLongController:
                 self.tick()
             except Exception as exc:
                 self.log("Lỗi vòng đọc: %s" % exc, "error")
-            self._stop.wait(self.interval)
+            self._stop.wait(self._next_wait())
         self.tool_running = False
         self._push_state()
+
+    def _next_wait(self):
+        """Nhịp chờ tới lần đọc sau.
+
+        Bình thường đọc mỗi ``interval`` giây. Khi đang cần bấm chip mà chưa bấm được
+        (cửa sổ cược đang mở dở) thì đọc nhanh hơn để không trễ ván.
+        """
+        try:
+            waiting_to_place = (bool(self.config.get("place_real"))
+                                and self.sim.strategy.pending is None
+                                and self.sim.strategy.plan().get("action") == "bet")
+        except Exception:
+            waiting_to_place = False
+        # Không đủ tiền thì đọc nhanh cũng vô ích -> giữ nhịp thường, khỏi quay CPU.
+        low_balance = bool(self._last_place_fail) and self._last_place_fail[-1] == "low_balance"
+        if waiting_to_place and not low_balance:
+            return min(self.interval, PLACE_POLL_SECONDS)
+        return self.interval
 
     def tick(self):
         """Một nhịp: đọc bàn -> chốt ván -> (nếu được bật) đặt chip -> phát state."""
@@ -313,33 +379,53 @@ class LongLongController:
             raw = self.tracker.feed(state.get("winner"), state.get("winner_raw"),
                                     state.get("read_at"))
             if raw:
-                self._on_hand(raw)
+                self._on_hand(raw, hand=self.tracker.hands)
         if state.get("ok"):
             self._try_place(state)
         return self._push_state()
 
     # ------------------------------------------------------------------ một ván
-    def _on_hand(self, raw):
+    def _on_hand(self, raw, hand=None):
+        """Nhận một ván đã chốt; chỉ tất toán lệnh nếu lệnh thuộc ĐÚNG ván này."""
         strategy = self.sim.strategy
+        if hand is None:
+            # Tay do người dùng nhập tay: đánh số tiếp theo bộ đếm ván để lệnh vẫn khớp.
+            self.tracker.hands += 1
+            hand = self.tracker.hands
+        hand = int(hand)
+        pending = strategy.pending
+        # Lệnh đặt cho ván khác (bấm trễ / lệch nhịp đọc): bỏ, không cộng trừ tiền —
+        # đây chính là lỗi "tay chưa mở mà đã tính thắng".
+        stale = pending is not None and pending.get("hand") not in (None, hand)
+        if stale:
+            strategy.pending = None
         had_pending = strategy.pending is not None
         parsed, delta = self.sim.append(raw)
         if parsed is None:
             return
         self.armed_this_hand = False
-        if had_pending:
+        if stale:
+            self.log("Ván %d: ra %s · BỎ lệnh đặt cho ván %s (không kịp vào tiền) — "
+                     "không tính tiền." % (hand, longlong.raw_label(raw), pending.get("hand")),
+                     "error")
+        elif had_pending:
             self.log("Ván %d: ra %s · %s %s đv" % (
-                self.tracker.hands, longlong.raw_label(raw),
+                hand, longlong.raw_label(raw),
                 "THẮNG" if delta > 0 else "THUA",
                 "{:,}".format(int(round(abs(delta)))).replace(",", ".")),
                 "win" if delta > 0 else "loss")
         else:
-            self.log("Ván %d: ra %s" % (self.tracker.hands, longlong.raw_label(raw)))
+            self.log("Ván %d: ra %s" % (hand, longlong.raw_label(raw)))
+        self._last_place_fail = None
         plan = strategy.plan()
         if plan["action"] == "bet":
-            self.log("Kế hoạch: đặt %s đv vào ô %s." % (
-                "{:,}".format(plan["stake"]).replace(",", "."), longlong.DOOR_NAME))
+            amount = longlong.to_site_amount(plan["stake"], self.unit_mode)
+            self.log("Kế hoạch: đặt %s đv (= %sđ) — gửi %s lên sàn vào ô %s." % (
+                _fn(plan["stake"]), _fn(plan["stake"] * longlong.DONG_PER_UNIT),
+                _fn(amount), longlong.DOOR_NAME))
             if not self.config.get("place_real", False):
-                strategy.arm()      # mô phỏng: chốt trên giấy để sổ vốn phản ánh chiến thuật
+                # Mô phỏng: chốt trên giấy để sổ vốn phản ánh chiến thuật.
+                strategy.arm(hand=hand + 1)
         elif plan["action"] == "stop":
             self.log("Phiên đã dừng: chạm đáy thang.", "error")
 
@@ -351,24 +437,67 @@ class LongLongController:
         if not self._busy.acquire(blocking=False):
             return
         try:
-            stake = plan["stake"]
-            balance = state.get("balance_vn2")
-            if balance is not None and balance + 0.001 < float(stake):
-                self.log("Không đủ số dư (%s < %s VN2): bỏ ván này." % (
-                    "{:,.2f}".format(balance), "{:,.2f}".format(stake)), "error")
-                self.sim.strategy.arm()   # vẫn ghi sổ để không lệch thang
+            mode = self.unit_mode
+            stake = plan["stake"]                                  # đv (1 đv = 1.000đ)
+            amount = longlong.to_site_amount(stake, mode)          # đúng thang khay chip
+            if amount <= 0:
+                self.log("Bậc %s đv quá nhỏ so với đơn vị đang chọn (%s)." % (
+                    _fn(stake), longlong.UNIT_MODE_NAME[mode]), "error")
                 return
-            result = self.table.place(stake)
+            balance = state.get("balance_vn2")                     # số tiền đọc trên sàn
+            if balance is not None:
+                spendable = longlong.from_site_amount(balance, mode)   # -> đv
+                if spendable + 1e-6 < stake:
+                    # Không đủ tiền: BỎ ván, không chốt sổ — chốt sổ mà không có tiền
+                    # trên bàn chính là kiểu "tính tiền cho tay chưa đặt".
+                    key = (self.tracker.hands, "low_balance")
+                    if key != getattr(self, "_last_place_fail", None):
+                        self._last_place_fail = key
+                        self.log("Không đủ số dư (%sđ < %sđ): bỏ ván này, không đặt." % (
+                            _fn(spendable * longlong.DONG_PER_UNIT),
+                            _fn(stake * longlong.DONG_PER_UNIT)), "error")
+                    return
+            result = self.table.place(amount)
             if result.get("ok"):
-                self.sim.strategy.arm()
-                self.log("Đã đặt %s VN2 vào ô %s · chip %s · tổng của bạn %s" % (
-                    "{:,.2f}".format(stake), longlong.DOOR_NAME,
+                self.sim.strategy.arm(hand=self.tracker.hands + 1)
+                self._last_place_fail = None
+                self.log("Đã đặt %s %s (= %sđ) vào ô %s · chip %s · tổng của bạn %s" % (
+                    _fn(amount), longlong.UNIT_MODE_SHORT[mode],
+                    _fn(stake * longlong.DONG_PER_UNIT), longlong.DOOR_NAME,
                     " + ".join(str(c) for c in (result.get("placed") or [])),
-                    "{:,.2f}".format(result.get("total") or 0.0)), "win")
+                    _fn(result.get("total") or 0.0)), "win")
             else:
-                self.log("Đặt chip chưa được: %s" % (result.get("error") or "?"), "error")
+                # Cửa sổ cược chưa mở nên lần đọc nào cũng hỏng: chỉ báo MỘT lần cho mỗi
+                # ván/lỗi, tránh nhật ký bị 7 dòng "chưa đặt được" như trước.
+                key = (self.tracker.hands, result.get("error") or "?")
+                if key != getattr(self, "_last_place_fail", None):
+                    self._last_place_fail = key
+                    self.log("Đặt chip chưa được: %s" % (result.get("error") or "?"), "error")
+                    hint = self._unit_hint(stake, result)
+                    if hint:
+                        self.log(hint, "error")
         finally:
             self._busy.release()
+
+    def _unit_hint(self, stake, result):
+        """Gợi ý đổi "Đơn vị tiền trên sàn" khi khay chip toàn mệnh giá lớn.
+
+        Chỉ gợi ý, KHÔNG tự đổi và càng không tự đặt số tiền lớn hơn: đổi đơn vị là
+        quyết định của người dùng vì nó thay đổi số tiền thật trên bàn.
+        """
+        denominations = [int(v) for v in (result.get("denominations") or [])
+                         if isinstance(v, (int, float)) and float(v) > 0]
+        if not denominations:
+            return ""
+        mode = self.unit_mode
+        other = longlong.UNIT_VND if mode == longlong.UNIT_VN2 else longlong.UNIT_VN2
+        amount = longlong.to_site_amount(stake, other)
+        if amount <= 0 or not longlong_table.decompose_amount(amount, denominations):
+            return ""
+        return ("Khay chip toàn mệnh giá lớn (%s) — có vẻ sàn hiển thị %s. "
+                "Đổi “Đơn vị tiền trên sàn” sang %s rồi thử lại." % (
+                    ", ".join(_fn(v) for v in denominations[:6]),
+                    longlong.UNIT_MODE_NAME[other], longlong.UNIT_MODE_NAME[other]))
 
     # ------------------------------------------------------------------ cấu hình
     def config_set(self, params):
@@ -391,6 +520,15 @@ class LongLongController:
                 changed.append("capital")
             except (TypeError, ValueError):
                 pass
+        if "unit_mode" in params:
+            mode = longlong.normalize_unit_mode(params.get("unit_mode"))
+            if mode != self.config.get("unit_mode"):
+                self.config["unit_mode"] = mode
+                changed.append("unit_mode")
+                self.log("Đơn vị tiền trên sàn: %s — bậc 1 (%s đv) sẽ gửi %s." % (
+                    longlong.UNIT_MODE_NAME[mode],
+                    _fn(self.sim.strategy.ladder[0]),
+                    _fn(longlong.to_site_amount(self.sim.strategy.ladder[0], mode))))
         for key in ("place_real", "auto_result"):
             if key in params:
                 self.config[key] = bool(params[key])
@@ -398,8 +536,22 @@ class LongLongController:
         if "min_gap" in params:
             try:
                 self.config["min_gap"] = float(params["min_gap"])
-                self.tracker.min_gap = self.config["min_gap"]
+                self.tracker.configure(min_gap=self.config["min_gap"])
                 changed.append("min_gap")
+            except (TypeError, ValueError):
+                pass
+        if "min_hand_gap" in params:
+            try:
+                self.config["min_hand_gap"] = max(0.0, float(params["min_hand_gap"]))
+                self.tracker.configure(min_hand_gap=self.config["min_hand_gap"])
+                changed.append("min_hand_gap")
+            except (TypeError, ValueError):
+                pass
+        if "confirm_reads" in params:
+            try:
+                self.config["confirm_reads"] = max(1, min(int(params["confirm_reads"]), 5))
+                self.tracker.configure(confirm=self.config["confirm_reads"])
+                changed.append("confirm_reads")
             except (TypeError, ValueError):
                 pass
         if "start_url" in params:
@@ -433,6 +585,7 @@ class LongLongController:
     def session_reset(self):
         self.sim.reset(capital=self.config["capital"] * 1000.0)
         self.tracker.reset()
+        self._last_place_fail = None
         self.log("Đã reset phiên và bộ đếm ván.")
         return self._push_ok()
 

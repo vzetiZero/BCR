@@ -52,6 +52,20 @@ class ParseSpotTests(unittest.TestCase):
         self.assertIsNone(parsed["code"])
         self.assertIsNone(parsed["amount"])
 
+    def test_reads_a_spot_without_the_vn2_word(self):
+        # Sàn in tiền thật không có chữ "VN2": đọc theo vị trí trước ô phần trăm.
+        parsed = LT.parse_spot("C 0.95:1 14 3.114,69 76 %")
+        self.assertEqual(parsed["code"], "C")
+        self.assertAlmostEqual(parsed["rate"], 0.95)
+        self.assertEqual(parsed["chips"], 14)
+        self.assertAlmostEqual(parsed["amount"], 3114.69)
+        self.assertEqual(parsed["percent"], 76)
+
+    def test_vn2_word_still_wins_over_positional_reading(self):
+        parsed = LT.parse_spot("C 0.95:1 14 VN2 3.114,69 76 %")
+        self.assertAlmostEqual(parsed["amount"], 3114.69)
+        self.assertEqual(parsed["chips"], 14)
+
 
 class DoorMappingTests(unittest.TestCase):
     def test_dom_roles_match_the_board_labels(self):

@@ -199,11 +199,13 @@ main::-webkit-scrollbar-thumb { background: #24314a; border-radius: 8px; }
 .ls-cell.done { opacity: 0.45; }
 
 .field { display: flex; flex-direction: column; gap: 6px; font-size: 11px; color: var(--muted); margin-bottom: 12px; }
-.field input {
+.field input,
+.field select {
   background: #0d1728; border: 1px solid var(--line-strong); color: var(--text);
   padding: 9px 11px; border-radius: 10px; font-size: 13px; font-weight: 600;
 }
-.field input:focus { outline: none; border-color: var(--gold); box-shadow: 0 0 0 3px rgba(245, 196, 81, 0.14); }
+.field input:focus,
+.field select:focus { outline: none; border-color: var(--gold); box-shadow: 0 0 0 3px rgba(245, 196, 81, 0.14); }
 .row { display: flex; gap: 8px; flex-wrap: wrap; }
 .hint { font-size: 11px; color: var(--muted); line-height: 1.5; }
 

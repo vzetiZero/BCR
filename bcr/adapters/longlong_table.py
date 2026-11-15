@@ -15,7 +15,9 @@ Bàn này nằm trong iframe của portal nên phải đọc đúng execution co
     Tổng theo ô:    text của từng [data-role="JNS_x"] -> "C 0.95:1 14 VN2 3.114,69 76 %"
 
 VN2 là đơn vị của sàn: 1 VN2 = 1.000đ, trùng đúng "đơn vị sảnh" mà thang cược đang dùng
-(40 đv = 40.000đ = 40 VN2).
+(40 đv = 40.000đ = 40 VN2). Sảnh khác in thẳng tiền thật (khay chip 10.000 / 20.000 /
+40.000 …): số tiền phải gửi vẫn đọc theo khay, còn tỉ lệ VN2 <-> VNĐ do
+``bcr.models.longlong.to_site_amount`` quyết định theo chế độ đơn vị đang chọn.
 """
 
 import json
@@ -110,7 +112,8 @@ def parse_spot(text):
     """Đọc dòng tổng của một ô: 'C 0.95:1 14 VN2 3.114,69 76 %' .
 
     Trả dict {"code", "rate", "chips", "amount", "percent"}; phần nào không đọc được
-    thì để None.
+    thì để None. Sàn in tiền thật không có chữ "VN2" thì đọc theo vị trí
+    ("C 0.95:1 14 3.114,69 76 %").
     """
     cleaned = clean_text(text)
     out = {"code": None, "rate": None, "chips": None, "amount": None, "percent": None}
@@ -137,6 +140,19 @@ def parse_spot(text):
                 out["percent"] = int(tokens[index - 1])
             except ValueError:
                 pass
+    if out["amount"] is None:
+        # Không có chữ VN2 (sàn hiển thị tiền thật): lượng chip và số tiền nằm ngay
+        # trước ô phần trăm -> "... <chips> <amount> <percent> %".
+        pct = next((i for i, token in enumerate(tokens) if token == "%"), None)
+        if pct is not None and pct >= 2:
+            amount = parse_vn2(tokens[pct - 2])
+            if amount is not None:
+                out["amount"] = amount
+                if out["chips"] is None:
+                    try:
+                        out["chips"] = int(tokens[pct - 3])
+                    except (ValueError, IndexError):
+                        pass
     return out
 
 
@@ -209,8 +225,9 @@ PLACE_READ_JS = r"""(() => {
 
 
 def decompose_amount(amount, denominations):
-    """Chia số VN2 thành các mệnh giá chip đang có trên khay (ít chip nhất).
+    """Chia ``amount`` thành các mệnh giá chip đang có trên khay (ít chip nhất).
 
+    ``amount`` phải cùng thang với khay (xem ``models.longlong.to_site_amount``).
     Tham lam từ mệnh giá lớn xuống (khay EVO có 10/20/40/100/500/2000, mọi mệnh giá đều
     là bội của 10). Trả danh sách mệnh giá cần bấm; nếu không chia khít được thì trả
     None để KHÔNG đặt thiếu tiền.
@@ -345,6 +362,7 @@ class LongLongTable:
         try:
             ws = self._open(ws_url)
             self._send(ws, "Runtime.enable", request_id=0)
+            self._park_mouse(ws)          # bỏ hover còn sót để không bị đọc thành "ô thắng"
             value = self._evaluate(ws, READ_JS, context_id)
             if not isinstance(value, dict) or not value.get("ok"):
                 # Bàn đổi tab/context: xoá cache để lần sau dò lại.
@@ -402,6 +420,39 @@ class LongLongTable:
                        request_id=11)
         time.sleep(pause)
 
+    def _read_total(self, ws, js, context_id):
+        """Đọc TỔNG ĐẶT CƯỢC của chính mình (số tiền đã nằm trên bàn)."""
+        state = self._evaluate(ws, js, context_id) or {}
+        return (parse_vn2(state.get("total_bet")) or 0.0), state
+
+    def _park_mouse(self, ws, x=2, y=2):
+        """Đưa con trỏ (synthetic) ra khỏi bàn cược.
+
+        Sàn gắn thêm class khi rê chuột lên ô cược, mà cách nhận "ô thắng" là đếm class
+        -> chuột còn nằm trên ô sau khi bấm sẽ bị đọc thành "ván đã có kết quả" (chặn
+        đặt chip) và thành VÁN MA trong sổ vốn. Chỉ là sự kiện CDP, không di chuyển
+        chuột thật của người dùng.
+        """
+        self._send(ws, "Input.dispatchMouseEvent",
+                   {"type": "mouseMoved", "x": x, "y": y, "button": "none", "buttons": 0},
+                   request_id=12)
+        time.sleep(0.05)
+
+    def _wait_total(self, ws, js, context_id, target, timeout=0.7):
+        """Chờ tới khi tổng đạt ``target``; trả (tổng, state, đạt_chưa).
+
+        Sàn cập nhật số tổng không đồng bộ với cú bấm nên phải đọc lại vài lần: đọc một
+        lần rồi kết luận sẽ báo "đặt lệch" oan và HOÀN TÁC nhầm tiền đã vào.
+        """
+        deadline = time.monotonic() + max(0.0, timeout)
+        total, state = self._read_total(ws, js, context_id)
+        while total + 0.01 < target:
+            if time.monotonic() >= deadline:
+                return total, state, False
+            time.sleep(0.12)
+            total, state = self._read_total(ws, js, context_id)
+        return total, state, True
+
     def _undo(self, ws, times, state):
         """Bấm HOÀN TÁC để huỷ số chip vừa đặt (dùng khi xác minh lệch)."""
         box = (state or {}).get("undo")
@@ -411,11 +462,15 @@ class LongLongTable:
             self._click(ws, box)
 
     def place(self, amount, door=STRATEGY_DOOR, max_chips=40):
-        """Đặt ``amount`` VN2 vào ô ``door`` bằng chip trên khay.
+        """Đặt ``amount`` (đúng thang khay chip của sàn) vào ô ``door``.
 
         Quy trình an toàn: chia tiền thành mệnh giá chip đang có -> bấm chip -> bấm ô ->
-        đọc lại TỔNG ĐẶT CƯỢC của chính mình và so với số tiền định đặt; lệch là bấm
-        HOÀN TÁC toàn bộ. Trả dict {"ok", "placed", "total", "error"}.
+        đọc lại TỔNG ĐẶT CƯỢC SAU TỪNG CHIP; cú bấm nào không vào bàn (cửa sổ cược đã
+        đóng) thì dừng ngay và bấm HOÀN TÁC toàn bộ. Trả dict
+        {"ok", "placed", "total", "error", "denominations"}.
+
+        ``denominations`` luôn được trả về (khi đọc được khay) để tầng Controller gợi ý
+        đổi chế độ đơn vị tiền khi số tiền nhỏ hơn mọi mệnh giá trên khay.
         """
         ws_url, context_id = self._discover()
         if ws_url is None:
@@ -426,6 +481,7 @@ class LongLongTable:
         try:
             ws = self._open(ws_url)
             self._send(ws, "Runtime.enable", request_id=0)
+            self._park_mouse(ws)          # hover còn sót từ lần bấm trước
             state = self._evaluate(ws, js, context_id)
             if not isinstance(state, dict) or not state.get("door"):
                 return {"ok": False, "error": "Chưa thấy ô cược trên bàn."}
@@ -436,12 +492,13 @@ class LongLongTable:
                              if str(value).isdigit()]
             chips = decompose_amount(amount, denominations)
             if not chips:
-                return {"ok": False,
-                        "error": "Không chia được %s VN2 theo mệnh giá %s." % (amount, denominations)}
+                return {"ok": False, "denominations": denominations,
+                        "error": "Không chia được %s theo mệnh giá %s." % (amount, denominations)}
             if len(chips) > max_chips:
-                return {"ok": False,
+                return {"ok": False, "denominations": denominations,
                         "error": "Cần %d chip (> %d) — dừng cho an toàn." % (len(chips), max_chips)}
             door_box = state.get("door")
+            initial = before
             for value in chips:
                 chip_box = (state.get("chips") or {}).get(str(value))
                 if not clickable(chip_box) or not clickable(door_box):
@@ -449,14 +506,27 @@ class LongLongTable:
                 self._click(ws, chip_box)
                 self._click(ws, door_box)
                 placed.append(value)
-            after_state = self._evaluate(ws, js, context_id) or {}
-            after = parse_vn2(after_state.get("total_bet")) or 0.0
+                # Xác minh NGAY sau từng chip: cửa sổ cược có thể đóng giữa chừng và cú
+                # bấm bị bỏ qua (bàn ghi 0.0). Dừng + hoàn tác thay vì bấm tiếp vô ích.
+                total, probe, gained = self._wait_total(ws, js, context_id,
+                                                       initial + value)
+                if not gained:
+                    self._undo(ws, len(placed), probe)
+                    self._park_mouse(ws)
+                    return {"ok": False, "placed": placed, "denominations": denominations,
+                            "delta": total - initial,
+                            "error": "Ván đã đóng — chip không vào bàn (đã hoàn tác)."}
+                initial = total
+            after = initial
             delta = after - before
+            self._park_mouse(ws)          # đừng để hover đè lên ô cược sau khi đặt
             if abs(delta - float(amount)) < 0.01:
-                return {"ok": True, "placed": chips, "total": after, "delta": delta}
-            self._undo(ws, len(placed), after_state)
+                return {"ok": True, "placed": chips, "total": after, "delta": delta,
+                        "denominations": denominations}
+            self._undo(ws, len(placed), probe)
             return {"ok": False, "placed": chips, "delta": delta,
-                    "error": "Đặt lệch: cần %s VN2, bàn ghi %s — đã hoàn tác." % (amount, delta)}
+                    "denominations": denominations,
+                    "error": "Đặt lệch: cần %s, bàn ghi %s — đã hoàn tác." % (amount, delta)}
         except Exception as exc:
             self._ws_url, self._context = None, None
             return {"ok": False, "placed": placed,

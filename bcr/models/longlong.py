@@ -62,6 +62,25 @@ DEFAULT_LADDER = [40, 80, 160, 320, 640, 1280, 2560, 4920]
 LADDER_LOWER = 1
 LADDER_UPPER = 20
 
+# --- Đơn vị tiền trên sàn -----------------------------------------------------
+# Một bậc của thang cược luôn là "đv" = 1.000đ (DONG_PER_UNIT). Nhưng số tiền gửi
+# cho sàn phải cùng thang với KHAY CHIP, mà khay chip mỗi sảnh in một kiểu:
+#   UNIT_VN2 – sàn in tiền theo VN2 (EVO):  số 40 trên bàn = 40 VN2 = 40.000đ
+#   UNIT_VND – sàn in tiền thật:            số 10.000 trên bàn = 10.000đ
+# Chọn sai thì bậc 10 đv bị gửi thành 10 trong khi khay toàn mệnh giá ≥10.000 nên
+# không chia được (lỗi "Không chia được 10 VN2 theo mệnh giá [...]").
+UNIT_VN2, UNIT_VND = "vn2", "vnd"
+DEFAULT_UNIT_MODE = UNIT_VN2
+# Số VNĐ ứng với MỘT đơn vị số tiền hiển thị trên sàn.
+UNIT_SCALE = {UNIT_VN2: 1000.0, UNIT_VND: 1.0}
+UNIT_MODE_NAME = {
+    UNIT_VN2: "VN2 (1 đơn vị = 1.000đ)",
+    UNIT_VND: "VND thật (1 đơn vị = 1đ)",
+}
+UNIT_MODE_SHORT = {UNIT_VN2: "VN2", UNIT_VND: "VND"}
+# Một đơn vị của thang cược (đv) luôn đáng 1.000đ, không phụ thuộc cách sàn in tiền.
+DONG_PER_UNIT = 1000.0
+
 # Sơ đồ quy đổi ô lịch sử của sàn về bộ VV/DD/VD/DV. Sàn vẽ hình nên decoder ưu tiên
 # nhãn chữ; ô nào chỉ có số thì dùng bảng này. Bàn thật mã hoá khác thì chỉ sửa ở đây.
 RESULT_CODES = {
@@ -242,6 +261,41 @@ def ladder_total(ladder):
     return sum(int(stake) for stake in normalize_ladder(ladder))
 
 
+def normalize_unit_mode(value):
+    """Chuẩn hoá chế độ đơn vị tiền của sàn; giá trị lạ về VN2 (mức tiền nhỏ, an toàn)."""
+    text = str(value or "").strip().casefold()
+    if text in (UNIT_VND, "đ", "d", "dong", "vietnamdong"):
+        return UNIT_VND
+    return UNIT_VN2
+
+
+def site_scale(mode=DEFAULT_UNIT_MODE):
+    """Số VNĐ của MỘT đơn vị số tiền hiển thị trên sàn (VN2 -> 1.000, VND -> 1)."""
+    return UNIT_SCALE[normalize_unit_mode(mode)]
+
+
+def to_site_amount(stake_units, mode=DEFAULT_UNIT_MODE):
+    """Đổi bậc cược (đv, 1 đv = 1.000đ) thành số tiền phải gửi cho sàn.
+
+    Cùng thang với khay chip: chế độ VN2 giữ nguyên số (40 -> 40), chế độ VND nhân
+    1.000 để thành tiền thật (10 -> 10.000).
+    """
+    try:
+        stake = float(stake_units or 0)
+    except (TypeError, ValueError):
+        return 0
+    return int(round(stake * DONG_PER_UNIT / site_scale(mode)))
+
+
+def from_site_amount(amount, mode=DEFAULT_UNIT_MODE):
+    """Đổi số tiền đọc trên sàn về đơn vị thang cược (đv)."""
+    try:
+        value = float(amount or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return value * site_scale(mode) / DONG_PER_UNIT
+
+
 def payout_of(door=DOOR):
     """Tỉ lệ ăn của ô đang đánh (0.95 cho ô 1 vàng 1 đỏ)."""
     return PAYOUT.get(door, PAYOUT[DOOR])
@@ -362,14 +416,19 @@ class LongLongStrategy:
                     reason="Tay trước ra bộ vàng-đỏ; đặt ô %s ở bậc %d." % (
                         DOOR_NAME, self.step + 1))
 
-    def arm(self):
-        """Chốt lệnh cược cho tay kế tiếp; trả về lệnh hoặc None nếu chưa đủ điều kiện."""
+    def arm(self, hand=None):
+        """Chốt lệnh cược cho tay kế tiếp; trả về lệnh hoặc None nếu chưa đủ điều kiện.
+
+        ``hand`` là SỐ VÁN mà lệnh này thuộc về (ván sắp ra kết quả). Nhờ vậy nếu một
+        ván khác ra kết quả (đặt trễ, lệch nhịp đọc) thì lệnh được nhận ra là của ván
+        khác và bị bỏ, thay vì cộng/trừ tiền cho tay không hề đặt.
+        """
         decision = self.plan()
         if decision["action"] != "bet":
             self.note = decision["reason"]
             return None
         self.pending = {"side": decision["side"], "stake": decision["stake"],
-                        "step": decision["step"]}
+                        "step": decision["step"], "hand": hand}
         self.note = "Đã chốt: %s vào ô %s (bậc %d)." % (
             "{:,}".format(decision["stake"]).replace(",", "."), DOOR_NAME,
             decision["step"] + 1)
@@ -470,9 +529,11 @@ class LongLongSimulation:
             self.strategy.pending = None
             fresh = fresh_list
         added = 0
-        for raw in fresh:
+        base = len(self.seen)
+        for offset, raw in enumerate(fresh, start=1):
             if auto_arm:
-                self.strategy.arm()
+                # Lệnh chốt trước tay thứ (base + offset) là lệnh CỦA tay đó.
+                self.strategy.arm(hand=base + offset)
             before = len(self.strategy.log)
             self.strategy.settle(raw)
             if len(self.strategy.log) > before:
@@ -485,9 +546,10 @@ class LongLongSimulation:
         self.note = self.strategy.note
         return added
 
-    def append(self, result, auto_arm=False):
+    def append(self, result, auto_arm=False, hand=None):
         """Ghi MỘT tay do người dùng (hoặc vòng đọc realtime) đưa vào sổ.
 
+        ``hand`` là số ván của tay này (dùng để gắn lệnh với đúng ván khi ``auto_arm``).
         Trả về (bộ đã ghi, tiền thắng/thua của tay đó). Tiền bằng 0 khi tay trước không
         có lệnh cược nào — vẫn trả về bộ để bên gọi biết tay đã được ghi.
         """
@@ -496,7 +558,7 @@ class LongLongSimulation:
             self.note = "Kết quả không đọc được: %r" % (result,)
             return None, 0
         if auto_arm:
-            self.strategy.arm()
+            self.strategy.arm(hand=hand)
         before = len(self.strategy.log)
         _, delta = self.strategy.settle(parsed)
         if len(self.strategy.log) > before:

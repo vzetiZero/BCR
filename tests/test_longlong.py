@@ -13,6 +13,7 @@ Luật đánh:
 import unittest
 
 from bcr.adapters import lobby_stream as LS
+from bcr.adapters import longlong_table
 from bcr.models import longlong
 
 
@@ -426,6 +427,49 @@ class LongLongStatsTests(unittest.TestCase):
         self.assertEqual(stats["hands"], len(sim.log))
         self.assertEqual(stats["hands"], stats["wins"] + stats["losses"])
         self.assertGreaterEqual(stats["max_loss_streak"], 1)
+
+
+class LongLongUnitModeTests(unittest.TestCase):
+    """Đơn vị tiền trên sàn: VN2 (1 đv = 1 số) hay VND thật (10 đv = 10.000).
+
+    Ca thật: sàn có khay chip [10.000, 20.000, 40.000, 100.000, 500.000, 2.000.000].
+    Bậc 10 đv ở chế độ VN2 gửi "10" nên KHÔNG chia được (lỗi người dùng gặp), còn ở
+    chế độ VND gửi "10.000" nên bấm đúng 1 chip.
+    """
+
+    REAL_TRAY = [10000, 20000, 40000, 100000, 500000, 2000000]
+
+    def test_vn2_mode_keeps_the_board_scale(self):
+        self.assertEqual(longlong.to_site_amount(40, longlong.UNIT_VN2), 40)
+        self.assertEqual(longlong.from_site_amount(40, longlong.UNIT_VN2), 40.0)
+        self.assertEqual(longlong.site_scale(longlong.UNIT_VN2), 1000.0)
+
+    def test_vnd_mode_sends_real_money(self):
+        self.assertEqual(longlong.to_site_amount(10, longlong.UNIT_VND), 10000)
+        self.assertEqual(longlong.to_site_amount(4920, longlong.UNIT_VND), 4920000)
+        self.assertEqual(longlong.from_site_amount(250000, longlong.UNIT_VND), 250.0)
+        self.assertEqual(longlong.site_scale(longlong.UNIT_VND), 1.0)
+
+    def test_default_and_unknown_modes_fall_back_to_vn2(self):
+        self.assertEqual(longlong.DEFAULT_UNIT_MODE, longlong.UNIT_VN2)
+        for value in (None, "", "gì đó", "usd"):
+            self.assertEqual(longlong.normalize_unit_mode(value), longlong.UNIT_VN2, value)
+        for value in ("vnd", "VND", "Vnd", "đ"):
+            self.assertEqual(longlong.normalize_unit_mode(value), longlong.UNIT_VND, value)
+
+    def test_ten_thousand_only_splits_in_vnd_mode(self):
+        self.assertEqual(
+            longlong_table.decompose_amount(
+                longlong.to_site_amount(10, longlong.UNIT_VND), self.REAL_TRAY), [10000])
+        self.assertIsNone(
+            longlong_table.decompose_amount(
+                longlong.to_site_amount(10, longlong.UNIT_VN2), self.REAL_TRAY),
+            "chế độ VN2 gửi 10 nên khay toàn mệnh giá lớn không chia được")
+
+    def test_bad_amount_is_not_rounded_into_a_bigger_bet(self):
+        self.assertEqual(longlong.to_site_amount("x", longlong.UNIT_VND), 0)
+        self.assertEqual(longlong.to_site_amount(None, longlong.UNIT_VND), 0)
+        self.assertEqual(longlong.from_site_amount("x", longlong.UNIT_VND), 0.0)
 
 
 if __name__ == "__main__":

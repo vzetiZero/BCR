@@ -92,8 +92,38 @@ Lệnh Baccarat: `chrome.open|attach|close|window`, `lobby.enter|sweep|back`,
 `tables`, `table.open|select|leave`, `tool.start|stop`, `scan`, `chips.read`,
 `config.get|set`, `session.new|reset|recover`.
 Lệnh LONG-LONG: `chrome.open|close|status|window`, `tool.start|stop`, `config.set`
-(nhận cả `start_url`, `chrome_window`), `ladder.fromCapital`, `hand.manual`,
+(nhận cả `unit_mode`, `start_url`, `chrome_window`), `ladder.fromCapital`, `hand.manual`,
 `session.reset`, `tick`.
+
+## Đơn vị tiền trên sàn (LONG-LONG)
+
+Một bậc thang cược luôn là "đv" = 1.000đ, nhưng **số tiền gửi cho sàn phải cùng thang
+với khay chip**, nên tab Cấu hình có 2 lựa chọn (`config.unit_mode`):
+
+| `unit_mode` | Khay chip của sàn | Bậc 10 đv gửi đi |
+|---|---|---|
+| `vn2` (mặc định) | in VN2 — chip 40 = 40.000đ | `10` (= 10.000đ) |
+| `vnd` | in tiền thật — chip 10.000 = 10.000đ | `10000` (= 10.000đ) |
+
+Quy đổi nằm ở `models/longlong.py`: `to_site_amount()` (đv → số gửi sàn) và
+`from_site_amount()` (số đọc trên sàn → đv, dùng khi so số dư). Chọn sai thì tool báo
+“Không chia được … theo mệnh giá” và **gợi ý đổi chế độ**, không tự đặt số lớn hơn.
+
+## Chống “ván ma” và độ trễ khi đặt chip (LONG-LONG)
+
+Sàn báo ô thắng bằng class hiệu ứng, và rê chuột lên ô cược cũng gắn class — nên bộ đếm
+ván dễ sinh **ván không có thật** (sổ vốn cộng/trừ tiền cho tay chưa mở). Ba lớp chặn:
+
+| Lớp | Ở đâu | Tác dụng |
+|---|---|---|
+| Xác nhận `confirm_reads` lần đọc liên tiếp | `controllers/longlong_auto.py` | lọc nhiễu animation/hover |
+| Hai ván cách nhau ≥ `min_hand_gap` giây | idem | chặn 2 “ván” cách nhau 2 giây |
+| Lệnh gắn số ván (`pending["hand"]`) | `controllers/longlong.py` | ván khác ra kết quả thì **bỏ lệnh**, không tính tiền |
+
+Khi đang cần bấm chip mà chưa bấm được, vòng đọc tự nhanh lên 0.7 giây (`PLACE_POLL_SECONDS`)
+để không trễ cửa sổ cược. `adapters/longlong_table.py::place()` đọc lại TỔNG ĐẶT CƯỢC
+**sau từng chip**; cú bấm nào không vào bàn thì dừng và HOÀN TÁC ngay, và tự đưa chuột
+ra khỏi ô cược để hover không bị đọc thành “ô thắng”.
 
 ## Tab Thống kê (LONG-LONG)
 
