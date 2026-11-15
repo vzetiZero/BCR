@@ -174,6 +174,19 @@ site cùng lúc vẫn đúng. Bắt tay frame của một sàn mới:
 python tools/probe_longlong.py --port 9223 --ws 60
 ```
 
+## Dừng theo lãi mục tiêu % (LONG-LONG)
+
+Cấu hình → khu An toàn → **“Dừng tool khi lãi đạt (%)”** (0 = tắt).
+
+- Vốn đầu phiên được **chốt tại lúc bấm Chạy tool**, lấy từ **số dư thật trên sàn**; nếu
+  chưa vào bàn thì tạm dùng “Vốn phiên” và sẽ chốt lại bằng số dư thật ngay khi đọc được.
+- Ngưỡng dừng = `vốn × (1 + %/100)`. Ví dụ vốn 3.000 đv + 30% → **3.900 đv** thì tool tự
+  dừng và ghi nhật ký `Đạt lãi mục tiêu +30% … DỪNG TOOL`.
+- Đạt ngưỡng giữa ván thì dừng ngay: nhịp đó không đặt thêm chip, vòng đọc kết thúc.
+- Đổi % trong Cấu hình sẽ xoá trạng thái “đã dừng” để chạy tiếp được; “Reset phiên” xoá
+  vốn đầu phiên và lần Chạy tool sau sẽ chốt lại.
+- Thẻ **LÃI / LỖ PHIÊN** hiện thêm `mục tiêu +30%: 3.000 → 3.900 đv · đang +10.0%`.
+
 ## Tab Thống kê (LONG-LONG)
 
 Đánh giá hiệu quả thực tế của phiên, tính từ **sổ tay đã cược** (`LongLongSimulation.log`),

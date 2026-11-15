@@ -66,6 +66,9 @@ class LongLongController:
         self.offline_noted = False
         self._last_place_fail = None    # (ván, lỗi) đã báo — chống spam nhật ký
         self._chip_gone_at = None       # mốc bắt đầu thấy tiền đặt biến mất khỏi bàn
+        # Vốn đầu phiên (chốt lúc bấm Chạy tool) để tính mục tiêu lãi %.
+        self.session_start = None
+        self.take_profit_hit = False
         self._heartbeat = None
         self._heartbeat_stop = None
         self.log("Engine LONG-LONG sẵn sàng.")
@@ -131,6 +134,8 @@ class LongLongController:
             # Luồng WebSocket của sàn: biết đúng ván / cửa sổ cược / kết quả.
             "use_ws": True,
             "min_bet_ms": 3000,      # còn ít hơn mức này thì không bấm (tránh vào muộn)
+            # Lãi mục tiêu: dừng tool khi lãi đạt % này so với vốn đầu phiên (0 = tắt).
+            "take_profit_pct": 0.0,
             "start_url": BR.START_URL,                 # link Chrome mở khi bấm “Mở Chrome”
             # Cửa sổ Chrome: cùng bộ tham số với tab Baccarat.
             "chrome_window": {"width": 1280, "height": 800, "percent": 100,
@@ -182,6 +187,11 @@ class LongLongController:
             config["min_bet_ms"] = max(0, min(int(config.get("min_bet_ms") or 3000), 60000))
         except (TypeError, ValueError):
             config["min_bet_ms"] = 3000
+        try:
+            config["take_profit_pct"] = max(0.0, min(float(config.get("take_profit_pct") or 0.0),
+                                                     1000.0))
+        except (TypeError, ValueError):
+            config["take_profit_pct"] = 0.0
         return config
 
     @property
@@ -254,6 +264,8 @@ class LongLongController:
             "hands_seen": self.tracker.hands,
             # Luồng WebSocket của sàn (nguồn chuẩn): ván nào, phase nào, còn bao lâu.
             "ws": self._ws_state(),
+            # Lãi mục tiêu theo % vốn đầu phiên (chốt lúc bấm Chạy tool).
+            "take_profit": self._take_profit_state(),
             "log": [dict(entry) for entry in strategy.log[-20:]],
             "profit_units": self.sim.profit / 1000.0,
             # Số liệu cho tab Thống kê: tỉ lệ thắng/thua, chuỗi thua dài nhất, đường lãi/lỗ.
@@ -368,6 +380,8 @@ class LongLongController:
             return {"ok": False, "error": "Chưa mở Chrome. Bấm “Mở Chrome” và vào bàn trước."}
         self.tool_running = True
         self._stop = threading.Event()
+        self.take_profit_hit = False
+        self._capture_baseline()     # chốt vốn đầu phiên TRƯỚC khi vào vòng đặt chip
         self._thread = threading.Thread(target=self._loop, daemon=True, name="ll-tool")
         self._thread.start()
         self.stream.start()          # nghe luồng WebSocket của sàn (nguồn chuẩn)
@@ -397,6 +411,87 @@ class LongLongController:
         self.tool_running = False
         self.stream.stop()
         self._push_state()
+
+    # ------------------------------------------------------- lãi mục tiêu (%)
+    def _capture_baseline(self, state=None):
+        """Chốt VỐN ĐẦU PHIÊN để tính mục tiêu lãi %.
+
+        Ưu tiên số dư thật đọc trên sàn (đúng nghĩa "vốn đang có"); nếu chưa đọc được
+        (chưa vào bàn) thì tạm dùng "Vốn phiên" trong cấu hình và sẽ chốt lại từ số dư
+        thật ngay khi đọc được (xem _check_take_profit).
+        """
+        mode = self.unit_mode
+        if state is None:
+            try:
+                state = self.table.read()
+            except Exception:
+                state = {}
+        balance = state.get("balance_vn2") if isinstance(state, dict) else None
+        if balance is not None:
+            units, source = longlong.from_site_amount(balance, mode), "balance"
+        else:
+            units, source = float(self.config.get("capital") or 0), "config"
+        self.session_start = {"units": float(units), "at": time.time(), "source": source}
+        pct = float(self.config.get("take_profit_pct") or 0)
+        if pct > 0 and units > 0:
+            target = units * (1.0 + pct / 100.0)
+            self.log("Vốn đầu phiên: %s đv (= %s) [%s] · lãi mục tiêu +%g%% → dừng ở %s đv (= %s)."
+                     % (_fn(units), _fn(units * longlong.DONG_PER_UNIT),
+                        "số dư trên sàn" if source == "balance" else "vốn phiên trong cấu hình",
+                        pct, _fn(target), _fn(target * longlong.DONG_PER_UNIT)))
+        return self.session_start
+
+    def _take_profit_state(self):
+        """Số liệu mục tiêu lãi cho UI (không đọc CDP)."""
+        start = self.session_start or {}
+        pct = float(self.config.get("take_profit_pct") or 0)
+        units = float(start.get("units") or 0)
+        state = self.last_state or {}
+        current = None
+        if state.get("ok") and state.get("balance_vn2") is not None:
+            current = longlong.from_site_amount(state["balance_vn2"], self.unit_mode)
+        target = units * (1.0 + pct / 100.0) if (pct > 0 and units > 0) else None
+        return {
+            "enabled": bool(pct > 0),
+            "pct": pct,
+            "start_units": units or None,
+            "start_source": start.get("source"),
+            "target_units": target,
+            "current_units": current,
+            "profit_units": (current - units) if (current is not None and units) else None,
+            "progress_pct": (((current / units) - 1.0) * 100.0)
+            if (current is not None and units) else None,
+            "hit": bool(self.take_profit_hit),
+        }
+
+    def _check_take_profit(self, state):
+        """Đạt lãi mục tiêu thì dừng tool. Trả True nếu vừa dừng."""
+        pct = float(self.config.get("take_profit_pct") or 0)
+        if pct <= 0 or self.take_profit_hit:
+            return False
+        start = self.session_start
+        balance = state.get("balance_vn2") if isinstance(state, dict) else None
+        # Chốt lại vốn đầu phiên bằng số dư thật nếu lúc bấm Chạy tool chưa đọc được bàn.
+        if start is None or (start.get("source") != "balance" and balance is not None):
+            start = self._capture_baseline(state=state)
+        units = float((start or {}).get("units") or 0)
+        if units <= 0:
+            return False
+        target = units * (1.0 + pct / 100.0)
+        if balance is not None:
+            current, source = longlong.from_site_amount(balance, self.unit_mode), "số dư trên sàn"
+        else:
+            current = units + self.sim.profit / longlong.DONG_PER_UNIT
+            source = "lãi theo sổ"
+        if current + 1e-6 < target:
+            return False
+        self.take_profit_hit = True
+        self.log("Đạt lãi mục tiêu +%g%% (%s → %s đv = %s, %s): DỪNG TOOL."
+                 % (pct, _fn(units), _fn(current), _fn(current * longlong.DONG_PER_UNIT), source),
+                 "win")
+        self.tool_running = False
+        self._stop.set()
+        return True
 
     def _next_wait(self):
         """Nhịp chờ tới lần đọc sau.
@@ -431,6 +526,9 @@ class LongLongController:
                                     state.get("read_at"), state.get("result_sig"))
             if raw:
                 self._on_hand(raw, hand=self.tracker.hands)
+        if state.get("ok") and self._check_take_profit(state):
+            # Đã đạt lãi mục tiêu: dừng ngay, không đặt thêm ván nào.
+            return self._push_state()
         if state.get("ok"):
             self._watch_chips(state, wsnap)
             self._try_place(state, wsnap)
@@ -685,6 +783,14 @@ class LongLongController:
                 changed.append("chip_watch_seconds")
             except (TypeError, ValueError):
                 pass
+        if "take_profit_pct" in params:
+            try:
+                self.config["take_profit_pct"] = max(0.0, min(float(params["take_profit_pct"]),
+                                                             1000.0))
+                self.take_profit_hit = False      # đổi ngưỡng thì cho phép chạy tiếp
+                changed.append("take_profit_pct")
+            except (TypeError, ValueError):
+                pass
         if "start_url" in params:
             url = str(params["start_url"] or "").strip()
             if not BR.valid_site_url(url):
@@ -717,6 +823,9 @@ class LongLongController:
         self.sim.reset(capital=self.config["capital"] * 1000.0)
         self.tracker.reset()
         self._last_place_fail = None
+        self._ws_settled_round = None
+        self.session_start = None       # vốn đầu phiên sẽ chốt lại ở lần Chạy tool sau
+        self.take_profit_hit = False
         self.log("Đã reset phiên và bộ đếm ván.")
         return self._push_ok()
 

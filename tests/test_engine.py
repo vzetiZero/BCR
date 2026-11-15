@@ -412,6 +412,76 @@ class WebSocketGateTests(unittest.TestCase):
         self.assertEqual(service.tracker.hands, 1, "một ván chỉ chốt một lần")
 
 
+class TakeProfitTests(unittest.TestCase):
+    """Lãi mục tiêu %: chốt vốn đầu phiên, đạt ngưỡng thì tự dừng tool."""
+
+    @staticmethod
+    def prepare(service, units=3000.0, pct=30.0, source="balance"):
+        service.config["take_profit_pct"] = pct
+        service.session_start = {"units": units, "at": 0.0, "source": source}
+
+    def test_stops_when_profit_reaches_the_target(self):
+        service = make_service(states=[state(balance=3900.0)])
+        self.prepare(service)
+        service.tick()
+        self.assertTrue(service.take_profit_hit)
+        self.assertTrue(service._stop.is_set(), "phải dừng vòng đặt chip")
+        texts = [entry["text"] for entry in service.logs]
+        self.assertTrue(any("DỪNG TOOL" in text for text in texts), texts)
+
+    def test_does_not_stop_below_the_target(self):
+        service = make_service(states=[state(balance=3899.0)])
+        self.prepare(service)
+        service.tick()
+        self.assertFalse(service.take_profit_hit)
+
+    def test_is_off_when_the_percentage_is_zero(self):
+        service = make_service(states=[state(balance=99999.0)])
+        self.prepare(service, pct=0.0)
+        service.tick()
+        self.assertFalse(service.take_profit_hit, "0% = tắt, không được tự dừng")
+
+    def test_baseline_uses_the_site_balance_when_available(self):
+        service = make_service()
+        start = service._capture_baseline(state={"balance_vn2": 3000.0})
+        self.assertEqual(start["units"], 3000.0)
+        self.assertEqual(start["source"], "balance")
+
+    def test_baseline_falls_back_to_the_configured_capital(self):
+        service = make_service()
+        service.config["capital"] = 2500
+        start = service._capture_baseline(state={"ok": False})
+        self.assertEqual(start["units"], 2500.0)
+        self.assertEqual(start["source"], "config")
+
+    def test_baseline_is_recaptured_from_the_site_when_it_was_only_config(self):
+        service = make_service(states=[state(balance=3000.0)])
+        self.prepare(service, units=10000.0, source="config")
+        service.tick()
+        self.assertEqual(service.session_start["source"], "balance")
+        self.assertEqual(service.session_start["units"], 3000.0)
+        self.assertFalse(service.take_profit_hit, "vốn thật 3000 chưa đạt 3900")
+
+    def test_reset_clears_the_baseline(self):
+        service = make_service()
+        self.prepare(service)
+        service.session_reset()
+        self.assertIsNone(service.session_start)
+        self.assertFalse(service.take_profit_hit)
+
+    def test_snapshot_exposes_the_target(self):
+        service = make_service(states=[state(balance=3300.0)])
+        self.prepare(service)
+        service.tick()
+        tp = service.snapshot()["take_profit"]
+        self.assertTrue(tp["enabled"])
+        self.assertEqual(tp["pct"], 30.0)
+        self.assertEqual(tp["start_units"], 3000.0)
+        self.assertEqual(tp["target_units"], 3900.0)
+        self.assertAlmostEqual(tp["progress_pct"], 10.0, places=6)
+        self.assertFalse(tp["hit"])
+
+
 class ConfigTests(unittest.TestCase):
     def test_config_set_persists_and_updates_the_ladder(self):
         service = make_service()

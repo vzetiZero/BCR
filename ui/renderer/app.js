@@ -174,6 +174,24 @@ function renderLongLong(snapshot) {
   profitBox.className = 'kpi-value ' + (profit >= 0 ? 'green' : 'red');
   $('#ll-hands').textContent = `${snapshot.hands_seen || 0} ván đã thấy`;
 
+  // Lãi mục tiêu: vốn đầu phiên chốt lúc bấm Chạy tool -> % đã cấu hình.
+  const tp = snapshot.take_profit || {};
+  const tpNote = $('#ll-tp-note');
+  if (tpNote) {
+    if (!tp.enabled) {
+      tpNote.textContent = 'mục tiêu lãi: tắt (0%)';
+    } else if (!tp.start_units) {
+      tpNote.textContent = `mục tiêu +${tp.pct}% · chưa chốt vốn (bấm Chạy tool)`;
+    } else {
+      const cur = tp.current_units;
+      const done = cur === null || cur === undefined ? null : tp.progress_pct;
+      tpNote.textContent = `mục tiêu +${tp.pct}%: ${fmtUnits(tp.start_units)} → ${fmtUnits(tp.target_units)} đv`
+        + (done === null ? '' : ` · đang ${done >= 0 ? '+' : ''}${done.toFixed(1)}%`)
+        + (tp.hit ? ' · ĐÃ DỪNG' : '');
+    }
+    tpNote.className = 'kpi-foot' + (tp.hit ? ' green' : '');
+  }
+
   $('#ll-total').textContent = fmtSite(snapshot.total_bet_vn2);
   const ws = snapshot.ws || {};
   // Luồng WebSocket của sàn: cho biết đang ở phase nào và còn bao lâu mới đóng cược.
@@ -254,6 +272,9 @@ function renderLongLong(snapshot) {
   }
   if (document.activeElement !== $('#ll-chip-watch')) {
     $('#ll-chip-watch').value = config.chip_watch_seconds ?? 3;
+  }
+  if (document.activeElement !== $('#ll-take-profit')) {
+    $('#ll-take-profit').value = config.take_profit_pct ?? 0;
   }
   const unitSelect = $('#ll-unit-mode');
   if (unitSelect && document.activeElement !== unitSelect) {
@@ -916,6 +937,7 @@ $('#ll-save').addEventListener('click', async () => {
     confirm_reads: Number($('#ll-confirm-reads').value),
     min_hand_gap: Number($('#ll-min-hand-gap').value),
     chip_watch_seconds: Number($('#ll-chip-watch').value),
+    take_profit_pct: Number($('#ll-take-profit').value),
     place_real: $('#ll-place-real').checked,
     auto_result: $('#ll-auto-result').checked,
     ladder,

@@ -76,6 +76,7 @@
               <div class="kpi-label">LÃI / LỖ PHIÊN</div>
               <div class="kpi-value" id="ll-profit">0 đv</div>
               <div class="kpi-foot" id="ll-hands">0 ván đã thấy</div>
+              <div class="kpi-foot" id="ll-tp-note">mục tiêu lãi: tắt</div>
             </div>
             <div class="card kpi">
               <div class="kpi-label">TỔNG ĐẶT CỦA BẠN</div>
@@ -167,6 +168,11 @@
               <label class="field">Chờ xác nhận chip trên bàn (giây)
                 <input id="ll-chip-watch" type="number" min="0" max="30" step="1" />
               </label>
+              <label class="field">Dừng tool khi lãi đạt (%) — 0 = tắt
+                <input id="ll-take-profit" type="number" min="0" max="1000" step="1" />
+              </label>
+              <p class="hint">Lãi tính trên <b>vốn đầu phiên</b> (chốt lúc bấm Chạy tool):
+                vốn 3.000 + 30% = 3.900 → tool tự dừng.</p>
               <p class="hint">Chống “ván ma” và chống tính tiền oan: chỉ chốt ván khi khối
                 KẾT QUẢ của sàn cũng đổi; nếu tiền đặt biến mất quá lâu mà chưa có kết quả
                 thì coi như sàn đã huỷ và bỏ ván đó.</p>
