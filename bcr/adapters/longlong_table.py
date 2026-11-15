@@ -141,8 +141,22 @@ def parse_spot(text):
             except ValueError:
                 pass
     if out["amount"] is None:
-        # Không có chữ VN2 (sàn hiển thị tiền thật): lượng chip và số tiền nằm ngay
-        # trước ô phần trăm -> "... <chips> <amount> <percent> %".
+        # Sàn in tiền thật kèm ký hiệu tệ: "C 0.95:1 4 ₫ 839,99 N+ 51 %" -> số tiền là
+        # token số ngay SAU ký hiệu, số chip là token số ngay TRƯỚC ký hiệu.
+        cur = next((i for i, token in enumerate(tokens)
+                    if token in ("₫", "đ", "VND", "$", "USD", "EUR")), None)
+        if cur is not None:
+            for token in tokens[cur + 1:]:
+                amount = parse_vn2(token)
+                if amount is not None:
+                    out["amount"] = amount
+                    break
+            for token in reversed(tokens[:cur]):
+                if token.isdigit():
+                    out["chips"] = int(token)
+                    break
+    if out["amount"] is None:
+        # Không có ký hiệu tệ và không có chữ VN2: đọc theo vị trí trước ô phần trăm.
         pct = next((i for i, token in enumerate(tokens) if token == "%"), None)
         if pct is not None and pct >= 2:
             amount = parse_vn2(tokens[pct - 2])

@@ -61,6 +61,20 @@ class ParseSpotTests(unittest.TestCase):
         self.assertAlmostEqual(parsed["amount"], 3114.69)
         self.assertEqual(parsed["percent"], 76)
 
+    def test_reads_a_spot_that_uses_a_currency_sign(self):
+        # Bàn VND thật (DragonDragon0001): "C 0.95:1 4 ₫ 839,99 N+ 51 %".
+        parsed = LT.parse_spot("C 0.95:1 4 ₫ 839,99 N+ 51 %")
+        self.assertEqual(parsed["code"], "C")
+        self.assertAlmostEqual(parsed["rate"], 0.95)
+        self.assertEqual(parsed["chips"], 4)
+        self.assertAlmostEqual(parsed["amount"], 839.99)
+        self.assertEqual(parsed["percent"], 51)
+
+    def test_currency_sign_wins_over_positional_reading(self):
+        parsed = LT.parse_spot("A 2.90:1 6 ₫ 638,71 N+ 39 %")
+        self.assertEqual(parsed["chips"], 6)
+        self.assertAlmostEqual(parsed["amount"], 638.71)
+
     def test_vn2_word_still_wins_over_positional_reading(self):
         parsed = LT.parse_spot("C 0.95:1 14 VN2 3.114,69 76 %")
         self.assertAlmostEqual(parsed["amount"], 3114.69)
