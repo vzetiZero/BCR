@@ -26,7 +26,17 @@ if (-not $Message) {
     $Message = "Update " + (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
 }
 
-& $git commit -m $Message
+# May nay chua cau hinh git user.name/user.email thi `git commit` bao
+# "unable to auto-detect email address". Truyen danh tinh inline (khong sua git config).
+$identName = "vzetiZero"
+$identEmail = "vzetiZero@users.noreply.github.com"
+$hasName = (& $git config --get user.name)
+$hasEmail = (& $git config --get user.email)
+if ($hasName -and $hasEmail) {
+    & $git commit -m $Message
+} else {
+    & $git -c "user.name=$identName" -c "user.email=$identEmail" commit -m $Message
+}
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
