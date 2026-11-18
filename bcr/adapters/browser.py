@@ -507,7 +507,7 @@ class BrowserSession:
                 self.cdp_attached = True
                 self._driver_info = info
                 self.note = ("Đã gắn Chrome hiện có · CDP 9222; chỉ đọc, giữ nguyên phiên đăng nhập. "
-                             "Bạn tự vào sảnh Baccarat rồi bấm “Nhận tab sảnh”.")
+                             "Bạn tự vào sảnh Baccarat rồi bấm “VÀO BÀN HỢP LỆ”.")
                 self.connection_state = "waiting"
                 return True
             except Exception as exc:

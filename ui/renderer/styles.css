@@ -123,6 +123,14 @@ main::-webkit-scrollbar-thumb { background: #24314a; border-radius: 8px; }
   box-shadow: 0 8px 20px rgba(245, 196, 81, 0.22);
 }
 .btn.primary:hover { filter: brightness(1.05); }
+.btn.big-cta {
+  width: 100%; padding: 16px 20px; font-size: 15px; letter-spacing: 0.06em;
+  border-radius: 12px; font-weight: 800;
+}
+.btn.big-cta:disabled {
+  background: #24304a; color: var(--muted); box-shadow: none; border-color: var(--line-strong);
+  cursor: progress;
+}
 .btn.danger-btn { background: #7d1d2c; border-color: #a3273a; }
 .btn.tiny { padding: 5px 10px; font-size: 11px; }
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }

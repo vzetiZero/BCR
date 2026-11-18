@@ -6,7 +6,8 @@ và không biết gì về Electron. Tầng transport (``bcr.service.engine``) g
 ``dispatch`` để phục vụ giao diện, giống tab LONG-LONG.
 
 Trách nhiệm:
-    - mở/gắn Chrome (CDP 9222), vào sảnh, quét sảnh, mở bàn, rời bàn
+    - mở/gắn Chrome (CDP 9222) và MỘT nút duy nhất “VÀO BÀN HỢP LỆ”: tự nhận tab sảnh,
+      quét sảnh, chọn bàn đạt bộ lọc, bấm ô bàn và xác nhận cầu (chưa đặt cược)
     - đọc cầu bàn, chạy LiveSimulation, chốt kế hoạch cược 3-3 / 3-2
     - tự đặt chip thật theo kế hoạch (gate "chờ ván mới" + xác nhận đã đặt)
     - tự săn bàn (quét lại theo chu kỳ), chốt lời, đủ số bàn thì dừng
@@ -119,13 +120,15 @@ class BaccaratController:
         self.recover_busy = False
         # Đã báo "Chrome đã đóng" chưa (tránh spam log mỗi 2 giây khi mất kết nối).
         self.offline_noted = False
+        # Đã từng kết nối Chrome trong phiên này chưa (phân biệt "chưa mở" với "vừa đóng").
+        self.had_chrome = False
 
         self.next_scan = 0.0
         self.chip_live = None
         self.chip_read_at = 0.0
         self.place_status = {"ok": None, "note": ""}
         self.wallet_text = "Số dư ví trên web: chưa đọc được"
-        self.sweep_note = "Mở Chrome, vào sảnh Baccarat rồi quét sảnh."
+        self.sweep_note = "Mở Chrome, vào sảnh Baccarat rồi bấm “VÀO BÀN HỢP LỆ”."
         self.connection_text = "Chưa kết nối Chrome."
 
         # vòng tự săn bàn
@@ -138,6 +141,12 @@ class BaccaratController:
         # xác nhận bàn vừa mở trước khi tự theo dõi
         self.auto_start_key = None
         self.auto_start_letters = ""
+        # Nút “Vào bàn hợp lệ”: tìm + mở + kiểm tra cầu nhưng KHÔNG theo dõi/đặt chip.
+        self.enter_valid = False
+        self.valid_check_done = False
+        self.valid_note = ""
+        self.enter_attempts = 0
+        self.enter_deadline = 0.0
         self.auto_start_deadline = 0.0
 
         self.session_lost = False
@@ -285,6 +294,14 @@ class BaccaratController:
 
     def _busy(self):
         return (self.chrome_busy or self.scan_busy or self.sweep_busy or self.open_table_busy)
+
+    def _busy_chrome(self):
+        """Bận vì thao tác Chrome/sảnh — KHÔNG tính nhịp đọc cầu (scan) đang chạy.
+
+        Vòng săn bàn cần đọc sảnh/mở ô bàn ngay cả khi nhịp đọc cầu 1,5–4 giây đang
+        chạy nền; nếu chặn theo ``_busy()`` thì mỗi lượt săn đều bị đẩy lùi vô hạn.
+        """
+        return self.chrome_busy or self.sweep_busy or self.open_table_busy
 
     def _cdp_available(self):
         try:
@@ -461,6 +478,13 @@ class BaccaratController:
                 },
                 "tables_done": self.tables_done,
                 "tables_target": self._tables_target(),
+                "enter_valid": {
+                    "active": bool(self.enter_valid),
+                    "checked": bool(self.valid_check_done),
+                    "note": getattr(self, "valid_note", ""),
+                    "attempts": int(self.enter_attempts),
+                    "remain": max(0.0, (self.enter_deadline or 0) - now) if self.enter_valid else 0.0,
+                },
                 "table": {
                     "key": sim.table_key,
                     "name": sim.table_name,
@@ -530,7 +554,7 @@ class BaccaratController:
                     self.browser.resize_window(window, pos=pos)
                 except Exception:
                     pass
-                self.events.put(("opened", "%s · Đăng nhập, vào sảnh Baccarat rồi bấm “Nhận tab sảnh”."
+                self.events.put(("opened", "%s · Đăng nhập, vào sảnh Baccarat rồi bấm “VÀO BÀN HỢP LỆ”."
                                  % self.browser.driver_info))
             except Exception as exc:
                 self.events.put(("open_error", "Không mở được Chrome (%s)." % type(exc).__name__))
@@ -608,7 +632,7 @@ class BaccaratController:
         if self.sweep_busy or self.chrome_busy:
             return {"ok": False, "error": "Đang bận thao tác sảnh."}
         if not self._cdp_available():
-            self.sweep_note = "Chưa bật CDP: mở trang Baccarat trong Chrome rồi gắn Chrome trước."
+            self.sweep_note = "Chưa bật CDP: mở trang Baccarat trong Chrome rồi bấm “VÀO BÀN HỢP LỆ”."
             self._push_state()
             return {"ok": False, "error": self.sweep_note}
         self.sweep_busy = True
@@ -633,7 +657,7 @@ class BaccaratController:
         if self.sweep_busy or self.chrome_busy:
             return {"ok": False, "error": "Đang bận thao tác sảnh."}
         if not self._cdp_available():
-            self.sweep_note = "Gắn Chrome đang mở trước rồi quét sảnh."
+            self.sweep_note = "Bấm “VÀO BÀN HỢP LỆ” khi Chrome đã mở sảnh Baccarat."
             self._push_state()
             return {"ok": False, "error": self.sweep_note}
         favorites = params.get("favorites_only")
@@ -717,6 +741,64 @@ class BaccaratController:
         self._push_state()
         return {"ok": True, "note": note, "started": bool(started)}
 
+    def enter_valid_table(self):
+        """Nút duy nhất “VÀO BÀN HỢP LỆ”.
+
+        Gắn Chrome → nhận tab sảnh → quét sảnh → chọn bàn đạt bộ lọc → bấm ô bàn →
+        xác nhận cầu (2 lần đọc giống nhau + cùng shoe) rồi **đứng chờ, chưa đặt cược**.
+        Chỉ khi tool đang chạy thì sau bước xác nhận mới arm và cược như cũ.
+        """
+        if self._busy_chrome() or self.open_table_busy:
+            return {"ok": False, "error": "Đang bận thao tác Chrome/sảnh, chờ một chút."}
+        if self.sim.running:
+            return {"ok": False, "error": "Đang chạy phiên trong bàn. Dừng tool trước khi "
+                                          "vào bàn hợp lệ khác."}
+        self.enter_valid = True
+        self.valid_check_done = False
+        self.valid_note = "Đang tìm bàn hợp lệ…"
+        self.enter_attempts = 0
+        self.enter_deadline = time.time() + ENTER_VALID_TIMEOUT
+        self.cycle_waiting = True
+        self.cycle_attempts = 0
+        self.cycle_retry_at = 0.0
+        self.cycle_table_key = None
+        self.sweep_note = self.valid_note
+
+        def work():
+            try:
+                if not self.browser.connected:
+                    attached = self.browser.attach()
+                    if not attached:
+                        window = self._window()
+                        pos = self._window_pos(window)
+                        if not self.browser.start(self.config["start_url"], pos=pos, cdp=True,
+                                                  window=window):
+                            self.events.put(("valid_fail", self.browser.last_error
+                                             or "Không mở/gắn được Chrome CDP 9222."))
+                            return
+                        self.browser.wait_for_cdp()
+                        try:
+                            self.browser.resize_window(window, pos=pos)
+                        except Exception:
+                            pass
+                        # Chrome vừa mở: người dùng còn phải đăng nhập + mở EVO. Không
+                        # tự bấm sảnh; báo rõ để họ làm rồi bấm lại nút.
+                        self.events.put(("valid_fail", "Đã mở Chrome · hãy đăng nhập và mở "
+                                                       "sảnh Baccarat rồi bấm “VÀO BÀN HỢP LỆ” lần nữa."))
+                        return
+                ok, note = self.stream.find_lobby_tab()
+                if not ok:
+                    self.events.put(("valid_fail", note))
+                    return
+                self.events.put(("valid_lobby", (True, note)))
+            except Exception as exc:
+                self.events.put(("valid_fail", "Không vào được sảnh (%s)." % type(exc).__name__))
+
+        threading.Thread(target=work, daemon=True, name="ba-enter-valid").start()
+        self._push_state()
+        return {"ok": True, "note": self.valid_note}
+
+
     def leave_table(self, take_profit=False):
         """Rời bàn hiện tại về sảnh; take_profit=True nghĩa là đã chốt lời."""
         take_profit = bool(take_profit or getattr(self.sim, "take_profit_done", False))
@@ -735,20 +817,33 @@ class BaccaratController:
     def tool_start(self):
         if self.tool_running:
             return {"ok": True, "note": "Tool đang chạy."}
-        if not self.browser.connected:
-            return {"ok": False, "error": "Chưa mở Chrome. Bấm “Mở Chrome” và vào sảnh trước."}
         self.tool_running = True
         self.next_scan = 0.0
         self.session_lost = False
+        # Đang đứng ở bàn đã xác nhận bằng nút “Vào bàn hợp lệ”: chuyển sang theo dõi
+        # ngay, vẫn chờ hết tay hiện tại rồi mới đặt cược.
+        if self.valid_check_done and self.sim.table_key:
+            row = self.tables.get(self.sim.table_key)
+            if row:
+                with self.lock:
+                    self.sim.arm_at_entry(row)
+                self.valid_check_done = False
+                self.valid_note = "Tool đang chạy · " + self.sim.note
         self.log("Chạy tool Baccarat: đọc bàn, chốt kế hoạch và %s." %
                  ("tự đặt chip thật" if self.config["auto_place"] else "chỉ mô phỏng (không bấm chip)"))
         self._push_state()
+        # Bật tool = tự vào bàn hợp lệ nếu chưa đứng ở bàn nào (kể cả mở Chrome).
+        if not self.sim.table_key and not self.enter_valid:
+            self.enter_valid_table()
         return {"ok": True, "note": "Tool đang chạy."}
 
     def tool_stop(self):
         self.tool_running = False
         self.cycle_waiting = False
         self.cycle_retry_at = 0.0
+        if self.enter_valid:
+            self.enter_valid = False
+            self.valid_note = "Đã dừng tool · huỷ tìm bàn hợp lệ."
         self.log("Đã dừng tool Baccarat.")
         self._push_state()
         return {"ok": True, "note": "Đã dừng tool."}
@@ -1064,7 +1159,7 @@ class BaccaratController:
             return
         if self.recover_attempts >= 3:
             self.sweep_note = ("Đã tự mở lại EVO 3 lần nhưng phiên vẫn bị văng. Hãy đăng nhập lại "
-                               "trang gốc rồi bấm “Nhận tab sảnh”.")
+                               "trang gốc rồi bấm “VÀO BÀN HỢP LỆ”.")
             self._push_state()
             return
         self.recover_busy = True
@@ -1147,6 +1242,18 @@ class BaccaratController:
                 self.log("Đã nhận tab sảnh Baccarat.")
             else:
                 self.log(note, "error")
+        elif kind == "valid_lobby":
+            self.sweep_busy = False
+            ok, note = data
+            self.sweep_note = note
+            if ok:
+                self.log("Đã nhận tab sảnh · đang quét tìm bàn hợp lệ…")
+                self.lobby_sweep({"favorites_only": self.config["favorites_only"]})
+            else:
+                self._valid_failed(note)
+        elif kind == "valid_fail":
+            self.sweep_busy = False
+            self._valid_failed(str(data))
         elif kind == "sweep":
             self.sweep_busy = False
             rows, error, observed_at = data
@@ -1218,7 +1325,7 @@ class BaccaratController:
                                "Ưa thích trên sảnh rồi quét lại."
                                if self.config["favorites_only"] else
                                "Không đọc được lịch sử bàn ở sảnh. Mở tab sảnh Baccarat rồi bấm "
-                               "“Nhận tab sảnh” để app tự quét tiếp.")
+                               "“VÀO BÀN HỢP LỆ” để app tự quét tiếp.")
             if not self.cycle_waiting and self.config["auto_hunt"] and not self.session_lost:
                 self.cycle_waiting = True
                 self.cycle_attempts = 0
@@ -1303,15 +1410,43 @@ class BaccaratController:
         self.auto_start_key = None
         with self.lock:
             self.sim.pause("Sảnh báo phiên Evolution không còn hợp lệ. Đăng nhập lại trang gốc, "
-                           "bấm thẻ Evolution một lần rồi bấm “Nhận tab sảnh”.")
+                           "bấm thẻ Evolution một lần rồi bấm “VÀO BÀN HỢP LỆ”.")
         self.sweep_note = note
         self.log("Mất phiên: " + note, "error")
         self._try_recover_session()
 
+    def cancel_enter_valid(self):
+        """Huỷ “vào bàn hợp lệ” khi người dùng bấm Dừng (không đụng phiên đang chạy)."""
+        if self.enter_valid:
+            self.enter_valid = False
+            self.valid_check_done = False
+            self.valid_note = self.sweep_note = "Đã huỷ tìm bàn hợp lệ."
+            self.cycle_waiting = False
+            self.cycle_attempts = 0
+            self.cycle_retry_at = 0.0
+            self.auto_start_key = None
+            self.log(self.valid_note)
+            self._push_state()
+        return {"ok": True, "note": "Đã huỷ vào bàn hợp lệ."}
+
+    def _valid_failed(self, note, level="error"):
+        """Huỷ chế độ “vào bàn hợp lệ” và báo lý do (không tự đặt cược)."""
+        self.enter_valid = False
+        self.valid_check_done = False
+        self.valid_note = "Chưa vào được bàn hợp lệ: " + str(note or "")
+        self.cycle_waiting = False
+        self.cycle_attempts = 0
+        self.cycle_retry_at = 0.0
+        self.auto_start_key = None
+        self.sweep_note = self.valid_note
+        self.log(self.valid_note, level)
+        self._push_state()
+
     def _schedule_cycle_retry(self, reason, exclude_key=None):
-        if self.session_lost or self.tool_running is False:
+        if self.session_lost or (self.tool_running is False and not self.enter_valid):
             return False
-        if not (self.cycle_waiting and self.config["auto_hunt"]):
+        manual_enter = bool(self.enter_valid)
+        if not (self.cycle_waiting and (self.config["auto_hunt"] or manual_enter)):
             return False
         if exclude_key:
             self.cycle_table_key = exclude_key
@@ -1373,7 +1508,7 @@ class BaccaratController:
 
     # ------------------------------------------------------------ tự săn bàn
     def auto_open_table(self, allow_sweep=False, exclude_key=None):
-        if self._busy() or not self.tool_running:
+        if self._busy_chrome() or not (self.tool_running or self.enter_valid):
             return
         if self.sim.running or getattr(self.sim, "take_profit_done", False):
             return
@@ -1403,8 +1538,8 @@ class BaccaratController:
             if self._schedule_cycle_retry(reason, exclude_key=exclude_key):
                 return
             if self.cycle_waiting or not allow_sweep:
-                self.sweep_note = ("Chưa có bàn đạt điều kiện · bấm “Quét sảnh” để thử lại, hoặc bật "
-                                   "“Tự săn bàn” để app tự lặp tới khi vào được.")
+                self.sweep_note = ("Chưa có bàn đạt điều kiện · bấm “VÀO BÀN HỢP LỆ” để quét lại, "
+                                   "hoặc bật “Tự săn bàn” để app tự lặp tới khi vào được.")
                 return
             self.lobby_sweep()
             return
@@ -1435,9 +1570,34 @@ class BaccaratController:
             self.auto_start_key = None
             self._cycle_search(key)
             return
+        info = ME.check_table(list(row["letters"]), self.sim.min_hands, self.sim.max_hands,
+                              self.sim.max_streak, self.sim.min_lead,
+                              max_lead=self.sim.max_lead, tie_side=self.sim.tie_side)
+        if self.enter_valid and not self.tool_running:
+            # Nút “VÀO BÀN HỢP LỆ”: đã vào đúng bàn và cầu khớp → chỉ báo đạt rồi đứng
+            # chờ người dùng bật tool; tuyệt đối không arm/đặt chip ở đây.
+            with self.lock:
+                self.sim.bind(row)
+            self.enter_valid = False
+            self.valid_check_done = True
+            self.auto_start_key = None
+            self.cycle_waiting = False
+            self.cycle_attempts = 0
+            self.cycle_retry_at = 0.0
+            self.cycle_table_key = None
+            self.valid_note = ("Đã vào bàn hợp lệ · %s · %d tay · mạnh %s · cùng shoe · "
+                               "CHƯA đặt cược (bật tool để chạy)." % (
+                                   row["label"], len(row["letters"]),
+                                   E.SIDE_NAME.get(info["strong"], "—")))
+            self.sweep_note = self.valid_note
+            self.log(self.valid_note, "win")
+            return
         with self.lock:
             started = self.sim.arm_at_entry(row)
             note = self.sim.note
+            if started:
+                self.enter_valid = False
+                self.valid_check_done = False
         if started:
             self.sweep_note = "Đã vào bàn và bắt đầu theo dõi · %s" % note
             self.auto_start_key = None
@@ -1458,7 +1618,9 @@ class BaccaratController:
     def _resume_cycle_hunt(self, now):
         take_profit = bool(getattr(self.sim, "take_profit_done", False))
         filter_exit = bool(getattr(self.sim, "filter_exit_done", False))
-        if not (self.cycle_waiting and (self.config["auto_hunt"] or take_profit or filter_exit)
+        manual_enter = bool(self.enter_valid)
+        if not (self.cycle_waiting and (self.config["auto_hunt"] or manual_enter
+                                       or take_profit or filter_exit)
                 and self.cycle_retry_at and now >= self.cycle_retry_at):
             return
         self.cycle_retry_at = 0.0
@@ -1472,7 +1634,7 @@ class BaccaratController:
             if self.session_lost:
                 self.cycle_retry_at = now + CYCLE_RETRY_SECONDS
             return
-        if self._busy() or not self._cdp_available():
+        if self._busy_chrome() or not self._cdp_available():
             self.cycle_retry_at = now + CYCLE_RETRY_SECONDS
             return
         self.sweep_note = "Đang tự quét tìm bàn đạt chuẩn (lượt %d)…" % (self.cycle_attempts + 1)
@@ -1545,10 +1707,15 @@ class BaccaratController:
     def _tick(self):
         self._drain()
         if not self.browser.connected:
-            self._on_chrome_lost()
+            # Nút “VÀO BÀN HỢP LỆ” gắn Chrome ở thread riêng: lần đầu chưa có kết nối là
+            # bình thường, không được coi là "Chrome đã đóng" rồi huỷ chế độ vừa bật.
+            if not (self.enter_valid and not self.had_chrome):
+                self._on_chrome_lost()
         else:
             self._on_chrome_ready()
-            if self.tool_running:
+            if self.enter_valid:
+                self._watch_enter_valid(time.time())
+            if self.tool_running or self.enter_valid or self.valid_check_done:
                 now = time.time()
                 if not self.session_lost and now >= self.next_scan and not self._busy():
                     self.next_scan = now + (FAST_SCAN if (self.auto_start_key or self.sim.running)
@@ -1561,6 +1728,14 @@ class BaccaratController:
                 self._auto_start_verified_table()
                 self._resume_cycle_hunt(now)
         self._push_state()
+
+    def _watch_enter_valid(self, now):
+        """Hết thời gian chờ “vào bàn hợp lệ” thì huỷ, không để chế độ treo vô hạn."""
+        if self.valid_check_done or not self.enter_deadline:
+            return
+        if now <= self.enter_deadline:
+            return
+        self._valid_failed("quá %d giây chưa tìm được bàn đạt chuẩn." % ENTER_VALID_TIMEOUT)
 
     def _on_chrome_lost(self):
         """Chrome bị đóng (người dùng tắt cửa sổ): dọn danh sách bàn, tạm dừng phiên.
@@ -1576,6 +1751,11 @@ class BaccaratController:
         self.chip_live = None
         self.chip_read_at = 0.0
         self.auto_start_key = None
+        if self.enter_valid:
+            self.enter_valid = False
+            self.valid_note = "Chrome đã đóng · huỷ tìm bàn hợp lệ."
+            self.cycle_waiting = False
+            self.cycle_retry_at = 0.0
         with self.lock:
             if self.sim.running:
                 self.sim.pause("Chrome đã đóng · phiên tạm dừng. Bấm “Mở Chrome” để mở lại.")
@@ -1586,6 +1766,7 @@ class BaccaratController:
             self.log(self.sweep_note, "error")
 
     def _on_chrome_ready(self):
+        self.had_chrome = True
         if self.offline_noted:
             self.offline_noted = False
             self.next_scan = 0.0
@@ -1610,6 +1791,8 @@ class BaccaratController:
                                  "note": self.sweep_note},
             "table.open": lambda p: self.open_table(p.get("key") or ""),
             "table.select": lambda p: self.select_table(p.get("key") or ""),
+            "table.enterValid": lambda p: self.enter_valid_table(),
+            "table.cancelEnter": lambda p: self.cancel_enter_valid(),
             "table.leave": lambda p: self.leave_table(take_profit=bool(p.get("take_profit"))),
             "tool.start": lambda p: self.tool_start(),
             "tool.stop": lambda p: self.tool_stop(),

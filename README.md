@@ -89,8 +89,9 @@ Mỗi trò một tiến trình, một profile Chrome và một file phiên:
 | LONG-LONG | 9223 | `chrome_profile_longlong/` | `bcr_state_longlong.json` |
 
 Lệnh Baccarat: `chrome.open|attach|close|window`, `lobby.enter|sweep|back`,
-`tables`, `table.open|select|leave`, `tool.start|stop`, `scan`, `chips.read`,
-`config.get|set`, `session.new|reset|recover`.
+`tables`, `table.enterValid|cancelEnter|open|select|leave`, `tool.start|stop`, `scan`,
+`chips.read`, `config.get|set`, `session.new|reset|recover`.
+UI chỉ gọi `table.enterValid` (nút duy nhất); `table.open`/`table.select` giữ lại cho script.
 Lệnh LONG-LONG: `chrome.open|close|status|window`, `tool.start|stop`, `config.set`
 (nhận cả `unit_mode`, `start_url`, `chrome_window`), `ladder.set` (lưu vốn từng tay),
 `ladder.fromCapital`, `hand.manual`, `session.reset`, `tick`.
@@ -278,6 +279,46 @@ Bên mạnh = bên nhiều tay hơn trên toàn shoe; **B = P thì ưu tiên bê
 Trước khi tính cầu, danh sách bàn còn phải qua cổng kỹ thuật: cầu WebSocket khớp
 cầu DOM (`road_match`/`screen_stable ≥ 2`), dữ liệu ≤ 30s, không xung đột, đúng
 `game_type = baccarat`, có mã bàn, và bỏ qua bàn Siêu Tốc Độ.
+
+## Một nút duy nhất: VÀO BÀN HỢP LỆ
+
+Tab **Bàn chơi** chỉ còn một nút thao tác bàn: **VÀO BÀN HỢP LỆ** (`table.enterValid`).
+Các nút cũ (Gắn Chrome / Nhận tab sảnh / Quét sảnh / Đọc lại bàn / Rời bàn / Đóng Chrome)
+và nút chọn bàn theo dòng đã bị bỏ để không bấm nhầm. Danh sách bàn bên dưới chỉ còn
+để **xem** (đạt/loại + lý do), không bấm được.
+
+Một lần bấm chạy đúng chuỗi:
+
+1. Gắn Chrome CDP 9222 (chưa mở thì mở Chrome `chrome_profile` rồi yêu cầu đăng nhập
+   + mở sảnh, bấm lại nút).
+2. Nhận tab sảnh → quét toàn bộ danh sách (cuộn hết, gom mọi ô bàn đã render).
+3. Chấm từng bàn bằng 5 điều kiện + 4 cổng kỹ thuật ở trên, bỏ bàn Siêu Tốc Độ và bàn
+   vừa rời; chọn bàn "giữa khung" (`|số tay − 30|` nhỏ nhất).
+4. Bấm đúng ô bàn bằng pointer event thật, chờ URL có `table_id`.
+5. Xác nhận cầu trong bàn: 2 lần đọc giống nhau, `source=evo-bead`, cùng shoe với cầu
+   đã lọc ở sảnh.
+6. **Dừng ở đây**: bàn đã vào & đã xác nhận nhưng **chưa đặt cược** (`sim.running = false`,
+   `pending = null`, không arm). Dòng trạng thái ghi `Đã vào bàn hợp lệ … CHƯA đặt cược`.
+
+Nếu không có bàn đạt, tool tự quét lại (lượt đầu ngay, sau đó mỗi 15 giây) tới khi hết
+`ENTER_VALID_TIMEOUT = 240` giây thì báo lỗi và dừng chế độ. Nút **Dừng tự quét** trên
+băng trạng thái huỷ ngay (`table.cancelEnter`).
+
+Bật **Chạy tool** khi đang đứng ở bàn đã xác nhận thì chuyển thẳng sang theo dõi, vẫn
+chờ hết tay hiện tại rồi mới chốt kế hoạch và (nếu bật `auto_place`) mới bấm chip.
+Bật tool khi chưa có bàn thì tool tự chạy chuỗi "vào bàn hợp lệ" rồi theo dõi.
+
+Kiểm tra luồng này ở mức chọn bàn:
+
+```
+python -m unittest tests.test_enter_valid_flow -v     # harness: sảnh giả + Chrome giả,
+                                                      # chạy đúng pipeline thật, có ca
+                                                      # bàn bệt/bàn siêu tốc/bàn đạt
+python tools/kiem_tra_chon_ban.py                     # THỰC TẾ: đọc sảnh Chrome của bạn,
+                                                      # in bảng đạt/loại (không bấm gì)
+python tools/kiem_tra_chon_ban.py --vao-ban           # bấm ô bàn đầu tiên đạt + xác nhận
+                                                      # cầu, KHÔNG đặt cược
+```
 
 ## Kiểm thử
 

@@ -553,6 +553,126 @@ class ToolLifecycleTests(unittest.TestCase):
         self.assertIn("Chưa mở Chrome", result["error"])
 
 
+class BaccaratEnterValidTests(unittest.TestCase):
+    """Nút duy nhất “VÀO BÀN HỢP LỆ”: tìm + mở + xác nhận nhưng KHÔNG cược."""
+
+    # 22 tay: B 13 · P 9 (lệch 4), không bệt quá 3, không có cầu 3-3 → đạt cả 5 điều kiện.
+    VALID = "".join(side * count for side, count in (
+        ("B", 3), ("P", 2), ("B", 3), ("P", 2), ("B", 2),
+        ("P", 3), ("B", 2), ("P", 2), ("B", 3)))
+
+    def service(self, letters=None, config=None):
+        letters = self.VALID if letters is None else letters
+        emit = FakeEmitter()
+        service = engine.BaccaratService(pathlib.Path(tempfile.mkdtemp()) / "b.json", emit)
+        if config:
+            self.assertTrue(service.config_set(config)["ok"])
+        service.browser = type("FakeBrowser", (), {
+            "connected": True, "note": "", "mode": "cdp", "stop": lambda self: None,
+        })()
+        now = time.time()
+        service.tables = {"id:x": {
+            "key": "id:x", "label": "Bàn X", "letters": letters, "ts": now,
+            "table_id": "x", "game_type": "", "read_error": "", "source": "evo-bead",
+            "conflict": False, "stable": 3, "screen_stable": 3,
+        }}
+        return service
+
+    def prime(self, service, letters=None):
+        """Giả lập: đã bấm ô bàn và cầu trong bàn đã xác nhận cùng shoe."""
+        letters = service.tables["id:x"]["letters"] if letters is None else letters
+        service.enter_valid = True
+        service.valid_check_done = False
+        service.auto_start_key = "id:x"
+        service.auto_start_letters = letters
+        service.auto_start_deadline = time.time() + 60
+
+    def test_enter_valid_binds_the_table_without_starting_a_session(self):
+        service = self.service()
+        self.prime(service)
+        service._auto_start_verified_table()
+        self.assertTrue(service.valid_check_done)
+        self.assertFalse(service.enter_valid)
+        self.assertEqual(service.sim.table_key, "id:x")
+        self.assertFalse(service.sim.running, "chưa bật tool thì chưa chạy phiên")
+        self.assertIsNone(service.sim.pending, "chưa được arm kế hoạch cược")
+        self.assertFalse(service.place_busy, "không được đặt chip")
+        self.assertIn("CHƯA đặt cược", service.valid_note)
+
+    def test_enter_valid_rejects_a_different_shoe(self):
+        service = self.service()
+        self.prime(service, letters="PPPBBB")
+        service._auto_start_verified_table()
+        self.assertFalse(service.valid_check_done)
+        self.assertIsNone(service.auto_start_key, "phải bỏ bàn khác shoe")
+        self.assertFalse(service.sim.running)
+
+    def test_tool_start_arms_the_verified_table(self):
+        service = self.service()
+        self.prime(service)
+        service._auto_start_verified_table()
+        reply = service.tool_start()
+        self.assertTrue(reply["ok"])
+        self.assertTrue(service.sim.running)
+        self.assertTrue(service.sim.entry_waiting, "vẫn chờ hết tay hiện tại mới cược")
+        self.assertIsNone(service.sim.pending)
+
+    def test_enter_valid_hunts_without_the_tool(self):
+        service = self.service()
+        service.enter_valid = True
+        called = []
+        service.open_table = lambda key: called.append(key) or {"ok": True}
+        service.auto_open_table(allow_sweep=False)
+        self.assertEqual(called, ["id:x"], "phải mở bàn đạt chuẩn dù tool chưa chạy")
+
+    def test_auto_hunt_alone_still_needs_the_tool(self):
+        service = self.service()
+        called = []
+        service.open_table = lambda key: called.append(key) or {"ok": True}
+        service.auto_open_table(allow_sweep=False)
+        self.assertEqual(called, [], "không bật tool thì không tự mở bàn")
+
+    def test_cancel_enter_valid_stops_the_hunt(self):
+        service = self.service()
+        service.enter_valid = True
+        service.cycle_waiting = True
+        reply = service.cancel_enter_valid()
+        self.assertTrue(reply["ok"])
+        self.assertFalse(service.enter_valid)
+        self.assertFalse(service.cycle_waiting)
+        self.assertIn("huỷ", service.valid_note.casefold())
+
+    def test_enter_valid_times_out(self):
+        service = self.service()
+        service.enter_valid = True
+        service.enter_deadline = time.time() - 1
+        service._watch_enter_valid(time.time())
+        self.assertFalse(service.enter_valid)
+        self.assertFalse(service.cycle_waiting)
+        self.assertIn("Chưa vào được bàn", service.valid_note)
+
+    def test_snapshot_exposes_enter_valid_state(self):
+        service = self.service()
+        service.enter_valid = True
+        service.enter_deadline = time.time() + 30
+        block = service.snapshot()["enter_valid"]
+        self.assertTrue(block["active"])
+        self.assertFalse(block["checked"])
+        self.assertGreater(block["remain"], 0)
+
+    def test_baccarat_tool_start_without_chrome_enters_valid_flow(self):
+        service = self.service()
+        service.browser = type("FakeBrowser", (), {
+            "connected": False, "note": "", "mode": "cdp", "cdp_attached": False,
+            "attach": lambda self: False, "stop": lambda self: None,
+        })()
+        reply = service.tool_start()
+        self.assertTrue(reply["ok"], reply)
+        self.assertTrue(service.tool_running)
+        self.assertTrue(service.enter_valid, "bật tool phải tự tìm bàn hợp lệ")
+        service.cancel_enter_valid()
+
+
 class BaccaratEngineTests(unittest.TestCase):
     def test_scan_maps_browser_reports_to_rows(self):
         emit = FakeEmitter()

@@ -14,6 +14,9 @@ SCAN_SECONDS = 4
 FAST_SCAN = 1.5
 LIVE_STALE = 30
 ENTRY_WAIT = 75
+# Nút “VÀO BÀN HỢP LỆ”: tổng thời gian tối đa để tìm + mở + xác nhận cầu một bàn đạt
+# chuẩn, kể cả khi phải quét lại nhiều lượt. Hết hạn thì báo lỗi, không treo UI.
+ENTER_VALID_TIMEOUT = 240
 # Vòng tự tìm bàn không có trần số lần: nghỉ CYCLE_RETRY_SECONDS giữa hai lượt quét.
 CYCLE_RETRY_SECONDS = 15
 CHIP_REFRESH = 3

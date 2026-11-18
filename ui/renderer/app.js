@@ -623,7 +623,7 @@ function renderChips(chips, plan) {
   if (!check) {
     statusBox.textContent = 'Chưa đọc chip.';
     statusBox.dataset.state = 'warn';
-    detailBox.textContent = 'Vào bàn rồi bấm “Đọc lại bàn” để đọc chip đang đặt.';
+    detailBox.textContent = 'Vào bàn rồi chip sẽ được đọc tự động.';
     return;
   }
   const [label, level] = CHIP_STATUS[check.status] || [check.status, 'warn'];
@@ -666,16 +666,12 @@ function renderTables(rows) {
   });
   if (title) title.textContent = `Bàn đọc được · ${list.length}`;
   if (!list.length) {
-    box.innerHTML = '<p class="hint">Không có bàn nào khớp. Mở Chrome, vào sảnh Baccarat rồi bấm “Quét sảnh”.</p>';
+    box.innerHTML = '<p class="hint">Không có bàn nào khớp. Bấm “VÀO BÀN HỢP LỆ” để quét lại sảnh.</p>';
     return;
   }
   box.innerHTML = list
     .map((row) => {
       const tagClass = row.read_error ? 'bad' : row.ready ? 'ok' : row.eligible ? 'warn' : 'muted';
-      const actions = [
-        `<button class="btn tiny" data-act="select" data-key="${escapeHtml(row.key)}">Theo dõi</button>`,
-        row.table_id ? `<button class="btn tiny" data-act="open" data-key="${escapeHtml(row.key)}">Mở bàn</button>` : '',
-      ].join('');
       const tieText = row.tie_side === 'B' ? 'đỏ' : row.tie_side === 'P' ? 'xanh' : 'vệt';
       const leadText = row.lead === null || row.lead === undefined
         ? ''
@@ -689,7 +685,6 @@ function renderTables(rows) {
           <span class="tag ${tagClass}">${escapeHtml(row.verdict || '')}</span>
           <small>${escapeHtml(row.status || '')}</small>
         </div>
-        <div class="tbl-actions">${actions}</div>
       </div>`;
     })
     .join('');
@@ -831,25 +826,35 @@ function renderBaccarat(snapshot) {
     toolButton.textContent = snapshot.tool_running ? 'Dừng tool' : 'Chạy tool';
     toolButton.classList.toggle('danger-btn', !!snapshot.tool_running);
   }
-  syncOpenChromeButton('#ba-open-chrome', 'baccarat', snapshot);
+  if (snapshot.chrome_connected) chromeSeen.baccarat = true;
   const led = $('[data-led="baccarat"]');
   if (led) led.classList.toggle('on', !!snapshot.tool_running || !!snapshot.chrome_connected);
 
-  const busy = snapshot.busy || {};
-  ['#ba-attach', '#ba-lobby-enter', '#ba-sweep', '#ba-scan', '#ba-leave', '#ba-close'].forEach((selector) => {
-    const node = $(selector);
-    if (node) node.disabled = !!busy.chrome && selector !== '#ba-close';
-  });
+  const enter = snapshot.enter_valid || {};
+  const enterButton = $('#ba-enter-valid');
+  if (enterButton) {
+    enterButton.disabled = !!enter.active;
+    enterButton.textContent = enter.active ? 'ĐANG TÌM BÀN HỢP LỆ…' : 'VÀO BÀN HỢP LỆ';
+  }
 
   setText('#ba-conn-note', snapshot.chrome_note || '');
   setText('#ba-wallet', snapshot.wallet_text || '');
   setText('#ba-sweep-note', snapshot.sweep_note || '');
 
-  /* --- banner tự săn bàn --- */
+  /* --- banner trạng thái vào bàn hợp lệ / tự săn bàn --- */
   const hunt = $('#ba-hunt');
   const cycle = snapshot.cycle || {};
   if (hunt) {
-    if (cycle.waiting) {
+    if (enter.active) {
+      hunt.classList.remove('hidden');
+      state.huntTick += 1;
+      const spin = $('#ba-hunt-spin');
+      if (spin) spin.textContent = state.huntTick % 2 ? '●' : '○';
+      const remain = Math.max(0, Math.round(enter.remain || 0));
+      setText('#ba-hunt-text', `${enter.note || 'Đang tìm bàn hợp lệ…'} · còn ${remain}s`);
+      const cancel = $('#ba-hunt-cancel');
+      if (cancel) cancel.textContent = 'Huỷ vào bàn';
+    } else if (cycle.waiting) {
       hunt.classList.remove('hidden');
       state.huntTick += 1;
       const spin = $('#ba-hunt-spin');
@@ -858,6 +863,8 @@ function renderBaccarat(snapshot) {
       setText('#ba-hunt-text', remain > 0
         ? `Đang tự săn bàn… nghỉ ${remain}s rồi quét lại (đã thử ${cycle.attempts || 0} lượt).`
         : `Đang tự quét tìm bàn đạt chuẩn… (đã thử ${cycle.attempts || 0} lượt)`);
+      const cancel = $('#ba-hunt-cancel');
+      if (cancel) cancel.textContent = 'Dừng tự quét';
     } else {
       hunt.classList.add('hidden');
     }
@@ -871,7 +878,7 @@ function renderBaccarat(snapshot) {
     if (!table.key) {
       planState.textContent = 'CHƯA CÓ BÀN';
       planState.className = 'hero-state';
-      planBox.textContent = 'Chọn một bàn trong danh sách rồi bấm “Theo dõi”.';
+      planBox.textContent = 'Bấm “VÀO BÀN HỢP LỆ” để tìm và vào bàn đạt chuẩn.';
     } else if (money.blocked) {
       planState.textContent = 'ĐÃ CHẶN';
       planState.className = 'hero-state stop';
@@ -910,7 +917,7 @@ function renderBaccarat(snapshot) {
     if (table.entry_waiting) noteBits.push('chờ kết quả tay hiện tại');
     if (table.place_skips) noteBits.push(`bỏ ${table.place_skips} tay`);
   } else {
-    noteBits.push('Chọn một bàn trong danh sách bên dưới.');
+    noteBits.push('Chưa vào bàn — bấm “VÀO BÀN HỢP LỆ”.');
   }
   setText('#ba-table-note', [table.note, noteBits.join(' · ')].filter(Boolean).join(' — '));
 
@@ -1069,39 +1076,9 @@ $('#ll-clear-log').addEventListener('click', () => {
 });
 
 /* ------------------------------ BACCARAT actions ------------------------------ */
-$('#ba-open-chrome').addEventListener('click', async () => {
-  await call('baccarat', 'chrome.open');
-  toast('Đang mở Chrome cho Baccarat — đăng nhập rồi vào sảnh.');
-});
-
-$('#ba-attach').addEventListener('click', async () => {
-  await call('baccarat', 'chrome.attach');
-  toast('Đang gắn Chrome đang mở (CDP 9222).');
-});
-
-$('#ba-lobby-enter').addEventListener('click', async () => {
-  const reply = await call('baccarat', 'lobby.enter');
-  if (reply) toast(reply.note || 'Đang tìm tab sảnh…');
-});
-
-$('#ba-sweep').addEventListener('click', async () => {
-  const reply = await call('baccarat', 'lobby.sweep', { favorites_only: $('#ba-favorites-only').checked });
-  if (reply) toast(reply.note || 'Đang quét sảnh…');
-});
-
-$('#ba-scan').addEventListener('click', async () => {
-  const reply = await call('baccarat', 'scan');
-  if (reply) toast(reply.note || 'Đang đọc lại bàn…');
-});
-
-$('#ba-leave').addEventListener('click', async () => {
-  const reply = await call('baccarat', 'table.leave', { take_profit: false });
-  if (reply) toast(reply.note || 'Đang rời bàn…');
-});
-
-$('#ba-close').addEventListener('click', async () => {
-  await call('baccarat', 'chrome.close');
-  toast('Đang ngắt kết nối Chrome.');
+$('#ba-enter-valid').addEventListener('click', async () => {
+  const reply = await call('baccarat', 'table.enterValid');
+  if (reply) toast(reply.note || 'Đang tìm bàn hợp lệ…');
 });
 
 $('#ba-tool').addEventListener('click', async () => {
@@ -1111,6 +1088,11 @@ $('#ba-tool').addEventListener('click', async () => {
 });
 
 $('#ba-hunt-cancel').addEventListener('click', async () => {
+  if (state.baccarat && (state.baccarat.enter_valid || {}).active) {
+    const reply = await call('baccarat', 'table.cancelEnter');
+    if (reply) toast(reply.note || 'Đã huỷ vào bàn.');
+    return;
+  }
   await call('baccarat', 'config.set', { auto_hunt: false });
   toast('Đã dừng tự săn bàn.');
 });
@@ -1123,24 +1105,6 @@ $('#ba-search').addEventListener('input', (event) => {
 $('#ba-only-eligible').addEventListener('change', (event) => {
   state.onlyEligible = !!event.target.checked;
   renderTables((state.baccarat && state.baccarat.tables) || []);
-});
-
-$('#ba-tables').addEventListener('click', async (event) => {
-  const button = event.target.closest('button[data-act]');
-  if (!button) return;
-  const key = button.dataset.key;
-  button.disabled = true;
-  try {
-    if (button.dataset.act === 'open') {
-      const reply = await call('baccarat', 'table.open', { key });
-      if (reply) toast(reply.note || 'Đang mở bàn…');
-    } else {
-      const reply = await call('baccarat', 'table.select', { key });
-      if (reply) toast(reply.note || 'Đã chọn bàn.');
-    }
-  } finally {
-    button.disabled = false;
-  }
 });
 
 $('#ba-save-money').addEventListener('click', async () => {
