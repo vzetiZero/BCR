@@ -20,7 +20,7 @@ NGUYÊN TẮC ĐÁNH (chỉ đánh ô "1 vàng 1 đỏ")
            lấy lại đúng số đã thua trước đó.
     3. Không có bộ VD/DV thì không đánh. Không đánh ô 2 vàng / 2 đỏ.
 
-    DỪNG PHIÊN: thua ngay ở bậc CUỐI của thang (mặc định 4.920.000đ) là hết vốn — phiên
+    DỪNG PHIÊN: thua ngay ở bậc CUỐI của thang (mặc định 2.560.000đ) là hết vốn — phiên
     dừng hẳn, không đánh tiếp bậc cuối lần nữa. Muốn chạy lại thì Reset phiên.
 
     Ví dụ (thang 40, 80, 160…):
@@ -49,21 +49,21 @@ DOOR_LABEL = "V-D / D-V"
 PAYOUT = {DOOR: 0.95, "VV": 2.90, "DD": 2.90}
 RAW_LABEL = {"VV": "2 vàng", "DD": "2 đỏ", "VD": "vàng-đỏ", "DV": "đỏ-vàng"}
 
-# Thang gấp thếp tính theo ĐƠN VỊ CỦA SẢNH: 1 đv = 1.000đ, nên 40 đv = 40.000đ.
-DEFAULT_BASE = 40
-DEFAULT_STEPS = 8
-# Hệ số nhân mỗi bậc khi chia vốn (bảng chia vốn thực tế đang dùng ×2.25):
-#   40 · 90 · 210 · 480 · 1.080 · 2.430 · 5.470  -> tổng 9.800 đv (vừa 10 triệu).
-DEFAULT_LADDER_MULT = 2.25
+# Thang gấp thếp tính theo ĐƠN VỊ CỦA SẢNH: 1 đv = 1.000đ, nên 10 đv = 10.000đ.
+DEFAULT_BASE = 10
+DEFAULT_STEPS = 9
+# Bảng vốn mặc định của bàn LONG-LONG: mỗi tay gấp đôi tay trước (×2.0):
+#   10 · 20 · 40 · 80 · 160 · 320 · 640 · 1.280 · 2.560  -> tổng 5.110 đv (= 5.110.000đ).
+DEFAULT_LADDER_MULT = 2.0
 MULT_LOWER, MULT_UPPER = 1.01, 10.0
-# Vốn phiên mặc định: 10.000 đv = 10.000.000đ.
-DEFAULT_CAPITAL = 10000
-# Làm tròn bậc cuối về bội số 10 đv (= 10.000đ) để số tiền luôn chẵn, dễ bấm chip.
+# Vốn phiên mặc định = đúng tổng bảng vốn: 5.110 đv = 5.110.000đ.
+DEFAULT_CAPITAL = 5110
+# Làm tròn mỗi bậc về bội số 10 đv (= 10.000đ) để số tiền luôn chẵn, dễ bấm chip.
 ROUND_STEP = 10
 
-# Vốn 10 triệu chia theo hệ số 2.25: 40 → 5.470, tổng 9.800 đv (dừng ở tay 7 vì tay 8
-# 12.310 sẽ vượt vốn). Đúng bằng ladder_for_capital(DEFAULT_CAPITAL).
-DEFAULT_LADDER = [40, 90, 210, 480, 1080, 2430, 5470]
+# Bảng vốn mặc định (đúng bảng trên bàn): 9 tay, tổng 5.110 đv. Bậc cuối 2.560 đv là
+# đáy thang — thua ở đây là dừng phiên. Đúng bằng ladder_for_capital(DEFAULT_CAPITAL).
+DEFAULT_LADDER = [10, 20, 40, 80, 160, 320, 640, 1280, 2560]
 
 LADDER_LOWER = 1
 LADDER_UPPER = 20
@@ -218,8 +218,8 @@ def ceil_step(value, step=1):
 def multiply_ladder(base, steps=DEFAULT_STEPS, mult=2.0, round_to=None):
     """Sinh thang gấp thếp từ mức gốc theo ``mult`` (mặc định ×2 như DEFAULT_LADDER).
 
-    ``round_to`` (tuỳ chọn) làm tròn LÊN bội số cho số tiền chẵn, giống bảng chia vốn
-    thực tế: 40 × 2.25 = 90; 90 × 2.25 = 202,5 -> 210; 210 × 2.25 = 472,5 -> 480.
+    ``round_to`` (tuỳ chọn) làm tròn LÊN bội số cho số tiền chẵn: 10 × 2 = 20;
+    10 × 2.25 = 22,5 -> 30 (bội 10).
     """
     try:
         value = float(str(base).replace(".", "").replace(",", "").strip())
@@ -242,10 +242,10 @@ def ladder_for_capital(capital, base=DEFAULT_BASE, steps=DEFAULT_STEPS, round_to
                        mult=DEFAULT_LADDER_MULT):
     """Chia vốn theo hệ số nhân ``mult``: chỉ thêm bậc khi TỔNG còn nằm trong vốn.
 
-    Vốn 10.000 đv, gốc 40, hệ số 2.25 (làm tròn lên bội 10):
+    Bảng vốn mặc định: vốn 5.110 đv, gốc 10, hệ số 2 (làm tròn lên bội 10):
 
-        40 · 90 · 210 · 480 · 1.080 · 2.430 · 5.470   (tổng 9.800 đv)
-        -> DỪNG, vì bậc kế tiếp 12.310 sẽ đẩy tổng lên 22.110 > 10.000.
+        10 · 20 · 40 · 80 · 160 · 320 · 640 · 1.280 · 2.560   (tổng 5.110 đv)
+        -> ĐỦ 9 tay, dùng hết vốn nên dừng đúng ở tay 9.
 
     Khác cách cũ (nhồi phần vốn còn lại vào bậc cuối): bậc cuối ở đây luôn đúng hệ số,
     nên "lãi nếu thắng" của từng tay đều dương và vốn không bị dồn vào một tay lẻ.

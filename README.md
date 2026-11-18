@@ -25,7 +25,7 @@ BCR/
 │  │  ├─ money.py            MoneyBook: vốn, lãi/lỗ, chốt lời, chặn thua
 │  │  ├─ chips.py            chia tiền → mệnh giá chip
 │  │  ├─ live_sim.py         LiveSimulation: vòng đời một phiên bàn
-│  │  └─ longlong.py         LongLongSimulation + thang 8 bậc
+│  │  └─ longlong.py         LongLongSimulation + bảng vốn 9 tay
 │  ├─ adapters/              Adapter — Chrome/Selenium/CDP
 │  │  ├─ browser.py          mở/gắn Chrome, quét DOM, đọc số dư
 │  │  ├─ lobby_stream.py     bắt WebSocket sảnh (lịch sử bàn), mở/rời bàn
@@ -92,27 +92,65 @@ Lệnh Baccarat: `chrome.open|attach|close|window`, `lobby.enter|sweep|back`,
 `tables`, `table.open|select|leave`, `tool.start|stop`, `scan`, `chips.read`,
 `config.get|set`, `session.new|reset|recover`.
 Lệnh LONG-LONG: `chrome.open|close|status|window`, `tool.start|stop`, `config.set`
-(nhận cả `unit_mode`, `start_url`, `chrome_window`), `ladder.fromCapital`, `hand.manual`,
-`session.reset`, `tick`.
+(nhận cả `unit_mode`, `start_url`, `chrome_window`), `ladder.set` (lưu vốn từng tay),
+`ladder.fromCapital`, `hand.manual`, `session.reset`, `tick`.
+
+## Bảng vốn mặc định (LONG-LONG)
+
+Bảng vốn **mặc định** của bàn (9 tay, tổng 5.110 đv = 5.110.000đ) — đúng bảng chia vốn
+đang dùng:
+
+| Tay | Vốn (đv) | Tiền |
+|---|---|---|
+| 1 | 10 | 10.000đ |
+| 2 | 20 | 20.000đ |
+| 3 | 40 | 40.000đ |
+| 4 | 80 | 80.000đ |
+| 5 | 160 | 160.000đ |
+| 6 | 320 | 320.000đ |
+| 7 | 640 | 640.000đ |
+| 8 | 1.280 | 1.280.000đ |
+| 9 | 2.560 | 2.560.000đ |
+| **Tổng** | **5.110** | **5.110.000đ** |
+
+Nguồn duy nhất: `bcr/models/longlong.py` (`DEFAULT_BASE = 10`, `DEFAULT_STEPS = 9`,
+`DEFAULT_LADDER_MULT = 2.0`, `DEFAULT_CAPITAL = 5110`, `DEFAULT_LADDER`). Controller
+(`bcr/controllers/longlong.py::_load_config`) đọc các hằng này cho cấu hình mặc định và
+UI cũng lấy từ `state.ladder`, nên ba nơi không bao giờ lệch nhau.
+
+Thua ở tay 9 (2.560 đv) = chạm đáy thang → tool **dừng phiên**, bấm **Reset phiên** để
+chạy lại.
+
+### Sửa vốn từng tay bằng tay rồi Lưu
+
+Cấu hình → thẻ **Vốn từng tay (9 bậc)**: mỗi tay một ô số, sửa trực tiếp rồi bấm
+**Lưu vốn các tay**.
+
+- Nút chỉ gửi lệnh `ladder.set` — không tự đi theo hệ số nhân, nên bạn đặt tay nào cũng
+  được (ví dụ tay 3 sửa thành `20` là lưu `20`).
+- Ô vừa sửa được viền vàng và nút đổi thành **Lưu vốn các tay •** cho tới khi lưu.
+- **Vốn phiên tự cập nhật = tổng các tay vừa lưu**, để ngưỡng chốt lời % và kiểm tra số
+  dư luôn khớp bảng trên màn hình.
+- Dòng cạnh nút hiện `N tay · tổng … đv (…đ)` ngay khi bạn gõ.
+- **Về bảng mặc định** (`ladder.set` với `defaults: true`) trả lại đúng bảng 9 tay ở trên.
+- Bảng vốn được ghi vào `bcr_state_longlong.json` và dùng ngay, không cần khởi động lại.
 
 ## Chia thang theo vốn (LONG-LONG)
 
 Cấu hình → **Vốn & thang** → nhập *Mức gốc*, *Vốn phiên*, *Hệ số nhân mỗi bậc* (mặc định
-**2.25**) rồi bấm **Chia thang theo vốn**.
+**2**) rồi bấm **Chia thang theo vốn**. Đây là cách sinh lại cả bảng vốn từ vốn + hệ số;
+nếu chỉ muốn sửa một tay thì dùng **Lưu vốn các tay** ở trên.
 
 Quy tắc: mỗi bậc = bậc trước × hệ số, **làm tròn lên bội 10 đv**; chỉ thêm bậc khi
 **tổng vốn còn nằm trong vốn phiên** → thang có thể ít tay hơn số bậc tối đa.
 
 | Vốn | Gốc | Hệ số | Thang | Tổng |
 |---|---|---|---|---|
-| 10.000 đv (10 triệu) | 40 | 2.25 | 40 · 90 · 210 · 480 · 1.080 · 2.430 · 5.470 | 9.800 đv → **dừng ở tay 7** |
-| 3.000 đv (3 triệu) | 40 | 2.25 | 40 · 90 · 210 · 480 · 1.080 | 1.900 đv |
-| 10.000 đv | 40 | 2.00 | 40 · 80 · 160 · 320 · 640 · 1.280 · 2.560 | 5.080 đv |
+| 5.110 đv (5,11 triệu) | 10 | 2.00 | 10 · 20 · 40 · 80 · 160 · 320 · 640 · 1.280 · 2.560 | 5.110 đv → **đủ 9 tay** |
+| 3.000 đv (3 triệu) | 10 | 2.00 | 10 · 20 · 40 · 80 · 160 · 320 · 640 · 1.280 | 2.550 đv |
+| 10.000 đv | 40 | 2.25 | 40 · 90 · 210 · 480 · 1.080 · 2.430 · 5.470 | 9.800 đv |
 
-Tay 8 của thang ×2.25 là 12.310 đv, cộng dồn 22.110 đv nên với 10 triệu thì **không đủ
-vốn để chơi tay 8** — tool dừng thang ở tay 7 (chạm đáy là dừng phiên).
-
-Thẻ *Thang cược* trên tab Bàn chơi hiện `· 7 tay · tổng 9.800 đv (9.800.000 đ) · ×2.25 · vốn 10.000 đv`.
+Thẻ *Thang cược* trên tab Bàn chơi hiện `· 9 tay · tổng 5.110 đv (5.110.000 đ) · ×2 · vốn 5.110 đv`.
 
 
 
@@ -250,6 +288,20 @@ node tests/test_reader.cjs                          # script đọc DOM
 
 ## Ghi chú
 
+- **BẮT BUỘC — push GitHub sau mỗi lần cập nhật/sửa đổi.** Mọi thay đổi (code, cấu hình
+  mặc định, tài liệu) phải được đẩy lên `origin/main` ngay trong cùng lần làm việc, không
+  để tồn đọng. Cách nhanh:
+
+  ```
+  push_update.bat                          # commit tự động "Update <thời gian>" rồi push
+  push_update.bat "mô tả thay đổi"         # commit kèm mô tả
+  powershell -ExecutionPolicy Bypass -File .\push_update.ps1 "mô tả"
+  ```
+
+  Script đã `git add -A` (tôn trọng `.gitignore`: `chrome_profile*`, `bcr_state*.json`,
+  `drivers`, `__pycache__`…), commit rồi `git push origin main`. Không push khi chưa chạy
+  lại `python -m unittest discover -s tests -t . -q` và thấy `OK`. Nếu push lỗi (mạng,
+  xác thực) thì sửa và push lại — **không** kết thúc công việc khi commit còn cục bộ.
 - **Đóng Chrome bằng tay**: app dò cổng CDP (mỗi 2 giây, có cache 3 giây) nên phát hiện
   ngay, đổi nút thành **“Mở lại Chrome”**, tạm dừng phiên và xoá danh sách bàn cũ. Bấm
   lại là Chrome mở lại bình thường — không cần khởi động lại app.

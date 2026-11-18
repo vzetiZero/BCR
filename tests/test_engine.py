@@ -152,15 +152,15 @@ class TickTests(unittest.TestCase):
         self.assertEqual(table.places, [])
         self.assertIsNotNone(service.sim.strategy.pending, "mô phỏng chốt trên giấy")
 
-    def test_real_mode_places_40_and_only_then_arms(self):
+    def test_real_mode_places_the_first_rung_and_only_then_arms(self):
         table = FakeTable([state("JNS_C", "VD", at=1000.0, balance=500.0)])
         service = make_service(table=table, config={"place_real": True, "confirm_reads": 1})
         service.tick()
-        self.assertEqual(table.places, [40])
+        self.assertEqual(table.places, [10], "bậc 1 của bảng vốn mặc định là 10 đv")
         self.assertIsNotNone(service.sim.strategy.pending, "chip vào rồi mới chốt sổ")
 
     def test_low_balance_skips_placing_and_keeps_the_ladder(self):
-        table = FakeTable([state("JNS_C", "VD", at=1000.0, balance=10.0)])
+        table = FakeTable([state("JNS_C", "VD", at=1000.0, balance=5.0)])
         service = make_service(table=table, config={"place_real": True, "confirm_reads": 1})
         service.tick()
         self.assertEqual(table.places, [])
@@ -284,7 +284,7 @@ class PaceTests(unittest.TestCase):
         self.assertEqual(len(fails), 1, [entry["text"] for entry in service.logs])
 
     def test_does_not_hot_poll_when_the_balance_is_too_low(self):
-        table = FakeTable([state("JNS_C", "VD", at=1000.0, balance=10.0)])
+        table = FakeTable([state("JNS_C", "VD", at=1000.0, balance=5.0)])
         service = make_service(table=table, config={"place_real": True, "confirm_reads": 1})
         service.interval = 2.0
         service.tick()
@@ -310,7 +310,7 @@ class ChipWatchTests(unittest.TestCase):
                                                     "chip_watch_seconds": 0.0})
         service.tick()
         self.assertIsNotNone(service.sim.strategy.pending)
-        self.assertEqual(service.sim.strategy.pending["amount_site"], 40)
+        self.assertEqual(service.sim.strategy.pending["amount_site"], 10)
         service._watch_chips({"total_bet_vn2": 0.0})
         service._watch_chips({"total_bet_vn2": 0.0})
         self.assertIsNone(service.sim.strategy.pending, "chip biến mất thì phải bỏ lệnh")
@@ -323,7 +323,7 @@ class ChipWatchTests(unittest.TestCase):
         service = make_service(table=table, config={"place_real": True, "confirm_reads": 1,
                                                     "chip_watch_seconds": 0.0})
         service.tick()
-        service._watch_chips({"total_bet_vn2": 40.0})
+        service._watch_chips({"total_bet_vn2": 10.0})
         self.assertIsNotNone(service.sim.strategy.pending, "còn tiền trên bàn thì giữ lệnh")
 
     def test_short_gap_does_not_void(self):
@@ -354,7 +354,7 @@ class WebSocketGateTests(unittest.TestCase):
                                config={"place_real": True, "confirm_reads": 1})
         self.prime(service)
         service.tick()
-        self.assertEqual(table.places, [40])
+        self.assertEqual(table.places, [10])
         self.assertEqual(service.sim.strategy.pending["round"], "r1")
 
     def test_does_not_click_when_the_window_is_closed(self):
@@ -495,16 +495,40 @@ class ConfigTests(unittest.TestCase):
 
     def test_ladder_from_capital_matches_the_board(self):
         service = make_service()
-        snapshot = service.ladder_from_capital({"capital": 10000, "base": 40, "mult": 2.25})
-        self.assertEqual(snapshot["ladder"], [40, 90, 210, 480, 1080, 2430, 5470])
-        self.assertEqual(sum(snapshot["ladder"]), 9800, "dừng ở tay 7, không vượt vốn")
-        self.assertEqual(snapshot["config"]["ladder_mult"], 2.25)
+        snapshot = service.ladder_from_capital({"capital": 5110, "base": 10, "mult": 2})
+        self.assertEqual(snapshot["ladder"], [10, 20, 40, 80, 160, 320, 640, 1280, 2560])
+        self.assertEqual(sum(snapshot["ladder"]), 5110, "9 tay, đúng bảng vốn mặc định")
+        self.assertEqual(snapshot["config"]["ladder_mult"], 2.0)
 
     def test_ladder_from_capital_with_mult_two_keeps_room(self):
         service = make_service()
-        snapshot = service.ladder_from_capital({"capital": 10000, "base": 40, "mult": 2})
-        self.assertEqual(snapshot["ladder"], [40, 80, 160, 320, 640, 1280, 2560])
+        snapshot = service.ladder_from_capital({"capital": 10000, "base": 10, "mult": 2})
+        self.assertEqual(snapshot["ladder"], [10, 20, 40, 80, 160, 320, 640, 1280, 2560])
         self.assertLessEqual(sum(snapshot["ladder"]), 10000)
+
+    def test_ladder_set_saves_hand_edited_stakes_and_capital(self):
+        service = make_service()
+        reply = service.ladder_set({"ladder": [20, 40, 80]})
+        self.assertTrue(reply["ok"])
+        saved = json.loads(service.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["ladder"], [20, 40, 80])
+        self.assertEqual(saved["capital"], 140, "vốn phiên = tổng các tay vừa lưu")
+        self.assertEqual(service.sim.strategy.ladder, [20, 40, 80])
+
+    def test_ladder_set_defaults_restores_the_board(self):
+        service = make_service()
+        service.ladder_set({"ladder": [20, 40, 80]})
+        reply = service.ladder_set({"defaults": True})
+        self.assertTrue(reply["ok"])
+        self.assertEqual(reply["ladder"], longlong.DEFAULT_LADDER)
+        self.assertEqual(reply["config"]["capital"], 5110)
+        self.assertEqual(reply["config"]["base"], longlong.DEFAULT_BASE)
+
+    def test_ladder_set_rejects_an_empty_board(self):
+        service = make_service()
+        reply = service.ladder_set({"ladder": []})
+        self.assertFalse(reply["ok"])
+        self.assertIn("Chưa có tay", reply["error"])
 
     def test_session_reset_clears_strategy_and_tracker(self):
         service = make_service()
@@ -692,7 +716,7 @@ class LongLongStatsWiringTests(unittest.TestCase):
         self.assertEqual(stats["hands"], 2)
         self.assertEqual((stats["wins"], stats["losses"]), (1, 1))
         self.assertEqual(stats["max_loss_streak"], 1)
-        self.assertAlmostEqual(stats["net_units"], 45.5, places=6)  # -40 + 85,5 (bậc 2)
+        self.assertAlmostEqual(stats["net_units"], 9.0, places=6)  # -10 + 19 (bậc 2)
         self.assertEqual(stats["recent"], ["L", "W"])
 
 

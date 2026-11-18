@@ -219,6 +219,9 @@ main::-webkit-scrollbar-thumb { background: #24314a; border-radius: 8px; }
   background: #0d1728; border: 1px solid var(--line-strong); color: var(--text);
   padding: 7px 9px; border-radius: 8px; font-weight: 700;
 }
+.ladder-edit input.dirty { border-color: var(--gold); box-shadow: 0 0 0 2px rgba(245, 196, 81, 0.16); }
+.ladder-actions { margin-top: 12px; align-items: center; }
+.ladder-actions .hint { margin-left: 4px; }
 
 .log-card { display: flex; flex-direction: column; height: 100%; }
 .log-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }

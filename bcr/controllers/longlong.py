@@ -117,8 +117,8 @@ class LongLongController:
         defaults = {
             "ladder": list(longlong.DEFAULT_LADDER),
             "base": longlong.DEFAULT_BASE,
-            "capital": longlong.DEFAULT_CAPITAL,       # đơn vị sảnh (10.000 = 10 triệu)
-            # Hệ số nhân mỗi bậc khi chia vốn (2.25 = bảng chia vốn đang dùng).
+            "capital": longlong.DEFAULT_CAPITAL,       # đơn vị sảnh (5.110 = 5,11 triệu)
+            # Hệ số nhân mỗi bậc khi chia vốn (2.0 = bảng vốn mặc định ×2).
             "ladder_mult": longlong.DEFAULT_LADDER_MULT,
             # Đơn vị tiền trên KHAY CHIP của sàn: "vn2" (chip 40 = 40.000đ) hay "vnd"
             # (chip 10.000 = 10.000đ). Xem bcr.models.longlong.UNIT_*.
@@ -818,6 +818,32 @@ class LongLongController:
             self.log("Đã lưu cấu hình: %s." % (", ".join(changed) or "không đổi"))
         return self._push_ok()
 
+    def ladder_set(self, params):
+        """Lưu tay vốn do người dùng sửa tay (nút “Lưu vốn các tay”).
+
+        Khác ``config_set``: đây là đường lưu riêng cho bảng vốn, giữ nguyên sổ phiên
+        đang chạy (không reset vốn/lãi) và không bắt buộc đi theo hệ số nhân. Bảng vốn
+        chính là vốn phiên, nên ``capital`` được cập nhật bằng TỔNG các tay vừa lưu —
+        nhờ vậy ngưỡng chốt lời % và kiểm tra số dư luôn khớp bảng vốn trên màn hình.
+        """
+        if params.get("defaults"):
+            ladder = list(longlong.DEFAULT_LADDER)
+            self.config["base"] = longlong.DEFAULT_BASE
+            self.config["ladder_mult"] = longlong.DEFAULT_LADDER_MULT
+        else:
+            if not params.get("ladder"):
+                return {"ok": False, "error": "Chưa có tay vốn nào để lưu."}
+            ladder = longlong.normalize_ladder(params.get("ladder"))
+        total = sum(int(stake) for stake in ladder)
+        self.config["ladder"] = ladder
+        self.config["capital"] = total
+        self.sim.set_ladder(ladder)
+        self._save_config()
+        self.log("Đã lưu vốn các tay: %s · %d tay · tổng %s đv (= %s) / vốn phiên %s đv." % (
+            " → ".join(str(s) for s in ladder), len(ladder), _fn(total),
+            _fn(total * longlong.DONG_PER_UNIT), _fn(total)))
+        return self._push_ok()
+
     def ladder_from_capital(self, params):
         """Chia thang theo vốn với hệ số nhân ``mult`` (mặc định 2.25).
 
@@ -885,6 +911,7 @@ class LongLongController:
             "tool.start": lambda p: self.tool_start(),
             "tool.stop": lambda p: self.tool_stop(),
             "config.set": self.config_set,
+            "ladder.set": self.ladder_set,
             "ladder.fromCapital": self.ladder_from_capital,
             "session.reset": lambda p: self.session_reset(),
             "hand.manual": self.manual_hand,

@@ -252,7 +252,7 @@ function renderLongLong(snapshot) {
     const sum = ladder.reduce((acc, value) => acc + Number(value || 0), 0);
     const config = snapshot.config || {};
     ladderTotal.textContent = `· ${ladder.length} tay · tổng ${fmtUnits(sum)} đv`
-      + ` (${fmtVnd(sum * 1000)}) · ×${config.ladder_mult ?? 2.25}`
+      + ` (${fmtVnd(sum * 1000)}) · ×${config.ladder_mult ?? 2}`
       + ` · vốn ${fmtUnits(config.capital || 0)} đv`;
   }
 
@@ -271,7 +271,7 @@ function renderLongLong(snapshot) {
   const config = snapshot.config || {};
   if (document.activeElement !== $('#ll-base')) $('#ll-base').value = config.base ?? '';
   if (document.activeElement !== $('#ll-capital')) $('#ll-capital').value = config.capital ?? '';
-  if (document.activeElement !== $('#ll-mult')) $('#ll-mult').value = config.ladder_mult ?? 2.25;
+  if (document.activeElement !== $('#ll-mult')) $('#ll-mult').value = config.ladder_mult ?? 2;
   if (document.activeElement !== $('#ll-min-gap')) $('#ll-min-gap').value = config.min_gap ?? 15;
   if (document.activeElement !== $('#ll-confirm-reads')) {
     $('#ll-confirm-reads').value = config.confirm_reads ?? 2;
@@ -306,11 +306,42 @@ function renderLongLong(snapshot) {
   if (edit && edit.dataset.signature !== signature) {
     edit.dataset.signature = signature;
     edit.innerHTML = ladder
-      .map((value, index) => `<label>Bậc ${index + 1}<input data-ladder="${index}" type="number" min="1" step="10" value="${value}" /></label>`)
+      .map((value, index) => `<label>Tay ${index + 1}<input data-ladder="${index}" type="number" min="1" step="10" value="${value}" /></label>`)
       .join('');
+    markLadderDirty(false);
+    renderLadderSum();
   }
 
   renderLongLongStats(snapshot);
+}
+
+/* Bảng vốn các tay: tổng tiền + trạng thái "đã sửa nhưng chưa lưu". */
+function ladderInputs() {
+  return $$('#ll-ladder-edit input[data-ladder]');
+}
+
+function ladderValues() {
+  return ladderInputs()
+    .map((input) => Number(String(input.value).replace(/[^\d.-]/g, '')))
+    .filter((value) => Number.isFinite(value) && value > 0);
+}
+
+function renderLadderSum() {
+  const box = $('#ll-ladder-sum');
+  if (!box) return;
+  const values = ladderValues();
+  if (!values.length) {
+    box.textContent = 'Chưa có tay nào hợp lệ.';
+    return;
+  }
+  const sum = values.reduce((acc, value) => acc + value, 0);
+  box.textContent = `${values.length} tay · tổng ${fmtUnits(sum)} đv (${fmtVnd(sum * 1000)})`;
+}
+
+function markLadderDirty(dirty) {
+  ladderInputs().forEach((input) => input.classList.toggle('dirty', !!dirty));
+  const button = $('#ll-save-ladder');
+  if (button) button.textContent = dirty ? 'Lưu vốn các tay •' : 'Lưu vốn các tay';
 }
 
 /* ------------------------ LONG-LONG: thống kê hiệu quả ------------------------ */
@@ -982,6 +1013,32 @@ $('#ll-place-real').addEventListener('change', async (event) => {
 
 $('#ll-auto-result').addEventListener('change', async (event) => {
   await call('longlong', 'config.set', { auto_result: event.target.checked });
+});
+
+$('#ll-ladder-edit').addEventListener('input', () => {
+  markLadderDirty(true);
+  renderLadderSum();
+});
+
+$('#ll-save-ladder').addEventListener('click', async () => {
+  const ladder = ladderValues();
+  if (!ladder.length) {
+    toast('Chưa có tay nào hợp lệ để lưu.');
+    return;
+  }
+  const reply = await call('longlong', 'ladder.set', { ladder });
+  if (!reply) return;
+  markLadderDirty(false);
+  const total = ladder.reduce((acc, value) => acc + value, 0);
+  toast(`Đã lưu vốn ${ladder.length} tay · tổng ${fmtUnits(total)} đv (${fmtVnd(total * 1000)}).`);
+});
+
+$('#ll-reset-ladder').addEventListener('click', async () => {
+  const reply = await call('longlong', 'ladder.set', { defaults: true });
+  if (!reply) return;
+  markLadderDirty(false);
+  const total = (reply.ladder || []).reduce((acc, value) => acc + value, 0);
+  toast(`Đã về bảng vốn mặc định · ${(reply.ladder || []).length} tay · tổng ${fmtUnits(total)} đv.`);
 });
 
 $('#ll-reset').addEventListener('click', async () => {

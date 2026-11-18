@@ -69,8 +69,8 @@
             </div>
             <div class="card kpi">
               <div class="kpi-label">BẬC HIỆN TẠI</div>
-              <div class="kpi-value" id="ll-step">1 / 8</div>
-              <div class="kpi-foot" id="ll-step-note">mức kế tiếp 40 đv</div>
+              <div class="kpi-value" id="ll-step">1 / 9</div>
+              <div class="kpi-foot" id="ll-step-note">mức kế tiếp 10 đv</div>
             </div>
             <div class="card kpi">
               <div class="kpi-label">LÃI / LỖ PHIÊN</div>
@@ -128,10 +128,10 @@
               <label class="field">Mức gốc (đơn vị sảnh, 1 = 1.000đ)
                 <input id="ll-base" type="number" min="1" step="10" />
               </label>
-              <label class="field">Vốn phiên (đơn vị sảnh · 10.000 = 10 triệu)
-                <input id="ll-capital" type="number" min="10" step="100" />
+              <label class="field">Vốn phiên (đơn vị sảnh · 5.110 = 5,11 triệu)
+                <input id="ll-capital" type="number" min="10" step="10" />
               </label>
-              <label class="field">Hệ số nhân mỗi bậc (2.25 = bảng chia vốn thực tế)
+              <label class="field">Hệ số nhân mỗi bậc (2 = bảng vốn mặc định ×2)
                 <input id="ll-mult" type="number" min="1.01" max="10" step="0.05" />
               </label>
               <label class="field">Đơn vị tiền trên sàn (theo khay chip)
@@ -148,8 +148,8 @@
                 <button class="btn primary" id="ll-save">Lưu cấu hình</button>
               </div>
               <p class="hint">Chia thang: mỗi bậc ×<b>hệ số</b> (làm tròn lên bội 10) và chỉ
-                thêm bậc khi tổng còn trong vốn — vốn 10.000, gốc 40, ×2.25 →
-                40 · 90 · 210 · 480 · 1.080 · 2.430 · 5.470 (tổng 9.800) rồi dừng.</p>
+                thêm bậc khi tổng còn trong vốn — vốn 5.110, gốc 10, ×2 →
+                10 · 20 · 40 · 80 · 160 · 320 · 640 · 1.280 · 2.560 (tổng 5.110 đv).</p>
             </div>
             <div class="card pad">
               <h3>An toàn</h3>
@@ -212,8 +212,15 @@
             </div>
           </div>
           <div class="card pad">
-            <h3>8 bậc cược</h3>
+            <h3>Vốn từng tay (9 bậc)</h3>
+            <p class="hint">Sửa trực tiếp số vốn của từng tay rồi bấm <b>Lưu vốn các tay</b> —
+              giá trị được ghi vào file cấu hình và dùng ngay cho phiên sau.</p>
             <div class="ladder-edit" id="ll-ladder-edit"></div>
+            <div class="row ladder-actions">
+              <button class="btn primary" id="ll-save-ladder">Lưu vốn các tay</button>
+              <button class="btn" id="ll-reset-ladder">Về bảng mặc định</button>
+              <span class="hint" id="ll-ladder-sum">—</span>
+            </div>
           </div>
         </div>
 
