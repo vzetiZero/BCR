@@ -19,6 +19,7 @@ const state = {
   tableSearch: '',
   onlyEligible: false,
   lastLadderSignature: '',
+  longlongFormDirty: false,
   huntTick: 0,
 };
 
@@ -269,9 +270,12 @@ function renderLongLong(snapshot) {
   $('[data-led="longlong"]').classList.toggle('on', !!snapshot.tool_running || !!snapshot.chrome_connected);
 
   const config = snapshot.config || {};
-  if (document.activeElement !== $('#ll-base')) $('#ll-base').value = config.base ?? '';
-  if (document.activeElement !== $('#ll-capital')) $('#ll-capital').value = config.capital ?? '';
-  if (document.activeElement !== $('#ll-mult')) $('#ll-mult').value = config.ladder_mult ?? 2;
+  if (!state.longlongFormDirty) {
+    $('#ll-base').value = config.base ?? '';
+    $('#ll-capital').value = config.capital ?? '';
+    $('#ll-mult').value = config.ladder_mult ?? 2;
+    $('#ll-steps').value = config.ladder_steps ?? 9;
+  }
   if (document.activeElement !== $('#ll-min-gap')) $('#ll-min-gap').value = config.min_gap ?? 15;
   if (document.activeElement !== $('#ll-confirm-reads')) {
     $('#ll-confirm-reads').value = config.confirm_reads ?? 2;
@@ -306,7 +310,7 @@ function renderLongLong(snapshot) {
   if (edit && edit.dataset.signature !== signature) {
     edit.dataset.signature = signature;
     edit.innerHTML = ladder
-      .map((value, index) => `<label>Tay ${index + 1}<input data-ladder="${index}" type="number" min="1" step="10" value="${value}" /></label>`)
+      .map((value, index) => `<label>Tay ${index + 1}<input data-ladder="${index}" type="number" min="0" step="10" value="${value}" /></label>`)
       .join('');
     markLadderDirty(false);
     renderLadderSum();
@@ -323,7 +327,7 @@ function ladderInputs() {
 function ladderValues() {
   return ladderInputs()
     .map((input) => Number(String(input.value).replace(/[^\d.-]/g, '')))
-    .filter((value) => Number.isFinite(value) && value > 0);
+    .filter((value) => Number.isFinite(value) && value >= 0);
 }
 
 function renderLadderSum() {
@@ -969,11 +973,11 @@ $('#ll-tool').addEventListener('click', async () => {
 });
 
 $('#ll-save').addEventListener('click', async () => {
-  const ladder = $$('#ll-ladder-edit input').map((input) => Number(input.value)).filter((value) => value > 0);
-  await call('longlong', 'config.set', {
+  const reply = await call('longlong', 'config.set', {
     base: Number($('#ll-base').value),
     capital: Number($('#ll-capital').value),
     ladder_mult: Number($('#ll-mult').value),
+    ladder_steps: Number($('#ll-steps').value),
     unit_mode: $('#ll-unit-mode').value,
     min_gap: Number($('#ll-min-gap').value),
     confirm_reads: Number($('#ll-confirm-reads').value),
@@ -982,9 +986,15 @@ $('#ll-save').addEventListener('click', async () => {
     take_profit_pct: Number($('#ll-take-profit').value),
     place_real: $('#ll-place-real').checked,
     auto_result: $('#ll-auto-result').checked,
-    ladder,
   });
-  toast('Đã lưu cấu hình LONG-LONG.');
+  if (reply) {
+    state.longlongFormDirty = false;
+    toast('Đã lưu cấu hình LONG-LONG.');
+  }
+});
+
+['#ll-base', '#ll-capital', '#ll-mult', '#ll-steps'].forEach((selector) => {
+  $(selector).addEventListener('input', () => { state.longlongFormDirty = true; });
 });
 
 $('#ll-unit-mode').addEventListener('change', async (event) => {
@@ -998,12 +1008,16 @@ $('#ll-unit-mode').addEventListener('change', async (event) => {
 });
 
 $('#ll-divide').addEventListener('click', async () => {
-  await call('longlong', 'ladder.fromCapital', {
+  const reply = await call('longlong', 'ladder.fromCapital', {
     capital: Number($('#ll-capital').value),
     base: Number($('#ll-base').value),
     mult: Number($('#ll-mult').value),
+    steps: Number($('#ll-steps').value),
   });
-  toast('Đã chia thang theo vốn.');
+  if (reply) {
+    state.longlongFormDirty = false;
+    toast('Đã chia thang theo vốn.');
+  }
 });
 
 $('#ll-place-real').addEventListener('change', async (event) => {
@@ -1023,7 +1037,7 @@ $('#ll-ladder-edit').addEventListener('input', () => {
 
 $('#ll-save-ladder').addEventListener('click', async () => {
   const ladder = ladderValues();
-  if (!ladder.length) {
+  if (!ladder.length || !ladder.some((value) => value > 0)) {
     toast('Chưa có tay nào hợp lệ để lưu.');
     return;
   }

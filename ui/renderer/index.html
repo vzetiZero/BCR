@@ -134,6 +134,9 @@
               <label class="field">Hệ số nhân mỗi bậc (2 = bảng vốn mặc định ×2)
                 <input id="ll-mult" type="number" min="1.01" max="10" step="0.05" />
               </label>
+              <label class="field">Số tay tối đa
+                <input id="ll-steps" type="number" min="1" max="20" step="1" />
+              </label>
               <label class="field">Đơn vị tiền trên sàn (theo khay chip)
                 <select id="ll-unit-mode">
                   <option value="vn2">VN2 — chip 40 = 40.000đ (EVO mặc định)</option>
@@ -212,7 +215,7 @@
             </div>
           </div>
           <div class="card pad">
-            <h3>Vốn từng tay (9 bậc)</h3>
+            <h3>Vốn từng tay</h3>
             <p class="hint">Sửa trực tiếp số vốn của từng tay rồi bấm <b>Lưu vốn các tay</b> —
               giá trị được ghi vào file cấu hình và dùng ngay cho phiên sau.</p>
             <div class="ladder-edit" id="ll-ladder-edit"></div>

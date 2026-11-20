@@ -118,6 +118,7 @@ class LongLongController:
             "ladder": list(longlong.DEFAULT_LADDER),
             "base": longlong.DEFAULT_BASE,
             "capital": longlong.DEFAULT_CAPITAL,       # đơn vị sảnh (5.110 = 5,11 triệu)
+            "ladder_steps": longlong.DEFAULT_STEPS,
             # Hệ số nhân mỗi bậc khi chia vốn (2.0 = bảng vốn mặc định ×2).
             "ladder_mult": longlong.DEFAULT_LADDER_MULT,
             # Đơn vị tiền trên KHAY CHIP của sàn: "vn2" (chip 40 = 40.000đ) hay "vnd"
@@ -166,6 +167,11 @@ class LongLongController:
             window.get("percent"), window.get("fullscreen"))
         config["unit_mode"] = longlong.normalize_unit_mode(config.get("unit_mode"))
         config["ladder_mult"] = longlong.normalize_mult(config.get("ladder_mult"))
+        try:
+            config["ladder_steps"] = max(1, min(int(config.get("ladder_steps") or
+                                                    longlong.DEFAULT_STEPS), longlong.LADDER_UPPER))
+        except (TypeError, ValueError):
+            config["ladder_steps"] = longlong.DEFAULT_STEPS
         try:
             config["confirm_reads"] = max(1, min(int(config.get("confirm_reads")
                                                     or longlong_auto.DEFAULT_CONFIRM), 5))
@@ -744,6 +750,13 @@ class LongLongController:
                 self.config["ladder_mult"] = mult
                 changed.append("ladder_mult")
                 self.log("Hệ số nhân bậc: ×%g (bấm “Chia thang theo vốn” để áp dụng)." % mult)
+        if "ladder_steps" in params:
+            try:
+                self.config["ladder_steps"] = max(1, min(int(params["ladder_steps"]),
+                                                          longlong.LADDER_UPPER))
+                changed.append("ladder_steps")
+            except (TypeError, ValueError):
+                pass
         if "capital" in params:
             try:
                 self.config["capital"] = int(params["capital"])
@@ -853,10 +866,13 @@ class LongLongController:
         base = params.get("base", self.config["base"])
         capital = params.get("capital", self.config["capital"])
         mult = longlong.normalize_mult(params.get("mult", self.config.get("ladder_mult")))
-        steps = int(params.get("steps") or len(self.config["ladder"]))
+        steps = int(params.get("steps") or self.config.get("ladder_steps") or
+                    len(self.config["ladder"]))
         stakes = longlong.ladder_for_capital(capital, base, steps, mult=mult)
         self.config["ladder"] = stakes
         self.config["ladder_mult"] = mult
+        self.config["ladder_steps"] = steps
+        self.config["capital"] = int(capital)
         self.config["base"] = int(base) if str(base).isdigit() else self.config["base"]
         self.sim.set_ladder(stakes)
         self._save_config()

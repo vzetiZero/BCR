@@ -259,18 +259,19 @@ def ladder_for_capital(capital, base=DEFAULT_BASE, steps=DEFAULT_STEPS, round_to
         target = 0
     if target <= 0:
         return multiply_ladder(base, steps, factor, step)
-    first = int(ceil_step(base, step))
-    if first > target:
-        # Vốn không đủ cho bậc gốc: giữ đúng một bậc bằng vốn để tool còn chạy được.
-        return [max(1, target)]
-    ladder, total, stake = [], 0, first
-    for _ in range(steps):
-        if total + stake > target:
-            break
-        ladder.append(int(stake))
-        total += int(stake)
-        stake = int(ceil_step(stake * factor, step))
-    return ladder or [max(1, target)]
+    planned = multiply_ladder(base, steps, factor, step)
+    remaining = max(0, target)
+    ladder = []
+    for stake in planned:
+        if remaining <= 0:
+            ladder.append(0)
+        elif stake <= remaining:
+            ladder.append(int(stake))
+            remaining -= int(stake)
+        else:
+            ladder.append(int(remaining))
+            remaining = 0
+    return ladder
 
 
 def normalize_ladder(stakes=None):
@@ -283,10 +284,11 @@ def normalize_ladder(stakes=None):
             value = float(str(stake).replace(".", "").replace(",", "").strip())
         except (TypeError, ValueError):
             return list(DEFAULT_LADDER)
-        if not value > 0:
+        if not value >= 0:
             return list(DEFAULT_LADDER)
         clean.append(int(value))
-    return clean[:LADDER_UPPER] or list(DEFAULT_LADDER)
+    clean = clean[:LADDER_UPPER]
+    return clean if clean and any(clean) else list(DEFAULT_LADDER)
 
 
 def ladder_total(ladder):
@@ -445,6 +447,9 @@ class LongLongStrategy:
                         reason="Tay trước ra %s — không phải bộ vàng-đỏ; tiếp tục chờ."
                         % raw_label(self.last))
         stake = self.ladder[min(self.step, self.bottom)]
+        if stake <= 0:
+            return dict(action="stop", side=None, stake=0,
+                        reason="Đã hết các tay có vốn; tay còn lại bằng 0 nên không đặt.")
         return dict(action="bet", side=DOOR, stake=stake, step=self.step,
                     reason="Tay trước ra bộ vàng-đỏ; đặt ô %s ở bậc %d." % (
                         DOOR_NAME, self.step + 1))
