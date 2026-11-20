@@ -666,7 +666,7 @@ function renderTables(rows) {
   });
   if (title) title.textContent = `Bàn đọc được · ${list.length}`;
   if (!list.length) {
-    box.innerHTML = '<p class="hint">Không có bàn nào khớp. Bấm “VÀO BÀN HỢP LỆ” để quét lại sảnh.</p>';
+    box.innerHTML = '<p class="hint">Không có bàn nào khớp.</p>';
     return;
   }
   box.innerHTML = list
@@ -726,7 +726,7 @@ function renderBaLadder(config) {
   const box = $('#ba-ladder-edit');
   if (!box) return;
   const ladder = config.ladder || [];
-  const signature = `${config.profile}|${ladder.join(',')}`;
+  const signature = `${config.profile}|${config.ladder_mode}|${ladder.join(',')}`;
   if (box.dataset.signature === signature) return;
   box.dataset.signature = signature;
   const readonly = config.ladder_mode === 'multiply' ? 'readonly' : '';
@@ -747,11 +747,13 @@ function renderBaConfig(config) {
   setValue('#ba-live-exit', config.live_exit_streak);
   setValue('#ba-tables-target', config.tables_to_play);
   setValue('#ba-ladder-base', config.ladder_base);
+  setValue('#ba-flat-stake', config.flat_stake);
   setValue('#ba-start-url', config.start_url);
 
   $$('input[name="ba-profile"]').forEach((input) => { input.checked = input.value === config.profile; });
   $$('input[name="ba-block-mode"]').forEach((input) => { input.checked = input.value === config.block_mode; });
   $$('input[name="ba-ladder-mode"]').forEach((input) => { input.checked = input.value === config.ladder_mode; });
+  syncBaLadderModeControls(config.ladder_mode);
   $$('input[name="ba-tie-side"]').forEach((input) => { input.checked = input.value === (config.tie_side || 'B'); });
 
   const flags = {
@@ -777,6 +779,18 @@ function renderBaConfig(config) {
   renderBaLadder(config);
 }
 
+function syncBaLadderModeControls(mode) {
+  const fixed = mode === 'fixed';
+  const flatField = $('#ba-flat-stake-field');
+  const baseField = $('#ba-ladder-base-field');
+  const ladderEdit = $('#ba-ladder-edit');
+  const saveButton = $('#ba-save-ladder');
+  if (flatField) flatField.hidden = !fixed;
+  if (baseField) baseField.hidden = fixed;
+  if (ladderEdit) ladderEdit.hidden = fixed;
+  if (saveButton) saveButton.textContent = fixed ? 'Lưu mức cược cố định' : 'Lưu phương pháp & thang';
+}
+
 function renderBaccarat(snapshot) {
   if (!snapshot) return;
   state.baccarat = snapshot;
@@ -791,14 +805,12 @@ function renderBaccarat(snapshot) {
     capitalBox.textContent = fmtMoney(money.capital);
     capitalBox.className = 'kpi-value';
   }
-  setText('#ba-capital-note', `Số dư phiên: ${fmtMoney(money.balance)}`);
 
   const profitBox = $('#ba-profit');
   if (profitBox) {
     profitBox.textContent = fmtSigned(money.profit);
     profitBox.className = 'kpi-value ' + (money.profit > 0 ? 'green' : money.profit < 0 ? 'red' : '');
   }
-  setText('#ba-profit-note', `${money.hands || 0} tay · ${money.wins || 0}T/${money.losses || 0}B/${money.pushes || 0}H`);
 
   const roiBox = $('#ba-roi');
   if (roiBox) {
@@ -827,19 +839,11 @@ function renderBaccarat(snapshot) {
     toolButton.classList.toggle('danger-btn', !!snapshot.tool_running);
   }
   if (snapshot.chrome_connected) chromeSeen.baccarat = true;
+  syncOpenChromeButton('#ba-open-chrome', 'baccarat', snapshot);
   const led = $('[data-led="baccarat"]');
   if (led) led.classList.toggle('on', !!snapshot.tool_running || !!snapshot.chrome_connected);
 
   const enter = snapshot.enter_valid || {};
-  const enterButton = $('#ba-enter-valid');
-  if (enterButton) {
-    enterButton.disabled = !!enter.active;
-    enterButton.textContent = enter.active ? 'ĐANG TÌM BÀN HỢP LỆ…' : 'VÀO BÀN HỢP LỆ';
-  }
-
-  setText('#ba-conn-note', snapshot.chrome_note || '');
-  setText('#ba-wallet', snapshot.wallet_text || '');
-  setText('#ba-sweep-note', snapshot.sweep_note || '');
 
   /* --- banner trạng thái vào bàn hợp lệ / tự săn bàn --- */
   const hunt = $('#ba-hunt');
@@ -878,7 +882,7 @@ function renderBaccarat(snapshot) {
     if (!table.key) {
       planState.textContent = 'CHƯA CÓ BÀN';
       planState.className = 'hero-state';
-      planBox.textContent = 'Bấm “VÀO BÀN HỢP LỆ” để tìm và vào bàn đạt chuẩn.';
+      planBox.textContent = 'Bấm “Chạy tool” để tự tìm bàn đạt chuẩn.';
     } else if (money.blocked) {
       planState.textContent = 'ĐÃ CHẶN';
       planState.className = 'hero-state stop';
@@ -886,8 +890,10 @@ function renderBaccarat(snapshot) {
     } else if (plan.action === 'bet') {
       planState.textContent = plan.armed ? 'ĐÃ CHỐT' : 'ĐẶT';
       planState.className = 'hero-state bet';
-      planBox.textContent = `${plan.side_name || SIDE_NAME[plan.side] || '—'} ${fmtMoney(plan.stake)} · bậc ${(plan.ladder_step || 0) + 1}`
-        + `/ ${(table.ladder || []).length}`;
+      planBox.textContent = `${plan.side_name || SIDE_NAME[plan.side] || '—'} ${fmtMoney(plan.stake)}`
+        + (config.ladder_mode === 'fixed'
+          ? ' · mức cố định'
+          : ` · bậc ${(plan.ladder_step || 0) + 1}/${(table.ladder || []).length}`);
     } else if (plan.action === 'halt') {
       planState.textContent = 'DỪNG';
       planState.className = 'hero-state stop';
@@ -909,18 +915,6 @@ function renderBaccarat(snapshot) {
   /* --- bàn đang theo dõi --- */
   setText('#ba-table-name', table.key ? `${table.name || table.key} · ${table.hands || 0} tay` : 'Chưa chọn bàn');
   renderRoad(table.letters);
-  const noteBits = [];
-  if (table.key) {
-    noteBits.push(table.running ? 'Đang theo dõi' : 'Đã dừng');
-    noteBits.push(`khối ${table.profile_label || table.profile || ''}`);
-    noteBits.push(`bậc ${Number(plan.ladder_step || 0) + 1}/${(table.ladder || []).length}`);
-    if (table.entry_waiting) noteBits.push('chờ kết quả tay hiện tại');
-    if (table.place_skips) noteBits.push(`bỏ ${table.place_skips} tay`);
-  } else {
-    noteBits.push('Chưa vào bàn — bấm “VÀO BÀN HỢP LỆ”.');
-  }
-  setText('#ba-table-note', [table.note, noteBits.join(' · ')].filter(Boolean).join(' — '));
-
   renderChips(snapshot.chips, plan);
   const place = snapshot.place || {};
   const placeBox = $('#ba-place-status');
@@ -1076,9 +1070,9 @@ $('#ll-clear-log').addEventListener('click', () => {
 });
 
 /* ------------------------------ BACCARAT actions ------------------------------ */
-$('#ba-enter-valid').addEventListener('click', async () => {
-  const reply = await call('baccarat', 'table.enterValid');
-  if (reply) toast(reply.note || 'Đang tìm bàn hợp lệ…');
+$('#ba-open-chrome').addEventListener('click', async () => {
+  const reply = await call('baccarat', 'chrome.open');
+  if (reply) toast(reply.note || 'Đang mở Chrome cho Baccarat.');
 });
 
 $('#ba-tool').addEventListener('click', async () => {
@@ -1128,6 +1122,10 @@ $('#ba-reset-session').addEventListener('click', async () => {
   if (reply) toast(reply.note || 'Đã reset phiên.');
 });
 
+$$('input[name="ba-ladder-mode"]').forEach((input) => input.addEventListener('change', () => {
+  syncBaLadderModeControls(input.value);
+}));
+
 $('#ba-save-ladder').addEventListener('click', async () => {
   const profile = ($('input[name="ba-profile"]:checked') || {}).value || '3-3';
   const blockMode = ($('input[name="ba-block-mode"]:checked') || {}).value || 'recalculate';
@@ -1138,6 +1136,7 @@ $('#ba-save-ladder').addEventListener('click', async () => {
     block_mode: blockMode,
     ladder_mode: ladderMode,
     ladder_base: Number($('#ba-ladder-base').value),
+    flat_stake: Number($('#ba-flat-stake').value),
   };
   if (ladderMode === 'manual' && ladder.length) params.ladder = ladder;
   const reply = await call('baccarat', 'config.set', params);

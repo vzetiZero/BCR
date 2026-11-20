@@ -157,6 +157,8 @@ main::-webkit-scrollbar-thumb { background: #24314a; border-radius: 8px; }
 .card h3 { margin: 0 0 12px; font-size: 13px; letter-spacing: 0.3px; }
 
 .kpi { padding: 14px 16px; }
+.kpi-compact { padding: 8px 12px; }
+.kpi-compact .kpi-value { font-size: 17px; margin-top: 3px; }
 .kpi-label { font-size: 10px; letter-spacing: 1.2px; color: var(--muted); }
 .kpi-value { font-size: 24px; font-weight: 800; margin-top: 6px; }
 .kpi-value.gold { color: var(--gold); }

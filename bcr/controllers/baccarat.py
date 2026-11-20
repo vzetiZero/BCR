@@ -40,8 +40,9 @@ DEFAULT_CONFIG = {
     "take_profit_pct": 25.0,    # chốt lời % vốn
     "profile": ME.DEFAULT_PROFILE,
     "ladder": None,             # None = dùng thang mặc định của phương pháp
-    "ladder_mode": "manual",    # manual | multiply
+    "ladder_mode": "manual",    # manual | multiply | fixed
     "ladder_base": 100.0,       # bậc 1 khi dùng cơ chế tự nhân
+    "flat_stake": 20.0,         # mức cược giữ nguyên mỗi tay khi chọn fixed
     "block_mode": ME.BLOCK_MODE_RECALCULATE,
     "min_hands": ME.MIN_HANDS,
     "max_hands": ME.MAX_HANDS,
@@ -184,9 +185,12 @@ class BaccaratController:
         config["capital"] = max(1.0, _as_float(config.get("capital"), DEFAULT_CONFIG["capital"]))
         config["take_profit_pct"] = max(1.0, _as_float(config.get("take_profit_pct"),
                                                        DEFAULT_CONFIG["take_profit_pct"]))
-        config["ladder_mode"] = "multiply" if config.get("ladder_mode") == "multiply" else "manual"
+        ladder_mode = config.get("ladder_mode")
+        config["ladder_mode"] = ladder_mode if ladder_mode in ("manual", "multiply", "fixed") else "manual"
         config["ladder_base"] = max(1.0, _as_float(config.get("ladder_base"),
                                                    DEFAULT_CONFIG["ladder_base"]))
+        config["flat_stake"] = max(1.0, _as_float(config.get("flat_stake"),
+                                                   DEFAULT_CONFIG["flat_stake"]))
         if config.get("block_mode") not in (ME.BLOCK_MODE_RECALCULATE, ME.BLOCK_MODE_REPEAT):
             config["block_mode"] = ME.BLOCK_MODE_RECALCULATE
         low, high = ME.normalize_hand_range(config.get("min_hands"), config.get("max_hands"))
@@ -223,6 +227,8 @@ class BaccaratController:
     def _normalize_ladder(ladder, config):
         """Chuẩn hoá thang cược; sai/thiếu thì về thang mặc định của phương pháp."""
         profile = config["profile"]
+        if config.get("ladder_mode") == "fixed":
+            return [float(config["flat_stake"])] * ME.block_hands(profile)
         if config.get("ladder_mode") == "multiply" and ladder in (None, "", []):
             ladder = ME.multiply_ladder(config["ladder_base"], profile)
         try:
@@ -241,7 +247,8 @@ class BaccaratController:
                              live_exit_streak=config["live_exit_streak"],
                              min_lead=config["min_lead"],
                              block_mode=config["block_mode"],
-                             max_lead=config["max_lead"], tie_side=config["tie_side"])
+                             max_lead=config["max_lead"], tie_side=config["tie_side"],
+                             fixed_stake=config["flat_stake"] if config["ladder_mode"] == "fixed" else 0)
         sim.on_arm = self._place_armed_bet
         # Khôi phục sổ vốn + lịch sử tay của phiên trước (nếu có).
         saved = getattr(self, "_saved_session", {}) or {}
@@ -362,14 +369,12 @@ class BaccaratController:
             if row.get("read_error"):
                 verdict = row["read_error"]
             elif info["eligible"]:
-                verdict = "Đạt %d/%d · cần đối chiếu" % (passed, total)
+                verdict = "Đạt %d/%d · sẵn sàng vào" % (passed, total)
             else:
                 verdict = "%d/%d · %s" % (passed, total, next(c["detail"] for c in info["checks"]
                                                               if not c["ok"]))
             if row.get("conflict"):
                 status = "Xung đột"
-            elif row.get("stable", 0) < 2:
-                status = "Chờ xác nhận đọc"
             elif age > LIVE_STALE:
                 status = "Dữ liệu cũ"
             else:
@@ -999,8 +1004,12 @@ class BaccaratController:
                 config["block_mode"] = params["block_mode"]
                 changed.append("block_mode")
             if "ladder_mode" in params:
-                config["ladder_mode"] = params["ladder_mode"]
-                changed.append("ladder_mode")
+                if params["ladder_mode"] in ("manual", "multiply", "fixed"):
+                    config["ladder_mode"] = params["ladder_mode"]
+                    changed.append("ladder_mode")
+            if "flat_stake" in params:
+                config["flat_stake"] = params["flat_stake"]
+                changed.append("flat_stake")
             if "ladder_base" in params:
                 config["ladder_base"] = params["ladder_base"]
                 changed.append("ladder_base")
@@ -1027,6 +1036,12 @@ class BaccaratController:
                 changed.append("start_url")
 
             normalized = self._normalize_config(config)
+            if (normalized["ladder_mode"] == "fixed"
+                    and normalized["capital"] < float(normalized["flat_stake"])
+                    and any(key in params for key in ("flat_stake", "ladder_mode", "ladder", "profile"))):
+                return {"ok": False,
+                        "error": "Vốn phiên phải lớn hơn hoặc bằng mức cược đầu tiên (%s VN2)."
+                                 % M.fmt_money(normalized["ladder"][0])}
             # đổi vốn / chốt lời chỉ khi chưa có tay nào, tránh làm sai lãi/lỗ
             for key in ("capital", "take_profit_pct"):
                 if key in params:
@@ -1047,6 +1062,8 @@ class BaccaratController:
             # áp vào model
             self.sim.profile = normalized["profile"]
             self.sim.ladder = [float(s) for s in normalized["ladder"]]
+            self.sim.fixed_stake = (normalized["flat_stake"]
+                                    if normalized["ladder_mode"] == "fixed" else 0.0)
             self.sim.set_road_filter(normalized["min_hands"], normalized["max_hands"],
                                      normalized["max_streak"], normalized["min_lead"])
             self.sim.set_lead_range(normalized["min_lead"], normalized["max_lead"])
@@ -1055,6 +1072,7 @@ class BaccaratController:
             self.sim.block_mode = normalized["block_mode"]
             book = self.sim.money
             book.take_profit_pct = normalized["take_profit_pct"]
+            book.unit = float(normalized["ladder"][0])
             if not book.hands_played:
                 book.unit = float(normalized["ladder"][0])
                 book.capital = book.start_capital = book.balance = normalized["capital"]
@@ -1083,7 +1101,9 @@ class BaccaratController:
                                  min_lead=self.config["min_lead"],
                                  block_mode=self.config["block_mode"],
                                  max_lead=self.config["max_lead"],
-                                 tie_side=self.config["tie_side"])
+                                 tie_side=self.config["tie_side"],
+                                 fixed_stake=self.config["flat_stake"]
+                                 if self.config["ladder_mode"] == "fixed" else 0)
             sim.on_arm = self._place_armed_bet
             self.sim = sim
             self.tables_done = 0
@@ -1103,7 +1123,7 @@ class BaccaratController:
         with self.lock:
             config = dict(self.config)
             for key in ("capital", "take_profit_pct", "profile", "ladder", "ladder_mode",
-                        "ladder_base", "block_mode", "min_hands", "max_hands", "max_streak",
+                        "ladder_base", "flat_stake", "block_mode", "min_hands", "max_hands", "max_streak",
                         "min_lead", "max_lead", "tie_side", "live_exit_streak"):
                 if key in params:
                     config[key] = params[key]
@@ -1132,7 +1152,9 @@ class BaccaratController:
                                  max_streak=config["max_streak"],
                                  live_exit_streak=config["live_exit_streak"],
                                  min_lead=config["min_lead"], block_mode=config["block_mode"],
-                                 max_lead=config["max_lead"], tie_side=config["tie_side"])
+                                 max_lead=config["max_lead"], tie_side=config["tie_side"],
+                                 fixed_stake=config["flat_stake"]
+                                 if config["ladder_mode"] == "fixed" else 0)
             sim.on_arm = self._place_armed_bet
             self.sim = sim
             self.tables_done = 0
@@ -1445,6 +1467,8 @@ class BaccaratController:
     def _schedule_cycle_retry(self, reason, exclude_key=None):
         if self.session_lost or (self.tool_running is False and not self.enter_valid):
             return False
+        if self.cycle_retry_at and time.time() < self.cycle_retry_at:
+            return True
         manual_enter = bool(self.enter_valid)
         if not (self.cycle_waiting and (self.config["auto_hunt"] or manual_enter)):
             return False
@@ -1684,6 +1708,12 @@ class BaccaratController:
             if self.sim.cycle_done:
                 self.sim.cycle_done = False
                 self.leave_table(take_profit=self.sim.take_profit_done)
+        elif rows and not self.sim.running:
+            # Recheck candidates as soon as a regular lobby scan provides data.
+            self.auto_open_table(
+                allow_sweep=False,
+                exclude_key=self.cycle_table_key if self.cycle_waiting else None,
+            )
 
     def _sync_wallet(self, reports):
         text = next((str((report.get("page") or {}).get("wallet_balance") or "").strip()

@@ -67,12 +67,10 @@ def group_money_input(raw, caret):
     return grouped, len(grouped)
 
 def road_is_current(row):
-    """Cầu đủ tin để chọn bàn: sảnh - hai nguồn (cầu đang vẽ + lịch sử WebSocket) cùng cho một chuỗi."""
+    """Chỉ chặn cầu lỗi hoặc mâu thuẫn; không đợi nguồn đọc thứ hai trước khi vào bàn."""
     if not row or row.get("conflict") or row.get("read_error") or not row.get("letters"):
         return False
-    if row.get("source") == "evo-bead":
-        return row.get("screen_stable", 0) >= 2
-    return row.get("ws_confirmed_letters") == row["letters"] and row.get("stable", 0) >= 2
+    return True
 
 def same_shoe(entry_letters, screen_letters):
     """Cầu đã lọc ở sảnh và cầu trong bàn là một shoe: phần trùng nhau phải khớp đầu hoặc khớp cuối."""
@@ -94,8 +92,6 @@ def row_problem(row, now=None, check_fresh=True):
         return row["read_error"]
     if row.get("game_type") and row["game_type"] != "baccarat":
         return "Bàn trả thưởng đặc biệt: chưa hỗ trợ tính lãi/lỗ theo bàn chuẩn."
-    if row.get("stable", 0) < 2:
-        return "Chờ hai lần đọc giống nhau để xác nhận dữ liệu."
     if not row.get("table_id") and (row["label"].lower().startswith("ban ") or not re.search(r"\d", row["label"])):
         return "Chưa nhận diện rõ mã bàn. Không thể bắt đầu theo dõi."
     return ""
@@ -126,10 +122,11 @@ class LiveSimulation:
                  live_exit_streak=ME.DEFAULT_LIVE_EXIT_STREAK,
                  min_lead=ME.DEFAULT_MIN_LEAD,
                  block_mode=ME.BLOCK_MODE_RECALCULATE,
-                 max_lead=None, tie_side=ME.DEFAULT_TIE_SIDE):
+                 max_lead=None, tie_side=ME.DEFAULT_TIE_SIDE, fixed_stake=0):
         self.money = book or M.MoneyBook()
         self.profile = profile
         self.ladder = ME.ladder_stakes(profile, ladder)
+        self.fixed_stake = max(0.0, float(fixed_stake or 0))
         self.min_hands, self.max_hands = ME.normalize_hand_range(min_hands, max_hands)
         self.max_streak = ME.normalize_streak(max_streak)
         self.live_exit_streak = ME.normalize_streak(live_exit_streak, ME.DEFAULT_LIVE_EXIT_STREAK)
@@ -173,10 +170,16 @@ class LiveSimulation:
 
     def plan(self):
         s = self.method_state
-        return ME.plan(self.results, self.ladder, s["ladder_step"], s["hands_in_block"],
+        ladder_step = 0 if self.fixed_stake > 0 else s["ladder_step"]
+        plan = ME.plan(self.results, self.ladder, ladder_step, s["hands_in_block"],
                        s["started"], s["strong"], self.profile,
                        self.min_hands, self.max_hands, self.max_streak, self.block_mode,
                        self.min_lead, max_lead=self.max_lead, tie_side=self.tie_side)
+        if self.fixed_stake > 0 and plan.get("action") in ("start", "bet"):
+            plan["stake"] = self.fixed_stake
+            plan["ladder_step"] = 0
+            plan["reason"] = "Mức cược cố định %s VN2 cho mỗi tay." % M.fmt_money(self.fixed_stake)
+        return plan
 
     def set_road_filter(self, min_hands, max_hands, max_streak, min_lead=ME.DEFAULT_MIN_LEAD):
         """Đổi bộ lọc cầu (khoảng tay đã đi + số tay bệt tối đa); kẹp trong biên của method."""
@@ -454,6 +457,8 @@ class LiveSimulation:
         settled = self.money.settle(plan["side"], result, plan["stake"], E.PAYOUT)
         self.method_state, _ = ME.advance(self.method_state, result, plan["side"], plan["stake"],
                                           self.profile)
+        if self.fixed_stake > 0:
+            self.method_state["ladder_step"] = 0
         self.method_state["strong"] = plan["strong"]
         self.letters = letters
         self.results = list(letters)

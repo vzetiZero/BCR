@@ -330,8 +330,8 @@ node tests/test_reader.cjs                          # script đọc DOM
 ## Ghi chú
 
 - **BẮT BUỘC — push GitHub sau mỗi lần cập nhật/sửa đổi.** Mọi thay đổi (code, cấu hình
-  mặc định, tài liệu) phải được đẩy lên `origin/main` ngay trong cùng lần làm việc, không
-  để tồn đọng. Cách nhanh:
+  mặc định, tài liệu) phải được commit và đẩy lên `origin/main` ngay trong cùng lần làm
+  việc, không để tồn đọng. Cách nhanh:
 
   ```
   push_update.bat                          # commit tự động "Update <thời gian>" rồi push
@@ -340,9 +340,9 @@ node tests/test_reader.cjs                          # script đọc DOM
   ```
 
   Script đã `git add -A` (tôn trọng `.gitignore`: `chrome_profile*`, `bcr_state*.json`,
-  `drivers`, `__pycache__`…), commit rồi `git push origin main`. Không push khi chưa chạy
-  lại `python -m unittest discover -s tests -t . -q` và thấy `OK`. Nếu push lỗi (mạng,
-  xác thực) thì sửa và push lại — **không** kết thúc công việc khi commit còn cục bộ.
+  `drivers`, `__pycache__`…), commit rồi `git push origin main`. Không chạy test tự động
+  trừ khi người dùng yêu cầu; hãy báo rõ nếu chưa chạy. Nếu push lỗi (mạng, xác thực hoặc
+  xung đột nhánh), báo chính xác trạng thái và không nói là đã push thành công.
 - **Đóng Chrome bằng tay**: app dò cổng CDP (mỗi 2 giây, có cache 3 giây) nên phát hiện
   ngay, đổi nút thành **“Mở lại Chrome”**, tạm dừng phiên và xoá danh sách bàn cũ. Bấm
   lại là Chrome mở lại bình thường — không cần khởi động lại app.
